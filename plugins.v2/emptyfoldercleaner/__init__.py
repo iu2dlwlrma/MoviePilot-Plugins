@@ -285,7 +285,7 @@ class EmptyFolderCleaner(_PluginBase):
                                             'model': 'exclude_dirs',
                                             'label': '排除目录',
                                             'rows': 3,
-                                            'placeholder': '每一行一个目录路径，这些目录不会被删除\n例如：\n.git\n.svn\nnode_modules'
+                                            'placeholder': '每一行一个目录路径，这些目录不会被删除\n例如：\n/downloads\n/media/movies'
                                         }
                                     }
                                 ]
@@ -301,7 +301,7 @@ class EmptyFolderCleaner(_PluginBase):
             "cron": "0 2 * * *",
             "target_dirs": "",
             "recursive": True,
-            "exclude_dirs": ".git\n.svn\nnode_modules\n.DS_Store\nThumbs.db",
+            "exclude_dirs": "",
             "dry_run": False
         }
 
