@@ -1,13 +1,14 @@
 {
-  "CleanEmptyFloder": {
+  "EmptyFolderCleaner": {
     "name": "空文件夹清理",
     "description": "定期清理指定目录下的空文件夹，支持递归清理。",
     "labels": "文件整理",
-    "version": "1.0",
+    "version": "1.1",
     "icon": "clean.png",
     "author": "oriecho",
     "level": 1,
     "history": {
+      "v1.1": "修复systemmessage调用错误",
       "v1.0": "支持定时清理空文件夹、递归清理、排除目录、模拟运行等功能"
     }
   }
