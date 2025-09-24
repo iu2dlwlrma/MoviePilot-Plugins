@@ -25,7 +25,7 @@ class EmptyFolderCleaner(_PluginBase):
     # 插件版本
     plugin_version = "1.0"
     # 插件作者
-    plugin_author = "iu2dlwlrma"
+    plugin_author = "oriecho"
     # 作者主页
     author_url = "https://github.com/iu2dlwlrma"
     # 插件配置项ID前缀
