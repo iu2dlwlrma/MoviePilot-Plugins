@@ -25,9 +25,9 @@ class EmptyFolderCleaner(_PluginBase):
     # 插件版本
     plugin_version = "1.0"
     # 插件作者
-    plugin_author = "Assistant"
+    plugin_author = "iu2dlwlrma"
     # 作者主页
-    author_url = "https://github.com/assistant"
+    author_url = "https://github.com/iu2dlwlrma"
     # 插件配置项ID前缀
     plugin_config_prefix = "emptyfoldercleaner_"
     # 加载顺序
