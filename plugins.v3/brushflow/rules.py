@@ -20,6 +20,44 @@ def _count(value: Any) -> int | None:
     return int(number) if number is not None and number.is_integer() else None
 
 
+def publication_age_minutes(
+    pubdate: Any,
+    timezone_offset: float,
+    timezone_name: str,
+    now: datetime | None = None,
+) -> float | None:
+    """显式时区按实际时刻计算；手动偏移仅修正无时区发布时间。"""
+    if not pubdate:
+        return None
+    try:
+        published = pubdate if isinstance(pubdate, datetime) else datetime.fromisoformat(str(pubdate).strip())
+        if published.tzinfo is None or published.utcoffset() is None:
+            local_zone = timezone.utc if timezone_name == "UTC" else ZoneInfo(timezone_name)
+            offset = float(timezone_offset)
+            if not math.isfinite(offset):
+                return None
+            published = (published + timedelta(hours=offset)).replace(tzinfo=local_zone)
+        current = now if now is not None else datetime.now(timezone.utc)
+        if current.tzinfo is None or current.utcoffset() is None:
+            return None
+        return (current.astimezone(timezone.utc) - published.astimezone(timezone.utc)).total_seconds() / 60
+    except (TypeError, ValueError, OverflowError, ZoneInfoNotFoundError):
+        return None
+
+
+def demand_rank(peers: Any, seeders: Any, age_minutes: float | None) -> tuple[float, float]:
+    """以需求人数和竞争程度排序，需求得分每六小时衰减一半。"""
+    age = _number(age_minutes)
+    if age is None:
+        return 0.0, -math.inf
+    peer_count, seed_count = _count(peers), _count(seeders)
+    if peer_count is None or seed_count is None:
+        return 0.0, -age
+    demand = math.log1p(peer_count) * (peer_count / (peer_count + seed_count + 1))
+    freshness = math.exp(-math.log(2) * age / 360)
+    return demand * freshness, -age
+
+
 def evaluate_peer_demand(
     peers: Any,
     seeders: Any,

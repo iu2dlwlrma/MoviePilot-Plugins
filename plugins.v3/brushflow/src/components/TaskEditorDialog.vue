@@ -27,12 +27,13 @@ const positive = value => value === '' || value == null || Number(value) > 0 || 
 const sections = [
   {
     value: 'base', title: '常用与调度', icon: 'mdi-calendar-clock',
-    description: '分享率未达标站点优先，达到目标后继续参与轮转。并发和速度由下载器管理。',
+    description: '单站轮换按驻留时间切换。分享率决定优先级，不会提前切走；并发和速度由下载器管理。',
     fields: [
       { key: 'downloader', label: '下载器', type: 'downloader', required: true },
       { key: 'save_path', label: '保存目录', hint: '留空使用下载器默认目录' },
       { key: 'brush_interval', label: '刷流刷新周期（分钟）', type: 'number', min: 1, max: 1440, required: true },
       { key: 'check_interval', label: '状态检查周期（分钟）', type: 'number', min: 1, max: 1440, required: true },
+      { key: 'rotation_hours', label: '每站驻留时间（小时）', type: 'number', min: 0, max: 168, required: true, hint: '单站轮换模式生效，默认 24 小时；切换后旧种继续按原规则下载、做种和删除。' },
       { key: 'cron', label: 'CRON 表达式', hint: '留空使用固定刷新周期' },
       { key: 'active_time_range', label: '开启时间段', hint: '如 00:00-08:00，留空为全天' },
       { key: 'site_ratio_target', label: '目标站点分享率', type: 'number', min: 0.01, step: 0.01, hint: '默认 2，未达标优先分配选种机会' },
@@ -101,7 +102,7 @@ function fieldLabel(field) {
 
 function fieldRules(field) {
   const rules = field.required ? [required] : []
-  if (field.key === 'site_ratio_target') rules.push(positive)
+  if (['site_ratio_target', 'rotation_hours'].includes(field.key)) rules.push(positive)
   if (field.type === 'number') {
     rules.push(value => value === '' || value == null || Number.isFinite(Number(value)) || '请输入有效数字')
     if (field.min != null) rules.push(value => value === '' || value == null || Number(value) >= field.min || `不能小于 ${field.min}`)
@@ -232,6 +233,7 @@ async function saveTask(apply = false) {
               <div><dt>下载器</dt><dd>{{ localTask.downloader || '未选择' }}</dd></div>
               <div><dt>刷新</dt><dd>{{ scheduleText }}</dd></div>
               <div><dt>检查</dt><dd>每 {{ localTask.check_interval || 5 }} 分钟</dd></div>
+              <div><dt>单站驻留</dt><dd>{{ localTask.rotation_hours ?? 24 }} 小时</dd></div>
               <div><dt>目标分享率</dt><dd>{{ localTask.site_ratio_target || '不限' }}</dd></div>
               <div><dt>下载人数</dt><dd>{{ localTask.leecher || '不限' }}</dd></div>
               <div><dt>下载 / 做种</dt><dd>{{ localTask.min_peer_seed_ratio ?? '不限' }}</dd></div>

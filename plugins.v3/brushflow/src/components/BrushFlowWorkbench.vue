@@ -7,6 +7,7 @@ import {
   formatBytes,
   formatDateTime,
   formatDuration,
+  formatRemainingTime,
   normalizeSettings,
   taskStateMeta,
   torrentProgress,
@@ -31,6 +32,7 @@ const statusLoaded = ref(false)
 const status = ref({
   enabled: false,
   show_sidebar_nav: true,
+  rotation_mode: 'parallel',
   summary: {},
   tasks: [],
   options: { sites: [], downloaders: [] },
@@ -50,6 +52,7 @@ const settingsMenu = ref(false)
 const settingsDraft = ref({
   enabled: false,
   show_sidebar_nav: true,
+  rotation_mode: 'parallel',
   global_disksize: null,
   global_defaults: {},
   global_proxy_delete: false,
@@ -60,8 +63,10 @@ let refreshTimer
 
 const pluginBase = computed(() => `plugin/${props.pluginId || 'BrushFlow'}`)
 const tasks = computed(() => status.value.tasks || [])
+const siteRotation = computed(() => status.value.site_rotation || {})
+const sequentialMode = computed(() => (status.value.rotation_mode || siteRotation.value.mode) === 'sequential')
 const selectedTask = computed(() => tasks.value.find(item => item.id === selectedTaskId.value) || null)
-const selectedState = computed(() => taskStateMeta(selectedTask.value?.state))
+const selectedState = computed(() => taskStateMeta(selectedTask.value?.state, sequentialMode.value && selectedTask.value?.is_focus === false))
 const rawTaskConfig = computed(() => taskDetail.value?.task?.config || taskDetail.value?.task || {})
 const taskConfig = computed(() => taskDetail.value?.effective_config || effectiveTask(rawTaskConfig.value, status.value.global_defaults))
 const configurationSource = computed(() => rawTaskConfig.value.use_global_defaults === false ? '站点独立设置' : `继承全局 · ${(rawTaskConfig.value.override_fields || []).length} 项覆盖`)
@@ -125,6 +130,7 @@ async function loadStatus({ preserveSelection = true, loadDetail = true } = {}) 
     settingsDraft.value = {
       enabled: Boolean(status.value.enabled),
       show_sidebar_nav: status.value.show_sidebar_nav !== false,
+      rotation_mode: status.value.rotation_mode || 'parallel',
       global_disksize: status.value.global_disksize ?? null,
       global_defaults: status.value.global_defaults || {},
       global_proxy_delete: Boolean(status.value.global_proxy_delete),
@@ -200,6 +206,7 @@ async function saveGlobalDefaults(defaults, applyToExisting = false) {
     const payload = normalizeSettings({
       enabled: status.value.enabled,
       show_sidebar_nav: status.value.show_sidebar_nav,
+      rotation_mode: status.value.rotation_mode || 'parallel',
       global_disksize: status.value.global_disksize,
       global_proxy_delete: status.value.global_proxy_delete,
       global_delete_size_range: status.value.global_delete_size_range,
@@ -384,7 +391,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
         <VIcon icon="mdi-sync" color="primary" size="28" />
         <div>
           <h1>站点刷流</h1>
-          <p>统一参数 · 考核与分享率优先 · 多站点轮转</p>
+          <p>统一参数 · 考核与分享率优先 · {{ sequentialMode ? '单站轮换' : '多站并行' }}</p>
         </div>
       </div>
       <div class="brushflow-page__actions">
@@ -405,6 +412,16 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                 color="primary"
                 hide-details
                 inset
+              />
+              <VSelect
+                v-model="settingsDraft.rotation_mode"
+                label="站点轮换模式"
+                :items="[
+                  { title: '多站并行', value: 'parallel' },
+                  { title: '单站按驻留时间轮换', value: 'sequential' },
+                ]"
+                hint="单站模式默认每天重点一个站，驻留时间可在统一参数中设置或按站覆盖。"
+                persistent-hint
               />
               <VDivider />
               <VSwitch
@@ -447,6 +464,14 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
     <VAlert v-if="statusLoaded && !status.enabled" type="warning" variant="tonal">
       插件当前未启用，任务配置与历史仍可查看，启用后才会注册刷新和检查服务。
     </VAlert>
+    <VAlert v-if="statusLoaded && sequentialMode" type="info" variant="tonal">
+      <div class="d-flex flex-wrap align-center ga-2 mb-2">
+        <strong>当前重点站：{{ siteRotation.site_name || '等待选择站点' }}</strong>
+        <VChip v-if="siteRotation.deadline_at" size="small" variant="tonal">预计切换 {{ formatDateTime(siteRotation.deadline_at) }}</VChip>
+        <span v-if="siteRotation.remaining_seconds != null" class="text-body-2">{{ Number(siteRotation.remaining_seconds) > 0 ? '剩余约 ' : '' }}{{ formatRemainingTime(siteRotation.remaining_seconds) }}</span>
+      </div>
+      切换站点后，原有种子继续下载与做种，直到满足原删除条件。分享率只影响下一站优先级，不会提前切走；等待站点仍正常检查种子。
+    </VAlert>
 
     <div v-if="loading && !tasks.length" class="brushflow-loading">
       <VSkeletonLoader type="list-item-three-line, list-item-three-line, article" />
@@ -473,7 +498,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
         <template #item="{ props: itemProps, item }">
           <VListItem v-bind="itemProps" :subtitle="item.raw.site_name">
             <template #prepend>
-              <VIcon :icon="taskStateMeta(item.raw.state).icon" :color="taskStateMeta(item.raw.state).color" />
+              <VIcon :icon="taskStateMeta(item.raw.state, sequentialMode && item.raw.is_focus === false).icon" :color="taskStateMeta(item.raw.state, sequentialMode && item.raw.is_focus === false).color" />
             </template>
           </VListItem>
         </template>
@@ -497,9 +522,10 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
             >
               <span class="brushflow-task-item__title">
                 <strong>{{ task.name }}</strong>
-                <span class="brushflow-status-dot" :class="`brushflow-status-dot--${taskStateMeta(task.state).color}`" />
+                <span class="brushflow-status-dot" :class="`brushflow-status-dot--${taskStateMeta(task.state, sequentialMode && task.is_focus === false).color}`" />
               </span>
               <span>{{ task.site_name }} · {{ task.downloader }}</span>
+              <span v-if="sequentialMode && task.enabled">{{ task.is_focus ? '当前重点站' : taskStateMeta(task.state, task.is_focus === false).text }}</span>
               <span class="brushflow-task-item__meta">
                 <span>{{ task.statistic.active || 0 }} 个种子</span>
                 <span>{{ task.next_run_at ? formatDateTime(task.next_run_at) : '暂无计划' }}</span>
@@ -520,6 +546,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
               <div>
                 <div class="brushflow-task-head__title">
                   <h2>{{ selectedTask.name }}</h2>
+                  <VChip v-if="sequentialMode && selectedTask.is_focus" color="primary" size="small" variant="tonal">当前重点站</VChip>
                   <VChip :color="selectedState.color" size="small" variant="tonal" :prepend-icon="selectedState.icon">
                     {{ selectedState.text }}
                   </VChip>
@@ -609,6 +636,8 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                   <dl class="brushflow-facts">
                     <div><dt>参数来源</dt><dd>{{ configurationSource }}</dd></div>
                     <div><dt>选种优先级</dt><dd>{{ priorityText }}</dd></div>
+                    <div v-if="sequentialMode"><dt>单站驻留</dt><dd>{{ taskConfig.rotation_hours ?? 24 }} 小时</dd></div>
+                    <div v-if="sequentialMode && selectedTask.is_focus && siteRotation.deadline_at"><dt>预计切换</dt><dd>{{ formatDateTime(siteRotation.deadline_at) }}</dd></div>
                     <div><dt>刷新周期</dt><dd>{{ taskConfig.cron || `每 ${taskConfig.brush_interval} 分钟` }}</dd></div>
                     <div><dt>检查周期</dt><dd>每 {{ taskConfig.check_interval }} 分钟</dd></div>
                     <div><dt>开启时段</dt><dd>{{ taskConfig.active_time_range || '全天' }}</dd></div>
@@ -815,6 +844,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                     <div><dt>排除规则</dt><dd>{{ taskConfig.exclude || '无' }}</dd></div>
                     <div><dt>保种上限</dt><dd>{{ taskConfig.disksize ? `${taskConfig.disksize} GB` : '不限' }}</dd></div>
                     <div><dt>目标分享率</dt><dd>{{ taskConfig.site_ratio_target || '不限' }}（达标继续轮转）</dd></div>
+                    <div><dt>单站驻留时间</dt><dd>{{ taskConfig.rotation_hours ?? 24 }} 小时{{ sequentialMode ? '' : '（单站轮换模式生效）' }}</dd></div>
                     <div><dt>新手考核</dt><dd>{{ selectedTask.novice ? '优先' : taskConfig.novice ? '已到期' : '关闭' }}</dd></div>
                     <div v-if="taskConfig.novice_until"><dt>考核截止</dt><dd>{{ formatDateTime(taskConfig.novice_until) }}</dd></div>
                     <div><dt>促销保护</dt><dd>{{ taskConfig.del_no_free ? `提前 ${taskConfig.promotion_lead_minutes ?? 10} 分钟，包含排队任务` : '关闭' }}</dd></div>

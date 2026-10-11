@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 def load_plugin():
@@ -295,6 +295,161 @@ class BrushFlowTests(unittest.TestCase):
         self.plugin._dispatch_brush()
         self.assertEqual(self.added, ["3", "2", "1", "4"] * 3)
 
+    def test_daily_rotation_only_adds_focus_and_keeps_old_torrents_and_checks(self):
+        first, second = self.add_task(1), self.add_task(2)
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        p._run_check = Mock()
+        with patch.object(self.ns["time"], "time", return_value=1800000000) as clock:
+            self.queue(first, second)
+            p._dispatch_brush()
+            self.assertEqual(self.added, ["1"] * 3)
+            self.assertIn("2", p._pending_brush)
+            retained = p._get_task_data(first.id, "torrents")
+            p.check(second.id)
+            self.assertEqual(p._run_check.call_args.args[0], second)
+            self.queue(first)
+            clock.return_value += 86400
+            p._dispatch_brush()
+            self.assertEqual(self.added, ["1"] * 3 + ["2"] * 3)
+            self.assertEqual(p._get_task_data(first.id, "torrents"), retained)
+            p.check(first.id)
+            self.assertEqual(p._run_check.call_args.args[0], first)
+            self.assertTrue(first.enabled)
+
+    def test_daily_priority_cannot_starve_other_sites_and_round_repeats(self):
+        normal, low, novice = (self.add_task(i) for i in range(1, 4))
+        novice.novice = True
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        p._build_site_ratio_status = lambda task, *args: {"available": True, "reached": task.id != low.id}
+        selected = [p._select_rotation_site({}, now=1800000000 + day * 86400) for day in range(4)]
+        self.assertEqual(selected, [novice.site_id, low.site_id, normal.site_id, novice.site_id])
+
+    def test_daily_focus_survives_reload_and_ratio_changes_until_its_deadline(self):
+        first, second = self.add_task(1), self.add_task(2)
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        first.rotation_hours = 48
+        start = 1800000000
+        self.assertEqual(p._select_rotation_site({}, start), first.site_id)
+        reloaded = self.cls()
+        reloaded._rotation_mode = "sequential"
+        reloaded._task_configs = p._task_configs
+        reloaded.get_data = p.get_data
+        reloaded.save_data = p.save_data
+        second.novice = True
+        self.assertEqual(reloaded._select_rotation_site({}, start + 86400), first.site_id)
+        self.assertEqual(self.data["site_rotation"]["deadline_at"], start + 48 * 3600)
+
+    def test_disabled_focus_advances_and_rotation_runs_even_without_pending_tasks(self):
+        first, second = self.add_task(1), self.add_task(2)
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        with patch.object(self.ns["time"], "time", return_value=1800000000):
+            p._dispatch_brush()
+            self.assertEqual(self.data["site_rotation"]["site_id"], first.site_id)
+            first.enabled = False
+            self.queue(second)
+            p._dispatch_brush()
+            self.assertEqual(self.added, ["2"] * 3)
+            second.enabled = False
+            p._dispatch_brush()
+            self.assertEqual(self.data["site_rotation"], {})
+
+    def test_same_site_tasks_share_one_daily_turn_and_expiry_blocks_further_adds(self):
+        first, same, other = self.add_task(1), self.add_task(2, site=1), self.add_task(3)
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        with patch.object(self.ns["time"], "time", return_value=1800000000) as clock:
+            self.queue(first, same, other)
+            p._dispatch_brush()
+            self.assertEqual(self.added, ["1", "2"] * 3)
+            clock.return_value += 86400
+            self.assertFalse(p._is_focus_site(first.site_id))
+            self.assertEqual(p._select_rotation_site({}), other.site_id)
+            self.assertEqual(self.data["site_rotation"]["visited_site_ids"], [1, 3])
+
+    def test_rotation_hours_inherit_and_override_roundtrip(self):
+        config = self.ns["BrushTaskConfig"]
+        task = config({"id": "1", "name": "one", "site_id": 1}, {"rotation_hours": 48})
+        self.assertEqual(task.rotation_hours, 48)
+        self.assertNotIn("rotation_hours", task.to_dict())
+        task = config({**task.to_dict(), "override_fields": ["rotation_hours"], "rotation_hours": 12},
+                      {"rotation_hours": 48})
+        self.assertEqual(config(task.to_dict(), {"rotation_hours": 24}).rotation_hours, 12)
+
+    def test_browse_crossing_focus_deadline_retains_pending_without_adding(self):
+        task = self.add_task(1)
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        with patch.object(self.ns["time"], "time", return_value=1800000000) as clock:
+            p._select_rotation_site({})
+            clock.return_value += 86399
+
+            def browse(domain):
+                clock.return_value += 2
+                return self.candidates[domain]
+
+            self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=browse)
+            self.queue(task)
+            p._dispatch_brush()
+        self.assertEqual(self.added, [])
+        self.assertIn(task.id, p._pending_brush)
+        report = p._get_task_data(task.id, "runs")[0]
+        self.assertEqual(report["result"], "outside_focus")
+        self.assertNotIn("下载器添加失败", report["reason_counts"])
+
+    def test_torrent_fetch_crossing_focus_deadline_never_submits_to_downloader(self):
+        for downloader_name in ("tb", "qb"):
+            with self.subTest(downloader=downloader_name):
+                self.setUp()
+                task = self.add_task(1, downloader=downloader_name)
+                p = self.plugin
+                p._rotation_mode = "sequential"
+                p._BrushFlow__download = self.cls._BrushFlow__download.__get__(p)
+                self.ns["StringUtils"] = SimpleNamespace(generate_random_str=lambda size: "unique-tag")
+                downloader = self.services[downloader_name].instance
+                downloader.add_torrent = Mock()
+                for torrent in self.candidates["1"]:
+                    torrent.enclosure = "https://example.invalid/torrent"
+                    torrent.site_proxy = False
+                    torrent.site_cookie = None
+                    torrent.site_ua = None
+                with patch.object(self.ns["time"], "time", return_value=1800000000) as clock:
+                    p._select_rotation_site({})
+                    clock.return_value += 86399
+
+                    def fetch(**kwargs):
+                        clock.return_value += 2
+                        return SimpleNamespace(ok=True, content=b"torrent")
+
+                    self.ns["RequestUtils"] = lambda **kwargs: SimpleNamespace(get_res=fetch)
+                    self.queue(task)
+                    p._dispatch_brush()
+                downloader.add_torrent.assert_not_called()
+                self.assertIn(task.id, p._pending_brush)
+                report = p._get_task_data(task.id, "runs")[0]
+                self.assertEqual(report["result"], "outside_focus")
+                self.assertNotIn("下载器添加失败", report["reason_counts"])
+
+    def test_settings_without_rotation_mode_preserve_focus_and_deadline(self):
+        task = self.add_task(1)
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        p._select_rotation_site({}, now=1800000000)
+        previous = copy.deepcopy(self.data["site_rotation"])
+        p._show_sidebar_nav = True
+        p._global_proxy_delete = False
+        p._global_delete_size_range = None
+        p._save_config = Mock()
+        p._build_status_data = lambda: {}
+        self.ns["schemas"] = SimpleNamespace(Response=lambda **values: SimpleNamespace(**values))
+        payload = self.ns["BrushFlowSettingsPayload"](global_disksize=100)
+        self.assertTrue(p.update_settings(payload).success)
+        self.assertEqual(p._rotation_mode, "sequential")
+        self.assertEqual(self.data["site_rotation"], previous)
+
     def test_space_reserves_queued_full_size_and_deduplicates_same_hash(self):
         first, second = self.add_task(1), self.add_task(2)
         self.plugin._global_disksize = 300 / 1024 ** 3
@@ -374,6 +529,41 @@ class BrushFlowTests(unittest.TestCase):
             self.assertEqual(evaluate(torrent, {})[1], "促销剩余时间不足")
             torrent.freedate = (datetime.now(timezone.utc) + timedelta(minutes=11)).isoformat()
             self.assertTrue(evaluate(torrent, {})[0])
+
+    def test_station_candidate_queue_prefers_fresh_demand_over_newest_or_old_ratio(self):
+        from datetime import timedelta, timezone
+        task = self.add_task(1)
+        now = datetime.now(timezone.utc)
+        rows = self.candidates["1"]
+        for torrent, title, peers, seeds, age in zip(
+            rows, ("newest-weak", "fresh-demand", "old-high-ratio"),
+            (1, 20, 100), (10, 5, 1), (1, 30, 7 * 1440),
+        ):
+            torrent.title, torrent.peers, torrent.seeders = title, peers, seeds
+            torrent.pubdate = (now - timedelta(minutes=age)).isoformat()
+        self.plugin._task_context.candidates = {}
+        report = self.plugin._new_run_report("brush")
+        with self.plugin._task_scope(task.id):
+            self.plugin._BrushFlow__brush_site_torrents(
+                SimpleNamespace(id=1, name="one", domain="1"), {}, {}, set(), report, 0,
+            )
+        self.assertEqual(report["added_titles"], ["fresh-demand"])
+
+    def test_publication_filter_rejects_unknown_and_respects_explicit_timezone(self):
+        from datetime import timedelta, timezone
+        task = self.add_task(1)
+        task.pubtime, task.timezone_offset = "0-120", 8
+        evaluate = self.cls._BrushFlow__evaluate_conditions_for_brush.__get__(self.plugin)
+        torrent = SimpleNamespace(title="sample", description="", site_name="one", page_url=None,
+                                  size=100, downloadvolumefactor=0, uploadvolumefactor=1,
+                                  hit_and_run=False, seeders=10, peers=1, freedate=None,
+                                  pubdate="invalid")
+        with self.plugin._task_scope(task.id):
+            self.assertEqual(evaluate(torrent, {})[1], "发布时间未知")
+            published = datetime.now(timezone.utc) - timedelta(minutes=60)
+            for value in (published.isoformat(), published.astimezone(timezone(timedelta(hours=8))).isoformat()):
+                torrent.pubdate = value
+                self.assertTrue(evaluate(torrent, {})[0])
 
     def test_unavailable_downloader_keeps_pending_without_blocking_other_sites(self):
         unavailable = self.add_task(1)

@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
-from .rules import download_has_started, evaluate_peer_demand, promotion_deadline
+from .rules import demand_rank, download_has_started, evaluate_peer_demand, promotion_deadline, publication_age_minutes
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import Query
@@ -56,6 +56,7 @@ TASK_CONFIG_FIELDS = (
     "active_time_range",
     "site_ratio_control",
     "site_ratio_target",
+    "rotation_hours",
     "novice",
     "novice_until",
     "disksize",
@@ -161,6 +162,7 @@ class BrushTaskConfig:
         self.active_time_range = self._clean_text(config.get("active_time_range"))
         self.site_ratio_control = True
         self.site_ratio_target = self._parse_number(config.get("site_ratio_target"))
+        self.rotation_hours = min(max(float(self._parse_number(config.get("rotation_hours")) or 24), 0.01), 168)
         self.novice = bool(config.get("novice", False))
         self.novice_until = self._clean_text(config.get("novice_until"))
         self.disksize = self._parse_number(config.get("disksize"))
@@ -253,7 +255,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.0.0"
+    plugin_version = "7.1.0"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -280,6 +282,11 @@ class BrushFlow(_PluginBase):
         self._subscribe_infos: Dict[str, List[str]] = {}
         self._enabled = bool(raw_config.get("enabled", False))
         self._show_sidebar_nav = bool(raw_config.get("show_sidebar_nav", True))
+        self._rotation_mode = raw_config.get("rotation_mode", "parallel")
+        if self._rotation_mode not in {"parallel", "sequential"}:
+            self._rotation_mode = "parallel"
+        if self._rotation_mode == "parallel" and self.get_data("site_rotation"):
+            self.save_data("site_rotation", {})
         self._global_defaults = {
             key: (raw_config.get("global_defaults") or {}).get(key, DEFAULT_TASK_SETTINGS.get(key))
             for key in SHARED_TASK_FIELDS
@@ -597,6 +604,11 @@ class BrushFlow(_PluginBase):
         global_dynamic_delete_was_enabled = self._global_dynamic_delete_enabled()
         self._enabled = payload.enabled
         self._show_sidebar_nav = payload.show_sidebar_nav
+        rotation_mode = (payload.rotation_mode if "rotation_mode" in payload.model_fields_set
+                         else getattr(self, "_rotation_mode", "parallel"))
+        if rotation_mode != getattr(self, "_rotation_mode", "parallel"):
+            self.save_data("site_rotation", {})
+        self._rotation_mode = rotation_mode
         for field in GLOBAL_LIMIT_FIELDS:
             setattr(self, f"_{field}", getattr(payload, field))
         for field in GLOBAL_DYNAMIC_DELETE_FIELDS:
@@ -729,6 +741,7 @@ class BrushFlow(_PluginBase):
             "schema_version": self.DATA_SCHEMA_VERSION,
             "enabled": bool(getattr(self, "_enabled", False)),
             "show_sidebar_nav": bool(getattr(self, "_show_sidebar_nav", True)),
+            "rotation_mode": getattr(self, "_rotation_mode", "parallel"),
             "global_defaults": getattr(self, "_global_defaults", {}),
             "tasks": [task.to_dict() for task in getattr(self, "_task_configs", {}).values()],
         }
@@ -1164,6 +1177,8 @@ class BrushFlow(_PluginBase):
         return {
             "enabled": self.get_state(),
             "show_sidebar_nav": self._show_sidebar_nav,
+            "rotation_mode": getattr(self, "_rotation_mode", "parallel"),
+            "site_rotation": self._build_rotation_status(),
             "global_defaults": self._global_defaults,
             **{field: getattr(self, f"_{field}", None) for field in GLOBAL_LIMIT_FIELDS},
             **{field: getattr(self, f"_{field}", None) for field in GLOBAL_DYNAMIC_DELETE_FIELDS},
@@ -1194,6 +1209,8 @@ class BrushFlow(_PluginBase):
             display_state = runtime.get("operation") or "running"
         elif not self._is_current_time_in_range(task):
             display_state = "waiting"
+        elif not self._is_focus_site(task.site_id):
+            display_state = "waiting"
         elif task_id in self._pending_brush:
             display_state = "waiting"
         elif runtime.get("last_error"):
@@ -1221,6 +1238,7 @@ class BrushFlow(_PluginBase):
             "site_ratio": site_ratio,
             "priority": self._priority_tier(task, site_ratio),
             "novice": self._novice_active(task),
+            "is_focus": self._is_focus_site(task.site_id),
         }
 
     @staticmethod
@@ -1411,6 +1429,64 @@ class BrushFlow(_PluginBase):
             latest = max(latest, float(added))
         return latest
 
+    def _is_focus_site(self, site_id: int) -> bool:
+        """驻留只控制新增种子，状态检查和已有下载不受影响。"""
+        if getattr(self, "_rotation_mode", "parallel") != "sequential":
+            return True
+        state = self.get_data("site_rotation") or {}
+        deadline = BrushTaskConfig._parse_number(state.get("deadline_at")) or 0
+        return state.get("site_id") == site_id and deadline > time.time()
+
+    def _select_rotation_site(self, site_data: dict, now: Optional[float] = None) -> Optional[int]:
+        """在分配锁内持久化驻留站点，每个启用站点每轮获得一次机会。"""
+        if getattr(self, "_rotation_mode", "parallel") != "sequential":
+            return None
+        now = time.time() if now is None else now
+        tasks = [task for task in self._task_configs.values() if task.enabled]
+        site_ids = {task.site_id for task in tasks}
+        state = self.get_data("site_rotation") or {}
+        deadline = BrushTaskConfig._parse_number(state.get("deadline_at")) or 0
+        if state.get("site_id") in site_ids and deadline > now:
+            return state["site_id"]
+        if not tasks:
+            if state:
+                self.save_data("site_rotation", {})
+            return None
+        visited = [sid for sid in state.get("visited_site_ids", []) if sid in site_ids]
+        remaining = [task for task in tasks if task.site_id not in visited]
+        if not remaining:
+            visited = []
+            remaining = tasks
+        selected = min(remaining, key=lambda task: (
+            self._priority_tier(task, self._build_site_ratio_status(task, site_data)),
+            self._site_last_added(task.site_id), task.id,
+        ))
+        self.save_data("site_rotation", {
+            "site_id": selected.site_id,
+            "started_at": now,
+            "deadline_at": now + selected.rotation_hours * 3600,
+            "visited_site_ids": [*visited, selected.site_id],
+        })
+        logger.info(f"刷流驻留站点：{selected.name}，持续 {selected.rotation_hours:g} 小时，已有种子继续托管")
+        return selected.site_id
+
+    def _build_rotation_status(self) -> Dict[str, Any]:
+        state = self.get_data("site_rotation") or {}
+        mode = getattr(self, "_rotation_mode", "parallel")
+        site_id = state.get("site_id") if mode == "sequential" else None
+        task = next((row for row in self._task_configs.values() if row.site_id == site_id and row.enabled), None)
+        started = BrushTaskConfig._parse_number(state.get("started_at")) if task else None
+        deadline = BrushTaskConfig._parse_number(state.get("deadline_at")) if task else None
+        return {
+            "mode": mode,
+            "site_id": site_id if task else None,
+            "site_name": (self._get_site_name(site_id) or task.name) if task else None,
+            "started_at": datetime.fromtimestamp(started, ZoneInfo(settings.TZ)).isoformat() if started else None,
+            "deadline_at": datetime.fromtimestamp(deadline, ZoneInfo(settings.TZ)).isoformat() if deadline else None,
+            "remaining_seconds": max(0, int(deadline - time.time())) if deadline else 0,
+            "visited_site_ids": state.get("visited_site_ids", []) if mode == "sequential" else [],
+        }
+
     def brush(self, task_id: Optional[str] = None) -> None:
         """手动刷新进入统一轮转，并检查空间额度。"""
         self._queue_brush(task_id)
@@ -1423,12 +1499,19 @@ class BrushFlow(_PluginBase):
         reports = {}
         self._task_context.candidates = {}
         try:
+            site_data = self._latest_site_user_data_by_domain()
+            self._select_rotation_site(site_data)
             with self._runtime_lock:
+                for tid in list(self._pending_brush):
+                    if tid not in self._task_configs or not self._task_configs[tid].enabled:
+                        self._pending_brush.pop(tid, None)
                 pending = dict(self._pending_brush)
             if not pending:
                 return
-            tasks = [self._task_configs[tid] for tid in pending if tid in self._task_configs]
-            site_data = self._latest_site_user_data_by_domain()
+            tasks = [self._task_configs[tid] for tid in pending
+                     if self._is_focus_site(self._task_configs[tid].site_id)]
+            if not tasks:
+                return
             self._task_context.site_user_data = site_data
             priorities = {task.id: self._priority_tier(task, self._build_site_ratio_status(task, site_data))
                           for task in tasks}
@@ -1441,6 +1524,8 @@ class BrushFlow(_PluginBase):
                 for task in tasks:
                     if self._stopping or not self.get_state():
                         break
+                    if not self._is_focus_site(task.site_id):
+                        continue
                     if not task.enabled:
                         with self._runtime_lock:
                             self._pending_brush.pop(task.id, None)
@@ -1454,6 +1539,8 @@ class BrushFlow(_PluginBase):
                     if result is None:
                         continue
                     reports[task.id] = result
+                    if result.get("result") == "outside_focus":
+                        continue
                     if result["added_count"] > before:
                         deadline = self._next_promotion_expiry(task)
                         previous = scheduled_deadlines.get(task.id)
@@ -1609,11 +1696,19 @@ class BrushFlow(_PluginBase):
                 if report["subscription_excluded"]:
                     report["reason_counts"]["命中订阅内容"] = report["subscription_excluded"]
             report["candidate_count"] = len(torrents)
-            torrents.sort(key=lambda item: item.pubdate or "", reverse=True)
+            ranked_at = datetime.now().astimezone()
+            torrents.sort(key=lambda item: demand_rank(
+                getattr(item, "peers", None), getattr(item, "seeders", None),
+                publication_age_minutes(item.pubdate, task.timezone_offset, settings.TZ, ranked_at),
+            ), reverse=True)
             queues[task.id] = list(torrents)
         torrents = queues[task.id]
         seeding_size = self.__calculate_seeding_torrents_size(torrent_tasks)
         while torrents:
+            if not self._is_focus_site(task.site_id):
+                report["result"] = "outside_focus"
+                report["reason_counts"]["等待站点轮转"] += 1
+                return
             torrent = torrents.pop(0)
             passed, reason = self.__evaluate_pre_conditions_for_brush(include_network_conditions=False)
             if not passed:
@@ -1634,6 +1729,10 @@ class BrushFlow(_PluginBase):
                 continue
             hash_string = self.__download(torrent)
             if not hash_string:
+                if not self._is_focus_site(task.site_id):
+                    report["result"] = "outside_focus"
+                    report["reason_counts"]["等待站点轮转"] += 1
+                    return
                 report["reason_counts"]["下载器添加失败"] += 1
                 break
             self._reserve_download(task, hash_string)
@@ -1828,7 +1927,9 @@ class BrushFlow(_PluginBase):
         if not passed:
             return False, reason
         if task.pubtime:
-            pubdate_minutes = self.__get_pubminutes(torrent.pubdate) - task.timezone_offset * 60
+            pubdate_minutes = self.__get_pubminutes(torrent.pubdate, task.timezone_offset)
+            if pubdate_minutes is None:
+                return False, "发布时间未知"
             pubtime_range = [float(value) for value in task.pubtime.split("-")]
             if len(pubtime_range) == 1 and pubdate_minutes > pubtime_range[0]:
                 return False, "发布时间超过上限"
@@ -2770,6 +2871,8 @@ class BrushFlow(_PluginBase):
                 )
                 if response and response.ok:
                     torrent_content = response.content
+            if not self._is_focus_site(task.site_id):
+                return None
             if not downloader.add_torrent(
                 content=torrent_content,
                 download_dir=task.save_path,
@@ -2800,6 +2903,8 @@ class BrushFlow(_PluginBase):
                 )
                 if response and response.ok:
                     torrent_content = response.content
+            if not self._is_focus_site(task.site_id):
+                return None
             added_torrent = downloader.add_torrent(
                 content=torrent_content,
                 download_dir=task.save_path,
@@ -3061,16 +3166,9 @@ class BrushFlow(_PluginBase):
         return len(self._downloading_keys(list(self._task_configs.values()), include_global=True))
 
     @staticmethod
-    def __get_pubminutes(pubdate: str) -> float:
+    def __get_pubminutes(pubdate: str, timezone_offset: float = 0) -> Optional[float]:
         """计算站点发布时间距当前时间的分钟数"""
-        if not pubdate:
-            return 0
-        try:
-            publish_time = datetime.strptime(pubdate.replace("T", " ").replace("Z", ""), "%Y-%m-%d %H:%M:%S")
-            return (datetime.now() - publish_time).total_seconds() / 60
-        except (TypeError, ValueError) as err:
-            logger.error(f"解析发布时间 {pubdate} 失败：{str(err)}")
-            return 0
+        return publication_age_minutes(pubdate, timezone_offset, settings.TZ)
 
     def __filter_torrents_by_tag(self, torrents: List[Any], exclude_tag: Optional[str]) -> List[Any]:
         """过滤包含任一删除排除标签的种子"""

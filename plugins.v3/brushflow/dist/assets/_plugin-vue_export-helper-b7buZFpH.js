@@ -11,6 +11,7 @@ const taskDefaults = {
   downloader: '',
   brush_interval: 10,
   check_interval: 5,
+  rotation_hours: 24,
   cron: null,
   active_time_range: null,
   site_ratio_target: 2,
@@ -121,6 +122,7 @@ function normalizeTask(task) {
   result.site_id = Number(result.site_id);
   result.brush_interval = Number(result.brush_interval || 10);
   result.check_interval = Number(result.check_interval || 5);
+  result.rotation_hours = Number(result.rotation_hours ?? 24);
   result.timezone_offset = Number(result.timezone_offset || 0);
   result.min_peer_seed_ratio = result.min_peer_seed_ratio === '' || result.min_peer_seed_ratio == null ? 0 : Number(result.min_peer_seed_ratio);
   result.promotion_lead_minutes = Number(result.promotion_lead_minutes ?? 10);
@@ -136,6 +138,7 @@ function normalizeDefaults(defaults = {}) {
 /** 把全局设置中的空值、零值和正数标准化为后端请求类型。 */
 function normalizeSettings(settings = {}) {
   const result = { ...(settings || {}) };
+  result.rotation_mode = result.rotation_mode === 'sequential' ? 'sequential' : 'parallel';
   const limitFields = ['global_disksize'];
   limitFields.forEach(key => {
     const value = Number(result[key] || 0);
@@ -181,17 +184,26 @@ function formatDuration(startedAt, finishedAt) {
 }
 
 /** 返回任务状态对应的中文文本、主题色和图标。 */
-function taskStateMeta(state) {
+function taskStateMeta(state, waitingRotation = false) {
   const states = {
     running: { text: '运行中', color: 'success', icon: 'mdi-check-circle-outline' },
     brush: { text: '正在刷新', color: 'primary', icon: 'mdi-sync' },
     check: { text: '正在检查', color: 'info', icon: 'mdi-progress-check' },
     paused: { text: '已暂停', color: 'secondary', icon: 'mdi-pause-circle-outline' },
     waiting: { text: '等待时段', color: 'warning', icon: 'mdi-clock-outline' },
+    waiting_rotation: { text: '等待轮转', color: 'info', icon: 'mdi-clock-outline' },
     disabled: { text: '插件停用', color: 'secondary', icon: 'mdi-stop-circle-outline' },
     error: { text: '运行异常', color: 'error', icon: 'mdi-alert-circle-outline' },
   };
-  return states[state] || states.running
+  return states[state === 'waiting' && waitingRotation ? 'waiting_rotation' : state] || states.running
+}
+
+function formatRemainingTime(value) {
+  const minutes = Math.max(0, Math.ceil(Number(value || 0) / 60));
+  if (!minutes) return '即将切换'
+  const hours = Math.floor(minutes / 60);
+  const remaining = minutes % 60;
+  return hours ? `${hours} 小时${remaining ? ` ${remaining} 分钟` : ''}` : `${remaining} 分钟`
 }
 
 /** 根据已下载量和总大小计算种子完成百分比。 */
@@ -209,4 +221,4 @@ const _export_sfc = (sfc, props) => {
   return target;
 };
 
-export { _export_sfc as _, taskDefaults as a, normalizeTask as b, cloneTask as c, formatDateTime as d, effectiveTask as e, formatBytes as f, formatDuration as g, torrentProgress as h, normalizeSettings as i, normalizeDefaults as n, taskStateMeta as t, unwrapResponse as u };
+export { _export_sfc as _, formatDateTime as a, formatRemainingTime as b, cloneTask as c, taskDefaults as d, effectiveTask as e, formatBytes as f, normalizeTask as g, formatDuration as h, torrentProgress as i, normalizeSettings as j, normalizeDefaults as n, taskStateMeta as t, unwrapResponse as u };

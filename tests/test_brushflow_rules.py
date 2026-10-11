@@ -52,6 +52,47 @@ class PeerDemandTests(unittest.TestCase):
         self.assertTrue(rules.evaluate_peer_demand("5", "10", " 5 - 8 ")[0])
 
 
+class DemandRankTests(unittest.TestCase):
+    def test_demand_and_competition_both_affect_order(self):
+        self.assertGreater(rules.demand_rank(20, 5, 30), rules.demand_rank(1, 5, 5))
+        self.assertGreater(rules.demand_rank(20, 5, 30), rules.demand_rank(20, 50, 30))
+        self.assertGreater(rules.demand_rank(20, 20, 30), rules.demand_rank(1, 1, 30))
+
+    def test_old_high_ratio_does_not_dominate_fresh_demand(self):
+        self.assertGreater(rules.demand_rank(5, 5, 30), rules.demand_rank(100, 1, 7 * 1440))
+        self.assertGreater(rules.demand_rank(5, 5, 30), rules.demand_rank(5, 5, 390))
+
+    def test_unknown_or_future_values_do_not_gain_priority(self):
+        valid = rules.demand_rank(1, 10, 10)
+        for values in ((None, 1, 1), (1, None, 1), (1000, 1, None),
+                       (1000, 1, -1), (float("inf"), 1, 1)):
+            with self.subTest(values=values):
+                self.assertGreater(valid, rules.demand_rank(*values))
+
+
+class PublicationAgeTests(unittest.TestCase):
+    now = datetime(2026, 10, 12, 12, tzinfo=timezone.utc)
+
+    def test_explicit_timezones_represent_the_same_age(self):
+        for published in ("2026-10-12T11:00:00Z", "2026-10-12T19:00:00+08:00",
+                          "2026-10-12T07:00:00-04:00"):
+            with self.subTest(published=published):
+                self.assertEqual(rules.publication_age_minutes(published, 8, "UTC", self.now), 60)
+
+    def test_naive_publication_preserves_manual_correction(self):
+        self.assertEqual(rules.publication_age_minutes("2026-10-12 03:00:00", 8, "UTC", self.now), 60)
+
+    @unittest.skipUnless(has_timezone_data(), "系统未提供 IANA 时区数据")
+    def test_host_zone_only_applies_to_naive_publication(self):
+        self.assertEqual(rules.publication_age_minutes("2026-10-12 19:00:00", 0, "Asia/Shanghai", self.now), 60)
+        self.assertEqual(rules.publication_age_minutes("2026-10-12T11:00:00Z", 8, "Asia/Shanghai", self.now), 60)
+
+    def test_invalid_date_is_unknown_instead_of_fresh(self):
+        for published in (None, "", "bad", "2026-02-30", 12345):
+            self.assertIsNone(rules.publication_age_minutes(published, 0, "UTC", self.now))
+        self.assertEqual(rules.publication_age_minutes("2026-10-12T13:00:00Z", 0, "UTC", self.now), -60)
+
+
 class PromotionDeadlineTests(unittest.TestCase):
     def test_naive_expiry_preserves_hour_offset(self):
         deadline = rules.promotion_deadline("2026-10-11 20:00:00", 8, "UTC")
