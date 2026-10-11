@@ -20,6 +20,7 @@ from fastapi import Query
 from app import schemas
 from app.api.endpoints.plugin import register_plugin_api
 from app.chain.torrents import TorrentsChain
+from app.chain.site import SiteChain
 from app.sdk.config import settings
 from app.sdk.media import MediaInfo
 from app.sdk.events import Event, eventmanager
@@ -255,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.1.2"
+    plugin_version = "7.1.3"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -1435,7 +1436,7 @@ class BrushFlow(_PluginBase):
             return True
         state = self.get_data("site_rotation") or {}
         deadline = BrushTaskConfig._parse_number(state.get("deadline_at")) or 0
-        return state.get("site_id") == site_id and deadline > time.time()
+        return state.get("site_id") == site_id and deadline > time.time() and not state.get("retry_at")
 
     def _select_rotation_site(self, site_data: dict, now: Optional[float] = None) -> Optional[int]:
         """在分配锁内持久化驻留站点，每个启用站点每轮获得一次机会。"""
@@ -1445,18 +1446,23 @@ class BrushFlow(_PluginBase):
         tasks = [task for task in self._task_configs.values() if task.enabled]
         site_ids = {task.site_id for task in tasks}
         state = self.get_data("site_rotation") or {}
+        cooldowns = {sid: until for sid, until in state.get("retry_cooldowns", {}).items() if until > now}
         deadline = BrushTaskConfig._parse_number(state.get("deadline_at")) or 0
-        if state.get("site_id") in site_ids and deadline > now:
+        if state.get("site_id") in site_ids and (deadline > now or state.get("retry_at")):
             return state["site_id"]
         if not tasks:
             if state:
                 self.save_data("site_rotation", {})
             return None
         visited = [sid for sid in state.get("visited_site_ids", []) if sid in site_ids]
-        remaining = [task for task in tasks if task.site_id not in visited]
+        eligible = [task for task in tasks if str(task.site_id) not in cooldowns]
+        if not eligible:
+            self.save_data("site_rotation", {"visited_site_ids": visited, "retry_cooldowns": cooldowns})
+            return None
+        remaining = [task for task in eligible if task.site_id not in visited]
         if not remaining:
             visited = []
-            remaining = tasks
+            remaining = eligible
         selected = min(remaining, key=lambda task: (
             self._priority_tier(task, self._build_site_ratio_status(task, site_data)),
             self._site_last_added(task.site_id), task.id,
@@ -1466,9 +1472,53 @@ class BrushFlow(_PluginBase):
             "started_at": now,
             "deadline_at": now + selected.rotation_hours * 3600,
             "visited_site_ids": [*visited, selected.site_id],
+            "retry_cooldowns": cooldowns,
         })
         logger.info(f"刷流驻留站点：{selected.name}，持续 {selected.rotation_hours:g} 小时，已有种子继续托管")
         return selected.site_id
+
+    def _check_rotation_site(self, now: Optional[float] = None) -> bool:
+        """首次失败后每十分钟重试，五次仍失败则让出驻留。"""
+        if getattr(self, "_rotation_mode", "parallel") != "sequential":
+            return True
+        now = time.time() if now is None else now
+        state = self.get_data("site_rotation") or {}
+        task = next((task for task in self._task_configs.values()
+                     if task.enabled and task.site_id == state.get("site_id")), None)
+        if not task:
+            return False
+        if state.get("health_checked"):
+            return True
+        if state.get("retry_at", 0) > now:
+            return False
+        site = SiteOper().get(task.site_id)
+        try:
+            healthy = bool(site and SiteChain().test(site.domain)[0])
+        except Exception:
+            healthy = False
+        if healthy:
+            recovered = bool(state.get("retry_at"))
+            if recovered:
+                state.update(started_at=now, deadline_at=now + task.rotation_hours * 3600)
+            state.update(health_checked=True, retry_count=0, retry_at=None)
+            self.save_data("site_rotation", state)
+            if recovered:
+                for row in self._task_configs.values():
+                    if row.enabled and row.site_id == task.site_id:
+                        self._queue_brush(row.id)
+            return True
+        retries = state.get("retry_count", 0) + (1 if state.get("retry_at") else 0)
+        if retries >= 5:
+            cooldowns = state.get("retry_cooldowns", {})
+            cooldowns[str(task.site_id)] = now + 600
+            state.update(site_id=None, deadline_at=0, retry_at=None, retry_count=retries,
+                         retry_cooldowns=cooldowns)
+            logger.warning(f"刷流站点 [{task.name}] 重试五次仍不可用，跳过本轮")
+        else:
+            state.update(retry_count=retries, retry_at=now + 600)
+            logger.warning(f"刷流站点 [{task.name}] 不可用，十分钟后重试（已重试 {retries}/5）")
+        self.save_data("site_rotation", state)
+        return False
 
     def _build_rotation_status(self) -> Dict[str, Any]:
         state = self.get_data("site_rotation") or {}
@@ -1485,6 +1535,8 @@ class BrushFlow(_PluginBase):
             "deadline_at": datetime.fromtimestamp(deadline, ZoneInfo(settings.TZ)).isoformat() if deadline else None,
             "remaining_seconds": max(0, int(deadline - time.time())) if deadline else 0,
             "visited_site_ids": state.get("visited_site_ids", []) if mode == "sequential" else [],
+            "retry_count": state.get("retry_count", 0),
+            "retry_at": state.get("retry_at"),
         }
 
     def brush(self, task_id: Optional[str] = None) -> None:
@@ -1501,6 +1553,8 @@ class BrushFlow(_PluginBase):
         try:
             site_data = self._latest_site_user_data_by_domain()
             self._select_rotation_site(site_data)
+            if not self._check_rotation_site():
+                return
             self._prioritize_download_queue(site_data)
             with self._runtime_lock:
                 for tid in list(self._pending_brush):
@@ -1897,9 +1951,12 @@ class BrushFlow(_PluginBase):
         self,
         include_network_conditions: bool = True,
     ) -> Tuple[bool, Optional[str]]:
-        """数量和带宽由下载器管理，插件仅检查任务可用性。"""
-        if not self._get_task_config():
+        """已完成保种达到每站五十个时停止新增，下载并发仍由下载器管理。"""
+        task = self._get_task_config()
+        if not task:
             return False, "任务配置不存在"
+        if self._site_completed_count(task.site_id) >= 50:
+            return False, "本站已完成保种达到 50 个，等待按删除规则释放名额"
         return True, None
 
     def __evaluate_conditions_for_brush(
@@ -3203,6 +3260,22 @@ class BrushFlow(_PluginBase):
         return len(self._downloading_keys([
             task for task in list(self._task_configs.values()) if task.site_id == site_id
         ]))
+
+    def _site_completed_count(self, site_id: int) -> int:
+        """按实际仍保留的已完成种子计数，删除落地后才释放名额。"""
+        snapshot = getattr(self._task_context, "downloads", None)
+        if snapshot is None:
+            snapshot = self._read_downloads()
+        keys = set()
+        for task in self._task_configs.values():
+            if task.site_id != site_id:
+                continue
+            records = self._get_task_data(task.id, "torrents") or {}
+            for torrent_hash, torrent in snapshot.get(task.downloader, {}).items():
+                if (torrent_hash in records or task.brush_tag in self._download_labels(torrent)) \
+                        and not self._unfinished_download(torrent):
+                    keys.add((task.downloader, torrent_hash))
+        return len(keys)
 
     def __get_downloading_count(self) -> int:
         task = self._get_task_config()

@@ -68,6 +68,8 @@ class BrushFlowTests(unittest.TestCase):
             get_service=lambda name: self.services.get(name),
             is_downloader=lambda kind, service: (kind == "qbittorrent") == (service.name == "qb"))
         self.ns["SiteOper"] = lambda: SimpleNamespace(get=lambda sid: SimpleNamespace(id=sid, name=str(sid), domain=str(sid)))
+        self.site_test = Mock(return_value=(True, ""))
+        self.ns["SiteChain"] = lambda: SimpleNamespace(test=self.site_test)
         self.candidates = {}
         self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=lambda domain: self.candidates.get(domain, []))
         p._validate_task_reference = lambda *args, **kwargs: True
@@ -136,6 +138,71 @@ class BrushFlowTests(unittest.TestCase):
         self.plugin._prioritize_download_queue({})
         self.assertEqual([call.kwargs["torrent_hashes"] for call in client.torrents_top_priority.call_args_list],
                          [["normal"], ["novice"]])
+
+    def test_rotation_retries_five_times_ten_minutes_apart_then_skips(self):
+        self.add_task(1)
+        self.add_task(2)
+        self.plugin._rotation_mode = "sequential"
+        self.plugin._select_rotation_site({}, now=100)
+        self.site_test.return_value = (False, "unavailable")
+        self.assertFalse(self.plugin._check_rotation_site(now=100))
+        for attempt in range(1, 6):
+            due = 100 + attempt * 600
+            self.assertFalse(self.plugin._check_rotation_site(now=due - 1))
+            self.assertEqual(self.site_test.call_count, attempt)
+            self.assertFalse(self.plugin._check_rotation_site(now=due))
+        self.assertEqual(self.site_test.call_count, 6)
+        self.assertEqual(self.plugin._select_rotation_site({}, now=3100), 2)
+
+    def test_rotation_retry_recovery_and_restart_keep_schedule(self):
+        task = self.add_task(1)
+        self.plugin._rotation_mode = "sequential"
+        self.plugin._select_rotation_site({}, now=100)
+        self.site_test.return_value = (False, "")
+        self.plugin._check_rotation_site(now=100)
+        self.assertEqual(self.plugin._select_rotation_site({}, now=600), 1)
+        self.assertFalse(self.plugin._check_rotation_site(now=699))
+        self.site_test.return_value = (True, "")
+        self.assertTrue(self.plugin._check_rotation_site(now=700))
+        state = self.data["site_rotation"]
+        self.assertIsNone(state["retry_at"])
+        self.assertEqual(state["deadline_at"], 700 + task.rotation_hours * 3600)
+        self.assertIn(task.id, self.plugin._pending_brush)
+        self.plugin._check_rotation_site(now=701)
+        self.assertEqual(self.site_test.call_count, 2)
+
+    def test_only_failed_site_waits_instead_of_busy_loop(self):
+        self.add_task(1)
+        self.plugin._rotation_mode = "sequential"
+        self.plugin._select_rotation_site({}, now=100)
+        self.site_test.return_value = (False, "")
+        for now in range(100, 3101, 600):
+            self.plugin._check_rotation_site(now=now)
+        self.assertIsNone(self.plugin._select_rotation_site({}, now=3101))
+        self.assertFalse(self.plugin._check_rotation_site(now=3101))
+        self.assertEqual(self.site_test.call_count, 6)
+        self.assertEqual(self.plugin._select_rotation_site({}, now=3700), 1)
+
+    def test_completed_retention_cap_blocks_at_fifty_and_resumes_after_removal(self):
+        task = self.add_task(1, downloader="qb")
+        self.add_task(2, site=1, downloader="qb")
+        self.rows["qb"] = [{"hash": str(i), "progress": 1, "tags": "site-1"} for i in range(50)]
+        self.rows["qb"] += [{"hash": "pending", "progress": 0, "tags": "site-1"},
+                            {"hash": "other", "progress": 1, "tags": "site-3"}]
+        self.assertEqual(self.plugin._site_completed_count(1), 50)
+        with self.plugin._task_scope(task.id):
+            allowed, reason = self.plugin._BrushFlow__evaluate_pre_conditions_for_brush()
+            self.assertFalse(allowed)
+            self.assertIn("50", reason)
+            self.rows["qb"].pop(0)
+            self.assertTrue(self.plugin._BrushFlow__evaluate_pre_conditions_for_brush()[0])
+
+    def test_completed_retention_counts_transmission_records_not_missing_torrents(self):
+        self.add_task(1)
+        self.data["task.1.torrents"] = {"done": {}, "queued": {}, "removed": {}}
+        self.rows["tb"] = [SimpleNamespace(hashString="done", percent_done=1, labels=[]),
+                           SimpleNamespace(hashString="queued", percent_done=0, labels=[])]
+        self.assertEqual(self.plugin._site_completed_count(1), 1)
 
     def add_task(self, tid, site=None, downloader="tb", enabled=True):
         task = self.ns["BrushTaskConfig"]({
