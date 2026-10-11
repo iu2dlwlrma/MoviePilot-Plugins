@@ -51,6 +51,23 @@ const taskDefaults = {
 const siteFields = ['id', 'name', 'enabled', 'site_id', 'novice', 'novice_until', 'timezone_offset', 'site_hr_active', 'site_skip_tips', 'tag'];
 const sharedFields = Object.keys(taskDefaults).filter(key => !siteFields.includes(key) && !['use_global_defaults', 'override_fields'].includes(key));
 const retiredFields = ['site_ratio_control', 'maxdlcount', 'maxupspeed', 'maxdlspeed', 'up_speed', 'dl_speed', 'global_maxdlcount', 'global_maxupspeed', 'global_maxdlspeed'];
+const nullableNumbers = ['disksize', 'site_ratio_target', 'seed_time', 'hr_seed_time', 'seed_ratio', 'seed_size', 'download_time', 'seed_avgspeed', 'seed_inactivetime', 'auto_archive_days'];
+
+function taskOverrideFields(task = {}) {
+  return sharedFields.filter(key => task[key] != null && (key === 'freeleech' || typeof task[key] !== 'string' || task[key].trim() !== ''))
+}
+
+function editableTask(task = {}) {
+  const result = cloneTask(task);
+  sharedFields.forEach(key => {
+    if (result.use_global_defaults && !result.override_fields.includes(key)) result[key] = null;
+    // 数字不限覆盖在后端存为 null，表单用 0 与继承区分。
+    else if (key !== 'site_ratio_target' && nullableNumbers.includes(key) && result[key] == null) result[key] = 0;
+  });
+  result.use_global_defaults = true;
+  result.override_fields = taskOverrideFields(result);
+  return result
+}
 
 function effectiveTask(task = {}, defaults = {}) {
   const result = cloneTask(task);
@@ -84,18 +101,6 @@ function cloneTask(task = {}) {
 /** 把表单空值和数字字段标准化为后端请求模型需要的类型。 */
 function normalizeTask(task) {
   const result = cloneTask(task);
-  const nullableNumbers = [
-    'disksize',
-    'site_ratio_target',
-    'seed_time',
-    'hr_seed_time',
-    'seed_ratio',
-    'seed_size',
-    'download_time',
-    'seed_avgspeed',
-    'seed_inactivetime',
-    'auto_archive_days',
-  ];
   const optionalText = [
     'cron',
     'active_time_range',
@@ -221,4 +226,4 @@ const _export_sfc = (sfc, props) => {
   return target;
 };
 
-export { _export_sfc as _, formatDateTime as a, formatRemainingTime as b, cloneTask as c, taskDefaults as d, effectiveTask as e, formatBytes as f, normalizeTask as g, formatDuration as h, torrentProgress as i, normalizeSettings as j, normalizeDefaults as n, taskStateMeta as t, unwrapResponse as u };
+export { _export_sfc as _, formatDateTime as a, formatRemainingTime as b, cloneTask as c, taskOverrideFields as d, effectiveTask as e, formatBytes as f, taskDefaults as g, editableTask as h, normalizeTask as i, formatDuration as j, torrentProgress as k, normalizeSettings as l, normalizeDefaults as n, taskStateMeta as t, unwrapResponse as u };
