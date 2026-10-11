@@ -1,0 +1,16 @@
+{
+  "BrushFlow": {
+    "name": "站点刷流",
+    "description": "多站点刷流任务、公平轮转、下载名额控制与独立统计。",
+    "labels": [
+      "刷流",
+      "仪表板"
+    ],
+    "version": "6.2.0",
+    "icon": "brush.jpg",
+    "author": "jxxghp,InfinityPacer,Seed680",
+    "level": 2,
+    "release": true,
+    "system_version": ">=3.0.0"
+  }
+}
