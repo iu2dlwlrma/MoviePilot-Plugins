@@ -1,7 +1,7 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
-import { cloneTask, effectiveTask, normalizeDefaults, normalizeTask, taskDefaults } from '../utils'
+import { cloneTask, editableTask, effectiveTask, normalizeDefaults, normalizeTask, taskDefaults, taskOverrideFields } from '../utils'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
@@ -30,14 +30,14 @@ const sections = [
     description: '单站轮换按驻留时间切换。分享率决定优先级，不会提前切走；并发和速度由下载器管理。',
     fields: [
       { key: 'downloader', label: '下载器', type: 'downloader', required: true },
-      { key: 'save_path', label: '保存目录', hint: '留空使用下载器默认目录' },
+      { key: 'save_path', label: '保存目录', globalHint: '留空使用下载器默认目录' },
       { key: 'brush_interval', label: '刷流刷新周期（分钟）', type: 'number', min: 1, max: 1440, required: true },
       { key: 'check_interval', label: '状态检查周期（分钟）', type: 'number', min: 1, max: 1440, required: true },
       { key: 'rotation_hours', label: '每站驻留时间（小时）', type: 'number', min: 0, max: 168, required: true, hint: '单站轮换模式生效，默认 24 小时；切换后旧种继续按原规则下载、做种和删除。' },
-      { key: 'cron', label: 'CRON 表达式', hint: '留空使用固定刷新周期' },
-      { key: 'active_time_range', label: '开启时间段', hint: '如 00:00-08:00，留空为全天' },
+      { key: 'cron', label: 'CRON 表达式', globalHint: '留空使用固定刷新周期' },
+      { key: 'active_time_range', label: '开启时间段', hint: '如 00:00-08:00', globalHint: '如 00:00-08:00，留空为全天' },
       { key: 'site_ratio_target', label: '目标站点分享率', type: 'number', min: 0.01, step: 0.01, hint: '默认 2，未达标优先分配选种机会' },
-      { key: 'disksize', label: '站点空间上限（GB）', type: 'number', min: 0, hint: '留空或 0 表示不限，仍受全局空间上限约束' },
+      { key: 'disksize', label: '站点空间上限（GB）', type: 'number', min: 0, hint: '0 表示不限，仍受全局空间上限约束', globalHint: '留空或 0 表示不限，仍受全局空间上限约束' },
       { key: 'notify', label: '发送通知', type: 'switch' },
     ],
   },
@@ -50,7 +50,7 @@ const sections = [
       { key: 'size', label: '种子大小（GB）', hint: '单值为上限，或填写范围，如 10-80' },
       { key: 'seeder', label: '做种人数', hint: '单值为上限，或填写范围，如 1-10' },
       { key: 'leecher', label: '下载人数', hint: '单值为最低人数，或填写范围，如 1-100；默认 1' },
-      { key: 'min_peer_seed_ratio', label: '下载人数 / 做种人数下限', type: 'number', min: 0, step: 0.01, hint: '默认 0.1，留空或 0 不限制' },
+      { key: 'min_peer_seed_ratio', label: '下载人数 / 做种人数下限', type: 'number', min: 0, step: 0.01, hint: '0 表示不限制', globalHint: '默认 0.1，留空或 0 不限制' },
       { key: 'pubtime', label: '发布时间（分钟）', hint: '单值或范围，如 5-120' },
       { key: 'include', label: '包含规则', hint: '支持正则表达式' },
       { key: 'exclude', label: '排除规则', hint: '支持正则表达式' },
@@ -85,15 +85,31 @@ const sections = [
   },
 ]
 
-const overrideOptions = sections.flatMap(section => section.fields.map(field => ({ title: `${section.title} · ${field.label}`, value: field.key })))
 const dialogTitle = computed(() => props.globalMode ? '全局统一参数' : localTask.value.id ? '编辑站点任务' : '新增站点任务')
 const siteName = computed(() => props.sites.find(item => item.value === Number(localTask.value.site_id))?.title || '未选择')
-const scheduleText = computed(() => localTask.value.cron || `每 ${localTask.value.brush_interval || 10} 分钟`)
-const visibleSections = computed(() => sections.filter(section => section.value === 'base' || fieldsFor(section).length))
+const overrideFields = computed(() => taskOverrideFields(localTask.value))
+const previewTask = computed(() => props.globalMode ? localTask.value : effectiveTask({ ...localTask.value, use_global_defaults: true, override_fields: overrideFields.value }, props.globalDefaults))
+const scheduleText = computed(() => previewTask.value.cron || `每 ${previewTask.value.brush_interval || 10} 分钟`)
 const noviceActive = computed(() => localTask.value.novice && (!localTask.value.novice_until || new Date(localTask.value.novice_until) > new Date()))
 
-function fieldsFor(section) {
-  return section.fields.filter(field => props.globalMode || !localTask.value.use_global_defaults || (localTask.value.override_fields || []).includes(field.key))
+function globalValueText(field) {
+  const value = { ...taskDefaults, ...props.globalDefaults }[field.key]
+  if (field.type === 'switch') return value ? '开启' : '关闭'
+  const items = field.type === 'downloader' ? props.downloaders : field.items
+  const selected = items?.find(item => item.value === value)
+  if (selected) return selected.title
+  if (value == null || value === '') return ({ downloader: '未选择', save_path: '下载器默认目录', cron: '固定刷新周期', active_time_range: '全天', qb_category: '不指定', delete_except_tags: '无' })[field.key] || '不限'
+  return String(value)
+}
+
+function fieldItems(field) {
+  const items = field.type === 'switch' ? [{ title: '开启', value: true }, { title: '关闭', value: false }] : field.type === 'downloader' ? props.downloaders : field.items
+  return props.globalMode ? items : [{ title: `跟随全局（${globalValueText(field)}）`, value: null }, ...items]
+}
+
+function fieldHint(field) {
+  if (props.globalMode) return field.globalHint || field.hint
+  return `留空跟随全局：${globalValueText(field)}${field.hint ? `。${field.hint}` : ''}`
 }
 
 function fieldLabel(field) {
@@ -101,7 +117,7 @@ function fieldLabel(field) {
 }
 
 function fieldRules(field) {
-  const rules = field.required ? [required] : []
+  const rules = field.required && props.globalMode ? [required] : []
   if (['site_ratio_target', 'rotation_hours'].includes(field.key)) rules.push(positive)
   if (field.type === 'number') {
     rules.push(value => value === '' || value == null || Number.isFinite(Number(value)) || '请输入有效数字')
@@ -109,12 +125,6 @@ function fieldRules(field) {
     if (field.max != null) rules.push(value => value === '' || value == null || Number(value) <= field.max || `不能大于 ${field.max}`)
   }
   return rules
-}
-
-function syncInherited() {
-  if (props.globalMode || !localTask.value.use_global_defaults) return
-  localTask.value = effectiveTask(localTask.value, props.globalDefaults)
-  if (!visibleSections.value.some(section => section.value === activeTab.value)) activeTab.value = 'base'
 }
 
 function selectSite(value) {
@@ -126,7 +136,7 @@ watch(() => props.modelValue, visible => {
   if (!visible) return
   localTask.value = props.globalMode
     ? cloneTask({ ...taskDefaults, ...props.task, use_global_defaults: false })
-    : effectiveTask(props.task, props.globalDefaults)
+    : editableTask(props.task)
   if (localTask.value.novice_until) {
     const deadline = new Date(localTask.value.novice_until)
     if (!Number.isNaN(deadline.getTime())) {
@@ -148,7 +158,7 @@ async function saveTask(apply = false) {
   if (result && !result.valid) return
   formError.value = ''
   try {
-    const payload = props.globalMode ? normalizeDefaults(localTask.value) : normalizeTask(localTask.value)
+    const payload = props.globalMode ? normalizeDefaults(localTask.value) : normalizeTask(previewTask.value)
     if (!payload.downloader) {
       formError.value = '请先在全局统一参数中选择下载器，或为当前站点覆盖下载器。'
       activeTab.value = 'base'
@@ -174,14 +184,14 @@ async function saveTask(apply = false) {
       <VCardText class="brushflow-editor__body">
         <VForm ref="formRef" class="brushflow-editor__form" @submit.prevent="saveTask()">
           <VTabs v-model="activeTab" :direction="display.mdAndUp.value ? 'vertical' : 'horizontal'" color="primary" class="brushflow-editor__tabs">
-            <VTab v-for="section in visibleSections" :key="section.value" :value="section.value" :prepend-icon="section.icon">
-              {{ section.value === 'base' && !globalMode ? '站点与覆盖' : section.title }}
+            <VTab v-for="section in sections" :key="section.value" :value="section.value" :prepend-icon="section.icon">
+              {{ section.value === 'base' && !globalMode ? '站点与调度' : section.title }}
             </VTab>
           </VTabs>
           <VDivider :vertical="display.mdAndUp.value" />
           <VWindow v-model="activeTab" :touch="false" class="brushflow-editor__window">
             <VAlert v-if="formError" type="error" variant="tonal" class="mb-4">{{ formError }}</VAlert>
-            <VWindowItem v-for="section in visibleSections" :key="section.value" :value="section.value">
+            <VWindowItem v-for="section in sections" :key="section.value" :value="section.value">
               <section v-if="section.value === 'base' && !globalMode" class="editor-section">
                 <div class="text-subtitle-1 font-weight-medium">站点信息</div>
                 <VRow>
@@ -190,10 +200,8 @@ async function saveTask(apply = false) {
                 </VRow>
                 <div class="editor-switches">
                   <VSwitch v-model="localTask.enabled" label="启用任务" color="primary" hide-details inset />
-                  <VSwitch v-model="localTask.use_global_defaults" label="继承全局统一参数" color="primary" hide-details inset @update:model-value="syncInherited" />
                 </div>
-                <VAlert v-if="localTask.use_global_defaults" type="info" variant="tonal" density="compact">未覆盖的参数会随全局设置自动生效，无需逐站填写。</VAlert>
-                <VSelect v-if="localTask.use_global_defaults" v-model="localTask.override_fields" :items="overrideOptions" label="此站点需要覆盖的参数（可选）" multiple chips closable-chips clearable hint="选择后在对应规则页填写；移除后恢复继承，覆盖字段允许留空表示不限。" persistent-hint @update:model-value="syncInherited" />
+                <VAlert type="info" variant="tonal" density="compact">规则留空即跟随全局；填写后仅此站点生效，清空即可恢复跟随。</VAlert>
               </section>
               <section v-if="section.value === 'base' && !globalMode" class="editor-section">
                 <div class="text-subtitle-1 font-weight-medium">考核与站点保护</div>
@@ -208,13 +216,13 @@ async function saveTask(apply = false) {
                   <VSwitch v-model="localTask.site_skip_tips" label="自动跳过下载提示" color="primary" hide-details inset />
                 </div>
               </section>
-              <section v-if="fieldsFor(section).length" class="editor-section">
+              <section class="editor-section">
                 <header class="editor-section__head"><div><div class="text-subtitle-1 font-weight-medium">{{ section.title }}</div><div class="text-body-2 text-medium-emphasis">{{ section.description }}</div></div></header>
                 <VRow>
-                  <VCol v-for="field in fieldsFor(section)" :key="field.key" cols="12" :md="field.type === 'switch' ? 12 : 6">
-                    <VSwitch v-if="field.type === 'switch'" v-model="localTask[field.key]" :label="fieldLabel(field)" color="primary" hide-details inset />
-                    <VSelect v-else-if="field.type === 'select' || field.type === 'downloader'" v-model="localTask[field.key]" :items="field.type === 'downloader' ? downloaders : field.items" :label="field.label" :rules="fieldRules(field)" />
-                    <VTextField v-else v-model="localTask[field.key]" :type="field.type || 'text'" :label="field.label" :min="field.min" :max="field.max" :step="field.step || 'any'" :hint="field.hint" :persistent-hint="!!field.hint" :rules="fieldRules(field)" :clearable="!field.required" />
+                  <VCol v-for="field in section.fields" :key="field.key" cols="12" :md="globalMode && field.type === 'switch' ? 12 : 6">
+                    <VSwitch v-if="globalMode && field.type === 'switch'" v-model="localTask[field.key]" :label="fieldLabel(field)" color="primary" hide-details inset />
+                    <VSelect v-else-if="['select', 'downloader', 'switch'].includes(field.type)" v-model="localTask[field.key]" :items="fieldItems(field)" :label="fieldLabel(field)" :hint="fieldHint(field)" :persistent-hint="!!fieldHint(field)" :rules="fieldRules(field)" :clearable="!globalMode" />
+                    <VTextField v-else v-model="localTask[field.key]" :type="field.type || 'text'" :label="field.label" :min="field.min" :max="field.max" :step="field.step || 'any'" :placeholder="globalMode ? undefined : `跟随全局：${globalValueText(field)}`" :persistent-placeholder="!globalMode" :hint="fieldHint(field)" :persistent-hint="!!fieldHint(field)" :rules="fieldRules(field)" :clearable="!globalMode || !field.required" />
                   </VCol>
                 </VRow>
               </section>
@@ -228,17 +236,17 @@ async function saveTask(apply = false) {
             <div class="text-subtitle-1 font-weight-medium">生效参数预览</div>
             <dl>
               <div v-if="!globalMode"><dt>站点</dt><dd>{{ siteName }}</dd></div>
-              <div v-if="!globalMode"><dt>参数来源</dt><dd>{{ localTask.use_global_defaults ? `全局 + ${localTask.override_fields.length} 项覆盖` : '站点独立设置' }}</dd></div>
+              <div v-if="!globalMode"><dt>参数来源</dt><dd>{{ overrideFields.length ? `全局 + ${overrideFields.length} 项站点设置` : '跟随全局' }}</dd></div>
               <div v-if="!globalMode"><dt>新手考核</dt><dd>{{ noviceActive ? '优先' : localTask.novice ? '已到期' : '关闭' }}</dd></div>
-              <div><dt>下载器</dt><dd>{{ localTask.downloader || '未选择' }}</dd></div>
+              <div><dt>下载器</dt><dd>{{ previewTask.downloader || '未选择' }}</dd></div>
               <div><dt>刷新</dt><dd>{{ scheduleText }}</dd></div>
-              <div><dt>检查</dt><dd>每 {{ localTask.check_interval || 5 }} 分钟</dd></div>
-              <div><dt>单站驻留</dt><dd>{{ localTask.rotation_hours ?? 24 }} 小时</dd></div>
-              <div><dt>目标分享率</dt><dd>{{ localTask.site_ratio_target || '不限' }}</dd></div>
-              <div><dt>下载人数</dt><dd>{{ localTask.leecher || '不限' }}</dd></div>
-              <div><dt>下载 / 做种</dt><dd>{{ localTask.min_peer_seed_ratio ?? '不限' }}</dd></div>
-              <div><dt>空间上限</dt><dd>{{ localTask.disksize ? `${localTask.disksize} GB` : '不限' }}</dd></div>
-              <div><dt>促销保护</dt><dd>{{ localTask.del_no_free ? `提前 ${localTask.promotion_lead_minutes ?? 10} 分钟` : '关闭' }}</dd></div>
+              <div><dt>检查</dt><dd>每 {{ previewTask.check_interval || 5 }} 分钟</dd></div>
+              <div><dt>单站驻留</dt><dd>{{ previewTask.rotation_hours ?? 24 }} 小时</dd></div>
+              <div><dt>目标分享率</dt><dd>{{ previewTask.site_ratio_target || '不限' }}</dd></div>
+              <div><dt>下载人数</dt><dd>{{ previewTask.leecher || '不限' }}</dd></div>
+              <div><dt>下载 / 做种</dt><dd>{{ previewTask.min_peer_seed_ratio ?? '不限' }}</dd></div>
+              <div><dt>空间上限</dt><dd>{{ Number(previewTask.disksize) > 0 ? `${previewTask.disksize} GB` : '不限' }}</dd></div>
+              <div><dt>促销保护</dt><dd>{{ previewTask.del_no_free ? `提前 ${previewTask.promotion_lead_minutes ?? 10} 分钟` : '关闭' }}</dd></div>
             </dl>
           </VSheet>
         </VForm>

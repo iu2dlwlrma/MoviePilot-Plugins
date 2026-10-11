@@ -1,5 +1,5 @@
 import { importShared } from './__federation_fn_import-JrT3xvdd.js';
-import { _ as _export_sfc, c as cloneTask, d as taskDefaults, e as effectiveTask, n as normalizeDefaults, g as normalizeTask, t as taskStateMeta, a as formatDateTime, b as formatRemainingTime, f as formatBytes, h as formatDuration, i as torrentProgress, u as unwrapResponse, j as normalizeSettings } from './_plugin-vue_export-helper-b7buZFpH.js';
+import { _ as _export_sfc, c as cloneTask, d as taskOverrideFields, e as effectiveTask, g as taskDefaults, h as editableTask, n as normalizeDefaults, i as normalizeTask, t as taskStateMeta, a as formatDateTime, b as formatRemainingTime, f as formatBytes, j as formatDuration, k as torrentProgress, u as unwrapResponse, l as normalizeSettings } from './_plugin-vue_export-helper-LC0gKRS3.js';
 
 const {unref:_unref$1,toDisplayString:_toDisplayString$1,createTextVNode:_createTextVNode$1,resolveComponent:_resolveComponent$1,withCtx:_withCtx$1,createVNode:_createVNode$1,renderList:_renderList$1,Fragment:_Fragment$1,openBlock:_openBlock$1,createElementBlock:_createElementBlock$1,createBlock:_createBlock$1,createCommentVNode:_createCommentVNode$1,createElementVNode:_createElementVNode$1,withModifiers:_withModifiers} = await importShared('vue');
 
@@ -14,15 +14,12 @@ const _hoisted_3$1 = {
   class: "editor-section"
 };
 const _hoisted_4$1 = { class: "editor-switches" };
-const _hoisted_5$1 = {
-  key: 2,
-  class: "editor-section"
-};
+const _hoisted_5$1 = { class: "editor-section" };
 const _hoisted_6$1 = { class: "editor-section__head" };
 const _hoisted_7$1 = { class: "text-subtitle-1 font-weight-medium" };
 const _hoisted_8$1 = { class: "text-body-2 text-medium-emphasis" };
 const _hoisted_9$1 = {
-  key: 3,
+  key: 2,
   class: "editor-section"
 };
 const _hoisted_10$1 = { key: 0 };
@@ -67,14 +64,14 @@ const sections = [
     description: '单站轮换按驻留时间切换。分享率决定优先级，不会提前切走；并发和速度由下载器管理。',
     fields: [
       { key: 'downloader', label: '下载器', type: 'downloader', required: true },
-      { key: 'save_path', label: '保存目录', hint: '留空使用下载器默认目录' },
+      { key: 'save_path', label: '保存目录', globalHint: '留空使用下载器默认目录' },
       { key: 'brush_interval', label: '刷流刷新周期（分钟）', type: 'number', min: 1, max: 1440, required: true },
       { key: 'check_interval', label: '状态检查周期（分钟）', type: 'number', min: 1, max: 1440, required: true },
       { key: 'rotation_hours', label: '每站驻留时间（小时）', type: 'number', min: 0, max: 168, required: true, hint: '单站轮换模式生效，默认 24 小时；切换后旧种继续按原规则下载、做种和删除。' },
-      { key: 'cron', label: 'CRON 表达式', hint: '留空使用固定刷新周期' },
-      { key: 'active_time_range', label: '开启时间段', hint: '如 00:00-08:00，留空为全天' },
+      { key: 'cron', label: 'CRON 表达式', globalHint: '留空使用固定刷新周期' },
+      { key: 'active_time_range', label: '开启时间段', hint: '如 00:00-08:00', globalHint: '如 00:00-08:00，留空为全天' },
       { key: 'site_ratio_target', label: '目标站点分享率', type: 'number', min: 0.01, step: 0.01, hint: '默认 2，未达标优先分配选种机会' },
-      { key: 'disksize', label: '站点空间上限（GB）', type: 'number', min: 0, hint: '留空或 0 表示不限，仍受全局空间上限约束' },
+      { key: 'disksize', label: '站点空间上限（GB）', type: 'number', min: 0, hint: '0 表示不限，仍受全局空间上限约束', globalHint: '留空或 0 表示不限，仍受全局空间上限约束' },
       { key: 'notify', label: '发送通知', type: 'switch' },
     ],
   },
@@ -87,7 +84,7 @@ const sections = [
       { key: 'size', label: '种子大小（GB）', hint: '单值为上限，或填写范围，如 10-80' },
       { key: 'seeder', label: '做种人数', hint: '单值为上限，或填写范围，如 1-10' },
       { key: 'leecher', label: '下载人数', hint: '单值为最低人数，或填写范围，如 1-100；默认 1' },
-      { key: 'min_peer_seed_ratio', label: '下载人数 / 做种人数下限', type: 'number', min: 0, step: 0.01, hint: '默认 0.1，留空或 0 不限制' },
+      { key: 'min_peer_seed_ratio', label: '下载人数 / 做种人数下限', type: 'number', min: 0, step: 0.01, hint: '0 表示不限制', globalHint: '默认 0.1，留空或 0 不限制' },
       { key: 'pubtime', label: '发布时间（分钟）', hint: '单值或范围，如 5-120' },
       { key: 'include', label: '包含规则', hint: '支持正则表达式' },
       { key: 'exclude', label: '排除规则', hint: '支持正则表达式' },
@@ -122,15 +119,31 @@ const sections = [
   },
 ];
 
-const overrideOptions = sections.flatMap(section => section.fields.map(field => ({ title: `${section.title} · ${field.label}`, value: field.key })));
 const dialogTitle = computed$1(() => props.globalMode ? '全局统一参数' : localTask.value.id ? '编辑站点任务' : '新增站点任务');
 const siteName = computed$1(() => props.sites.find(item => item.value === Number(localTask.value.site_id))?.title || '未选择');
-const scheduleText = computed$1(() => localTask.value.cron || `每 ${localTask.value.brush_interval || 10} 分钟`);
-const visibleSections = computed$1(() => sections.filter(section => section.value === 'base' || fieldsFor(section).length));
+const overrideFields = computed$1(() => taskOverrideFields(localTask.value));
+const previewTask = computed$1(() => props.globalMode ? localTask.value : effectiveTask({ ...localTask.value, use_global_defaults: true, override_fields: overrideFields.value }, props.globalDefaults));
+const scheduleText = computed$1(() => previewTask.value.cron || `每 ${previewTask.value.brush_interval || 10} 分钟`);
 const noviceActive = computed$1(() => localTask.value.novice && (!localTask.value.novice_until || new Date(localTask.value.novice_until) > new Date()));
 
-function fieldsFor(section) {
-  return section.fields.filter(field => props.globalMode || !localTask.value.use_global_defaults || (localTask.value.override_fields || []).includes(field.key))
+function globalValueText(field) {
+  const value = { ...taskDefaults, ...props.globalDefaults }[field.key];
+  if (field.type === 'switch') return value ? '开启' : '关闭'
+  const items = field.type === 'downloader' ? props.downloaders : field.items;
+  const selected = items?.find(item => item.value === value);
+  if (selected) return selected.title
+  if (value == null || value === '') return ({ downloader: '未选择', save_path: '下载器默认目录', cron: '固定刷新周期', active_time_range: '全天', qb_category: '不指定', delete_except_tags: '无' })[field.key] || '不限'
+  return String(value)
+}
+
+function fieldItems(field) {
+  const items = field.type === 'switch' ? [{ title: '开启', value: true }, { title: '关闭', value: false }] : field.type === 'downloader' ? props.downloaders : field.items;
+  return props.globalMode ? items : [{ title: `跟随全局（${globalValueText(field)}）`, value: null }, ...items]
+}
+
+function fieldHint(field) {
+  if (props.globalMode) return field.globalHint || field.hint
+  return `留空跟随全局：${globalValueText(field)}${field.hint ? `。${field.hint}` : ''}`
 }
 
 function fieldLabel(field) {
@@ -138,7 +151,7 @@ function fieldLabel(field) {
 }
 
 function fieldRules(field) {
-  const rules = field.required ? [required] : [];
+  const rules = field.required && props.globalMode ? [required] : [];
   if (['site_ratio_target', 'rotation_hours'].includes(field.key)) rules.push(positive);
   if (field.type === 'number') {
     rules.push(value => value === '' || value == null || Number.isFinite(Number(value)) || '请输入有效数字');
@@ -146,12 +159,6 @@ function fieldRules(field) {
     if (field.max != null) rules.push(value => value === '' || value == null || Number(value) <= field.max || `不能大于 ${field.max}`);
   }
   return rules
-}
-
-function syncInherited() {
-  if (props.globalMode || !localTask.value.use_global_defaults) return
-  localTask.value = effectiveTask(localTask.value, props.globalDefaults);
-  if (!visibleSections.value.some(section => section.value === activeTab.value)) activeTab.value = 'base';
 }
 
 function selectSite(value) {
@@ -163,7 +170,7 @@ watch$1(() => props.modelValue, visible => {
   if (!visible) return
   localTask.value = props.globalMode
     ? cloneTask({ ...taskDefaults, ...props.task, use_global_defaults: false })
-    : effectiveTask(props.task, props.globalDefaults);
+    : editableTask(props.task);
   if (localTask.value.novice_until) {
     const deadline = new Date(localTask.value.novice_until);
     if (!Number.isNaN(deadline.getTime())) {
@@ -185,7 +192,7 @@ async function saveTask(apply = false) {
   if (result && !result.valid) return
   formError.value = '';
   try {
-    const payload = props.globalMode ? normalizeDefaults(localTask.value) : normalizeTask(localTask.value);
+    const payload = props.globalMode ? normalizeDefaults(localTask.value) : normalizeTask(previewTask.value);
     if (!payload.downloader) {
       formError.value = '请先在全局统一参数中选择下载器，或为当前站点覆盖下载器。';
       activeTab.value = 'base';
@@ -226,7 +233,7 @@ return (_ctx, _cache) => {
       scrollable: "",
       fullscreen: _unref$1(display).smAndDown.value,
       "max-width": "74rem",
-      "onUpdate:modelValue": _cache[15] || (_cache[15] = value => emit('update:modelValue', value))
+      "onUpdate:modelValue": _cache[13] || (_cache[13] = value => emit('update:modelValue', value))
     }, {
       default: _withCtx$1(() => [
         _createVNode$1(_component_VCard, { class: "brushflow-editor" }, {
@@ -251,7 +258,7 @@ return (_ctx, _cache) => {
                   loading: __props.saving,
                   onClick: _cache[0] || (_cache[0] = $event => (saveTask()))
                 }, {
-                  default: _withCtx$1(() => [...(_cache[19] || (_cache[19] = [
+                  default: _withCtx$1(() => [...(_cache[17] || (_cache[17] = [
                     _createTextVNode$1("保存", -1)
                   ]))]),
                   _: 1
@@ -272,7 +279,7 @@ return (_ctx, _cache) => {
                   ref_key: "formRef",
                   ref: formRef,
                   class: "brushflow-editor__form",
-                  onSubmit: _cache[14] || (_cache[14] = _withModifiers($event => (saveTask()), ["prevent"]))
+                  onSubmit: _cache[12] || (_cache[12] = _withModifiers($event => (saveTask()), ["prevent"]))
                 }, {
                   default: _withCtx$1(() => [
                     _createVNode$1(_component_VTabs, {
@@ -283,18 +290,18 @@ return (_ctx, _cache) => {
                       class: "brushflow-editor__tabs"
                     }, {
                       default: _withCtx$1(() => [
-                        (_openBlock$1(true), _createElementBlock$1(_Fragment$1, null, _renderList$1(visibleSections.value, (section) => {
-                          return (_openBlock$1(), _createBlock$1(_component_VTab, {
+                        (_openBlock$1(), _createElementBlock$1(_Fragment$1, null, _renderList$1(sections, (section) => {
+                          return _createVNode$1(_component_VTab, {
                             key: section.value,
                             value: section.value,
                             "prepend-icon": section.icon
                           }, {
                             default: _withCtx$1(() => [
-                              _createTextVNode$1(_toDisplayString$1(section.value === 'base' && !__props.globalMode ? '站点与覆盖' : section.title), 1)
+                              _createTextVNode$1(_toDisplayString$1(section.value === 'base' && !__props.globalMode ? '站点与调度' : section.title), 1)
                             ]),
                             _: 2
-                          }, 1032, ["value", "prepend-icon"]))
-                        }), 128))
+                          }, 1032, ["value", "prepend-icon"])
+                        }), 64))
                       ]),
                       _: 1
                     }, 8, ["modelValue", "direction"]),
@@ -303,7 +310,7 @@ return (_ctx, _cache) => {
                     }, null, 8, ["vertical"]),
                     _createVNode$1(_component_VWindow, {
                       modelValue: activeTab.value,
-                      "onUpdate:modelValue": _cache[13] || (_cache[13] = $event => ((activeTab).value = $event)),
+                      "onUpdate:modelValue": _cache[11] || (_cache[11] = $event => ((activeTab).value = $event)),
                       touch: false,
                       class: "brushflow-editor__window"
                     }, {
@@ -321,15 +328,15 @@ return (_ctx, _cache) => {
                               _: 1
                             }))
                           : _createCommentVNode$1("", true),
-                        (_openBlock$1(true), _createElementBlock$1(_Fragment$1, null, _renderList$1(visibleSections.value, (section) => {
-                          return (_openBlock$1(), _createBlock$1(_component_VWindowItem, {
+                        (_openBlock$1(), _createElementBlock$1(_Fragment$1, null, _renderList$1(sections, (section) => {
+                          return _createVNode$1(_component_VWindowItem, {
                             key: section.value,
                             value: section.value
                           }, {
                             default: _withCtx$1(() => [
                               (section.value === 'base' && !__props.globalMode)
                                 ? (_openBlock$1(), _createElementBlock$1("section", _hoisted_1$1, [
-                                    _cache[21] || (_cache[21] = _createElementVNode$1("div", { class: "text-subtitle-1 font-weight-medium" }, "站点信息", -1)),
+                                    _cache[19] || (_cache[19] = _createElementVNode$1("div", { class: "text-subtitle-1 font-weight-medium" }, "站点信息", -1)),
                                     _createVNode$1(_component_VRow, null, {
                                       default: _withCtx$1(() => [
                                         _createVNode$1(_component_VCol, {
@@ -372,58 +379,26 @@ return (_ctx, _cache) => {
                                         color: "primary",
                                         "hide-details": "",
                                         inset: ""
-                                      }, null, 8, ["modelValue"]),
-                                      _createVNode$1(_component_VSwitch, {
-                                        modelValue: localTask.value.use_global_defaults,
-                                        "onUpdate:modelValue": [
-                                          _cache[4] || (_cache[4] = $event => ((localTask.value.use_global_defaults) = $event)),
-                                          syncInherited
-                                        ],
-                                        label: "继承全局统一参数",
-                                        color: "primary",
-                                        "hide-details": "",
-                                        inset: ""
                                       }, null, 8, ["modelValue"])
                                     ]),
-                                    (localTask.value.use_global_defaults)
-                                      ? (_openBlock$1(), _createBlock$1(_component_VAlert, {
-                                          key: 0,
-                                          type: "info",
-                                          variant: "tonal",
-                                          density: "compact"
-                                        }, {
-                                          default: _withCtx$1(() => [...(_cache[20] || (_cache[20] = [
-                                            _createTextVNode$1("未覆盖的参数会随全局设置自动生效，无需逐站填写。", -1)
-                                          ]))]),
-                                          _: 1
-                                        }))
-                                      : _createCommentVNode$1("", true),
-                                    (localTask.value.use_global_defaults)
-                                      ? (_openBlock$1(), _createBlock$1(_component_VSelect, {
-                                          key: 1,
-                                          modelValue: localTask.value.override_fields,
-                                          "onUpdate:modelValue": [
-                                            _cache[5] || (_cache[5] = $event => ((localTask.value.override_fields) = $event)),
-                                            syncInherited
-                                          ],
-                                          items: _unref$1(overrideOptions),
-                                          label: "此站点需要覆盖的参数（可选）",
-                                          multiple: "",
-                                          chips: "",
-                                          "closable-chips": "",
-                                          clearable: "",
-                                          hint: "选择后在对应规则页填写；移除后恢复继承，覆盖字段允许留空表示不限。",
-                                          "persistent-hint": ""
-                                        }, null, 8, ["modelValue", "items"]))
-                                      : _createCommentVNode$1("", true)
+                                    _createVNode$1(_component_VAlert, {
+                                      type: "info",
+                                      variant: "tonal",
+                                      density: "compact"
+                                    }, {
+                                      default: _withCtx$1(() => [...(_cache[18] || (_cache[18] = [
+                                        _createTextVNode$1("规则留空即跟随全局；填写后仅此站点生效，清空即可恢复跟随。", -1)
+                                      ]))]),
+                                      _: 1
+                                    })
                                   ]))
                                 : _createCommentVNode$1("", true),
                               (section.value === 'base' && !__props.globalMode)
                                 ? (_openBlock$1(), _createElementBlock$1("section", _hoisted_3$1, [
-                                    _cache[22] || (_cache[22] = _createElementVNode$1("div", { class: "text-subtitle-1 font-weight-medium" }, "考核与站点保护", -1)),
+                                    _cache[20] || (_cache[20] = _createElementVNode$1("div", { class: "text-subtitle-1 font-weight-medium" }, "考核与站点保护", -1)),
                                     _createVNode$1(_component_VSwitch, {
                                       modelValue: localTask.value.novice,
-                                      "onUpdate:modelValue": _cache[6] || (_cache[6] = $event => ((localTask.value.novice) = $event)),
+                                      "onUpdate:modelValue": _cache[4] || (_cache[4] = $event => ((localTask.value.novice) = $event)),
                                       label: "新手考核优先",
                                       color: "primary",
                                       "hide-details": "",
@@ -433,7 +408,7 @@ return (_ctx, _cache) => {
                                       ? (_openBlock$1(), _createBlock$1(_component_VTextField, {
                                           key: 0,
                                           modelValue: localTask.value.novice_until,
-                                          "onUpdate:modelValue": _cache[7] || (_cache[7] = $event => ((localTask.value.novice_until) = $event)),
+                                          "onUpdate:modelValue": _cache[5] || (_cache[5] = $event => ((localTask.value.novice_until) = $event)),
                                           type: "datetime-local",
                                           label: "考核截止时间（本地时间，可选）",
                                           clearable: "",
@@ -451,7 +426,7 @@ return (_ctx, _cache) => {
                                           default: _withCtx$1(() => [
                                             _createVNode$1(_component_VTextField, {
                                               modelValue: localTask.value.timezone_offset,
-                                              "onUpdate:modelValue": _cache[8] || (_cache[8] = $event => ((localTask.value.timezone_offset) = $event)),
+                                              "onUpdate:modelValue": _cache[6] || (_cache[6] = $event => ((localTask.value.timezone_offset) = $event)),
                                               modelModifiers: { number: true },
                                               type: "number",
                                               label: "站点时区偏移（小时）"
@@ -466,7 +441,7 @@ return (_ctx, _cache) => {
                                           default: _withCtx$1(() => [
                                             _createVNode$1(_component_VTextField, {
                                               modelValue: localTask.value.tag,
-                                              "onUpdate:modelValue": _cache[9] || (_cache[9] = $event => ((localTask.value.tag) = $event)),
+                                              "onUpdate:modelValue": _cache[7] || (_cache[7] = $event => ((localTask.value.tag) = $event)),
                                               label: "下载器标签",
                                               hint: "留空使用「刷流-站点名」；同站点多任务需使用不同标签。",
                                               "persistent-hint": ""
@@ -480,7 +455,7 @@ return (_ctx, _cache) => {
                                     _createElementVNode$1("div", _hoisted_4$1, [
                                       _createVNode$1(_component_VSwitch, {
                                         modelValue: localTask.value.site_hr_active,
-                                        "onUpdate:modelValue": _cache[10] || (_cache[10] = $event => ((localTask.value.site_hr_active) = $event)),
+                                        "onUpdate:modelValue": _cache[8] || (_cache[8] = $event => ((localTask.value.site_hr_active) = $event)),
                                         label: "全站 H&R",
                                         color: "primary",
                                         "hide-details": "",
@@ -488,7 +463,7 @@ return (_ctx, _cache) => {
                                       }, null, 8, ["modelValue"]),
                                       _createVNode$1(_component_VSwitch, {
                                         modelValue: localTask.value.site_skip_tips,
-                                        "onUpdate:modelValue": _cache[11] || (_cache[11] = $event => ((localTask.value.site_skip_tips) = $event)),
+                                        "onUpdate:modelValue": _cache[9] || (_cache[9] = $event => ((localTask.value.site_skip_tips) = $event)),
                                         label: "自动跳过下载提示",
                                         color: "primary",
                                         "hide-details": "",
@@ -497,65 +472,68 @@ return (_ctx, _cache) => {
                                     ])
                                   ]))
                                 : _createCommentVNode$1("", true),
-                              (fieldsFor(section).length)
-                                ? (_openBlock$1(), _createElementBlock$1("section", _hoisted_5$1, [
-                                    _createElementVNode$1("header", _hoisted_6$1, [
-                                      _createElementVNode$1("div", null, [
-                                        _createElementVNode$1("div", _hoisted_7$1, _toDisplayString$1(section.title), 1),
-                                        _createElementVNode$1("div", _hoisted_8$1, _toDisplayString$1(section.description), 1)
-                                      ])
-                                    ]),
-                                    _createVNode$1(_component_VRow, null, {
-                                      default: _withCtx$1(() => [
-                                        (_openBlock$1(true), _createElementBlock$1(_Fragment$1, null, _renderList$1(fieldsFor(section), (field) => {
-                                          return (_openBlock$1(), _createBlock$1(_component_VCol, {
-                                            key: field.key,
-                                            cols: "12",
-                                            md: field.type === 'switch' ? 12 : 6
-                                          }, {
-                                            default: _withCtx$1(() => [
-                                              (field.type === 'switch')
-                                                ? (_openBlock$1(), _createBlock$1(_component_VSwitch, {
-                                                    key: 0,
-                                                    modelValue: localTask.value[field.key],
-                                                    "onUpdate:modelValue": $event => ((localTask.value[field.key]) = $event),
-                                                    label: fieldLabel(field),
-                                                    color: "primary",
-                                                    "hide-details": "",
-                                                    inset: ""
-                                                  }, null, 8, ["modelValue", "onUpdate:modelValue", "label"]))
-                                                : (field.type === 'select' || field.type === 'downloader')
-                                                  ? (_openBlock$1(), _createBlock$1(_component_VSelect, {
-                                                      key: 1,
-                                                      modelValue: localTask.value[field.key],
-                                                      "onUpdate:modelValue": $event => ((localTask.value[field.key]) = $event),
-                                                      items: field.type === 'downloader' ? __props.downloaders : field.items,
-                                                      label: field.label,
-                                                      rules: fieldRules(field)
-                                                    }, null, 8, ["modelValue", "onUpdate:modelValue", "items", "label", "rules"]))
-                                                  : (_openBlock$1(), _createBlock$1(_component_VTextField, {
-                                                      key: 2,
-                                                      modelValue: localTask.value[field.key],
-                                                      "onUpdate:modelValue": $event => ((localTask.value[field.key]) = $event),
-                                                      type: field.type || 'text',
-                                                      label: field.label,
-                                                      min: field.min,
-                                                      max: field.max,
-                                                      step: field.step || 'any',
-                                                      hint: field.hint,
-                                                      "persistent-hint": !!field.hint,
-                                                      rules: fieldRules(field),
-                                                      clearable: !field.required
-                                                    }, null, 8, ["modelValue", "onUpdate:modelValue", "type", "label", "min", "max", "step", "hint", "persistent-hint", "rules", "clearable"]))
-                                            ]),
-                                            _: 2
-                                          }, 1032, ["md"]))
-                                        }), 128))
-                                      ]),
-                                      _: 2
-                                    }, 1024)
-                                  ]))
-                                : _createCommentVNode$1("", true),
+                              _createElementVNode$1("section", _hoisted_5$1, [
+                                _createElementVNode$1("header", _hoisted_6$1, [
+                                  _createElementVNode$1("div", null, [
+                                    _createElementVNode$1("div", _hoisted_7$1, _toDisplayString$1(section.title), 1),
+                                    _createElementVNode$1("div", _hoisted_8$1, _toDisplayString$1(section.description), 1)
+                                  ])
+                                ]),
+                                _createVNode$1(_component_VRow, null, {
+                                  default: _withCtx$1(() => [
+                                    (_openBlock$1(true), _createElementBlock$1(_Fragment$1, null, _renderList$1(section.fields, (field) => {
+                                      return (_openBlock$1(), _createBlock$1(_component_VCol, {
+                                        key: field.key,
+                                        cols: "12",
+                                        md: __props.globalMode && field.type === 'switch' ? 12 : 6
+                                      }, {
+                                        default: _withCtx$1(() => [
+                                          (__props.globalMode && field.type === 'switch')
+                                            ? (_openBlock$1(), _createBlock$1(_component_VSwitch, {
+                                                key: 0,
+                                                modelValue: localTask.value[field.key],
+                                                "onUpdate:modelValue": $event => ((localTask.value[field.key]) = $event),
+                                                label: fieldLabel(field),
+                                                color: "primary",
+                                                "hide-details": "",
+                                                inset: ""
+                                              }, null, 8, ["modelValue", "onUpdate:modelValue", "label"]))
+                                            : (['select', 'downloader', 'switch'].includes(field.type))
+                                              ? (_openBlock$1(), _createBlock$1(_component_VSelect, {
+                                                  key: 1,
+                                                  modelValue: localTask.value[field.key],
+                                                  "onUpdate:modelValue": $event => ((localTask.value[field.key]) = $event),
+                                                  items: fieldItems(field),
+                                                  label: fieldLabel(field),
+                                                  hint: fieldHint(field),
+                                                  "persistent-hint": !!fieldHint(field),
+                                                  rules: fieldRules(field),
+                                                  clearable: !__props.globalMode
+                                                }, null, 8, ["modelValue", "onUpdate:modelValue", "items", "label", "hint", "persistent-hint", "rules", "clearable"]))
+                                              : (_openBlock$1(), _createBlock$1(_component_VTextField, {
+                                                  key: 2,
+                                                  modelValue: localTask.value[field.key],
+                                                  "onUpdate:modelValue": $event => ((localTask.value[field.key]) = $event),
+                                                  type: field.type || 'text',
+                                                  label: field.label,
+                                                  min: field.min,
+                                                  max: field.max,
+                                                  step: field.step || 'any',
+                                                  placeholder: __props.globalMode ? undefined : `跟随全局：${globalValueText(field)}`,
+                                                  "persistent-placeholder": !__props.globalMode,
+                                                  hint: fieldHint(field),
+                                                  "persistent-hint": !!fieldHint(field),
+                                                  rules: fieldRules(field),
+                                                  clearable: !__props.globalMode || !field.required
+                                                }, null, 8, ["modelValue", "onUpdate:modelValue", "type", "label", "min", "max", "step", "placeholder", "persistent-placeholder", "hint", "persistent-hint", "rules", "clearable"]))
+                                        ]),
+                                        _: 2
+                                      }, 1032, ["md"]))
+                                    }), 128))
+                                  ]),
+                                  _: 2
+                                }, 1024)
+                              ]),
                               (__props.globalMode && section.value === 'base')
                                 ? (_openBlock$1(), _createElementBlock$1("section", _hoisted_9$1, [
                                     _createVNode$1(_component_VAlert, {
@@ -563,7 +541,7 @@ return (_ctx, _cache) => {
                                       variant: "tonal",
                                       density: "compact"
                                     }, {
-                                      default: _withCtx$1(() => [...(_cache[23] || (_cache[23] = [
+                                      default: _withCtx$1(() => [...(_cache[21] || (_cache[21] = [
                                         _createTextVNode$1("普通保存保留站点覆盖。应用到全部站点会清除共享参数覆盖，并保留站点身份、考核和保护设置。", -1)
                                       ]))]),
                                       _: 1
@@ -572,9 +550,9 @@ return (_ctx, _cache) => {
                                       variant: "tonal",
                                       color: "primary",
                                       disabled: __props.saving,
-                                      onClick: _cache[12] || (_cache[12] = $event => (applyDialog.value = true))
+                                      onClick: _cache[10] || (_cache[10] = $event => (applyDialog.value = true))
                                     }, {
-                                      default: _withCtx$1(() => [...(_cache[24] || (_cache[24] = [
+                                      default: _withCtx$1(() => [...(_cache[22] || (_cache[22] = [
                                         _createTextVNode$1("保存并应用到全部站点", -1)
                                       ]))]),
                                       _: 1
@@ -583,8 +561,8 @@ return (_ctx, _cache) => {
                                 : _createCommentVNode$1("", true)
                             ]),
                             _: 2
-                          }, 1032, ["value"]))
-                        }), 128))
+                          }, 1032, ["value"])
+                        }), 64))
                       ]),
                       _: 1
                     }, 8, ["modelValue"]),
@@ -593,61 +571,61 @@ return (_ctx, _cache) => {
                       class: "brushflow-editor__summary"
                     }, {
                       default: _withCtx$1(() => [
-                        _cache[37] || (_cache[37] = _createElementVNode$1("div", { class: "text-subtitle-1 font-weight-medium" }, "生效参数预览", -1)),
+                        _cache[35] || (_cache[35] = _createElementVNode$1("div", { class: "text-subtitle-1 font-weight-medium" }, "生效参数预览", -1)),
                         _createElementVNode$1("dl", null, [
                           (!__props.globalMode)
                             ? (_openBlock$1(), _createElementBlock$1("div", _hoisted_10$1, [
-                                _cache[25] || (_cache[25] = _createElementVNode$1("dt", null, "站点", -1)),
+                                _cache[23] || (_cache[23] = _createElementVNode$1("dt", null, "站点", -1)),
                                 _createElementVNode$1("dd", null, _toDisplayString$1(siteName.value), 1)
                               ]))
                             : _createCommentVNode$1("", true),
                           (!__props.globalMode)
                             ? (_openBlock$1(), _createElementBlock$1("div", _hoisted_11$1, [
-                                _cache[26] || (_cache[26] = _createElementVNode$1("dt", null, "参数来源", -1)),
-                                _createElementVNode$1("dd", null, _toDisplayString$1(localTask.value.use_global_defaults ? `全局 + ${localTask.value.override_fields.length} 项覆盖` : '站点独立设置'), 1)
+                                _cache[24] || (_cache[24] = _createElementVNode$1("dt", null, "参数来源", -1)),
+                                _createElementVNode$1("dd", null, _toDisplayString$1(overrideFields.value.length ? `全局 + ${overrideFields.value.length} 项站点设置` : '跟随全局'), 1)
                               ]))
                             : _createCommentVNode$1("", true),
                           (!__props.globalMode)
                             ? (_openBlock$1(), _createElementBlock$1("div", _hoisted_12$1, [
-                                _cache[27] || (_cache[27] = _createElementVNode$1("dt", null, "新手考核", -1)),
+                                _cache[25] || (_cache[25] = _createElementVNode$1("dt", null, "新手考核", -1)),
                                 _createElementVNode$1("dd", null, _toDisplayString$1(noviceActive.value ? '优先' : localTask.value.novice ? '已到期' : '关闭'), 1)
                               ]))
                             : _createCommentVNode$1("", true),
                           _createElementVNode$1("div", null, [
-                            _cache[28] || (_cache[28] = _createElementVNode$1("dt", null, "下载器", -1)),
-                            _createElementVNode$1("dd", null, _toDisplayString$1(localTask.value.downloader || '未选择'), 1)
+                            _cache[26] || (_cache[26] = _createElementVNode$1("dt", null, "下载器", -1)),
+                            _createElementVNode$1("dd", null, _toDisplayString$1(previewTask.value.downloader || '未选择'), 1)
                           ]),
                           _createElementVNode$1("div", null, [
-                            _cache[29] || (_cache[29] = _createElementVNode$1("dt", null, "刷新", -1)),
+                            _cache[27] || (_cache[27] = _createElementVNode$1("dt", null, "刷新", -1)),
                             _createElementVNode$1("dd", null, _toDisplayString$1(scheduleText.value), 1)
                           ]),
                           _createElementVNode$1("div", null, [
-                            _cache[30] || (_cache[30] = _createElementVNode$1("dt", null, "检查", -1)),
-                            _createElementVNode$1("dd", null, "每 " + _toDisplayString$1(localTask.value.check_interval || 5) + " 分钟", 1)
+                            _cache[28] || (_cache[28] = _createElementVNode$1("dt", null, "检查", -1)),
+                            _createElementVNode$1("dd", null, "每 " + _toDisplayString$1(previewTask.value.check_interval || 5) + " 分钟", 1)
                           ]),
                           _createElementVNode$1("div", null, [
-                            _cache[31] || (_cache[31] = _createElementVNode$1("dt", null, "单站驻留", -1)),
-                            _createElementVNode$1("dd", null, _toDisplayString$1(localTask.value.rotation_hours ?? 24) + " 小时", 1)
+                            _cache[29] || (_cache[29] = _createElementVNode$1("dt", null, "单站驻留", -1)),
+                            _createElementVNode$1("dd", null, _toDisplayString$1(previewTask.value.rotation_hours ?? 24) + " 小时", 1)
                           ]),
                           _createElementVNode$1("div", null, [
-                            _cache[32] || (_cache[32] = _createElementVNode$1("dt", null, "目标分享率", -1)),
-                            _createElementVNode$1("dd", null, _toDisplayString$1(localTask.value.site_ratio_target || '不限'), 1)
+                            _cache[30] || (_cache[30] = _createElementVNode$1("dt", null, "目标分享率", -1)),
+                            _createElementVNode$1("dd", null, _toDisplayString$1(previewTask.value.site_ratio_target || '不限'), 1)
                           ]),
                           _createElementVNode$1("div", null, [
-                            _cache[33] || (_cache[33] = _createElementVNode$1("dt", null, "下载人数", -1)),
-                            _createElementVNode$1("dd", null, _toDisplayString$1(localTask.value.leecher || '不限'), 1)
+                            _cache[31] || (_cache[31] = _createElementVNode$1("dt", null, "下载人数", -1)),
+                            _createElementVNode$1("dd", null, _toDisplayString$1(previewTask.value.leecher || '不限'), 1)
                           ]),
                           _createElementVNode$1("div", null, [
-                            _cache[34] || (_cache[34] = _createElementVNode$1("dt", null, "下载 / 做种", -1)),
-                            _createElementVNode$1("dd", null, _toDisplayString$1(localTask.value.min_peer_seed_ratio ?? '不限'), 1)
+                            _cache[32] || (_cache[32] = _createElementVNode$1("dt", null, "下载 / 做种", -1)),
+                            _createElementVNode$1("dd", null, _toDisplayString$1(previewTask.value.min_peer_seed_ratio ?? '不限'), 1)
                           ]),
                           _createElementVNode$1("div", null, [
-                            _cache[35] || (_cache[35] = _createElementVNode$1("dt", null, "空间上限", -1)),
-                            _createElementVNode$1("dd", null, _toDisplayString$1(localTask.value.disksize ? `${localTask.value.disksize} GB` : '不限'), 1)
+                            _cache[33] || (_cache[33] = _createElementVNode$1("dt", null, "空间上限", -1)),
+                            _createElementVNode$1("dd", null, _toDisplayString$1(Number(previewTask.value.disksize) > 0 ? `${previewTask.value.disksize} GB` : '不限'), 1)
                           ]),
                           _createElementVNode$1("div", null, [
-                            _cache[36] || (_cache[36] = _createElementVNode$1("dt", null, "促销保护", -1)),
-                            _createElementVNode$1("dd", null, _toDisplayString$1(localTask.value.del_no_free ? `提前 ${localTask.value.promotion_lead_minutes ?? 10} 分钟` : '关闭'), 1)
+                            _cache[34] || (_cache[34] = _createElementVNode$1("dt", null, "促销保护", -1)),
+                            _createElementVNode$1("dd", null, _toDisplayString$1(previewTask.value.del_no_free ? `提前 ${previewTask.value.promotion_lead_minutes ?? 10} 分钟` : '关闭'), 1)
                           ])
                         ])
                       ]),
@@ -667,14 +645,14 @@ return (_ctx, _cache) => {
     }, 8, ["model-value", "fullscreen"]),
     _createVNode$1(_component_VDialog, {
       modelValue: applyDialog.value,
-      "onUpdate:modelValue": _cache[18] || (_cache[18] = $event => ((applyDialog).value = $event)),
+      "onUpdate:modelValue": _cache[16] || (_cache[16] = $event => ((applyDialog).value = $event)),
       "max-width": "30rem"
     }, {
       default: _withCtx$1(() => [
         _createVNode$1(_component_VCard, { title: "应用统一参数到全部站点" }, {
           default: _withCtx$1(() => [
             _createVNode$1(_component_VCardText, null, {
-              default: _withCtx$1(() => [...(_cache[38] || (_cache[38] = [
+              default: _withCtx$1(() => [...(_cache[36] || (_cache[36] = [
                 _createTextVNode$1("所有站点将继承这套全局参数，并清除已有共享参数覆盖。站点名称、启用状态、考核截止时间、时区、H&R、提示跳过和下载器标签保持各站设置。", -1)
               ]))]),
               _: 1
@@ -684,9 +662,9 @@ return (_ctx, _cache) => {
                 _createVNode$1(_component_VSpacer),
                 _createVNode$1(_component_VBtn, {
                   variant: "text",
-                  onClick: _cache[16] || (_cache[16] = $event => (applyDialog.value = false))
+                  onClick: _cache[14] || (_cache[14] = $event => (applyDialog.value = false))
                 }, {
-                  default: _withCtx$1(() => [...(_cache[39] || (_cache[39] = [
+                  default: _withCtx$1(() => [...(_cache[37] || (_cache[37] = [
                     _createTextVNode$1("取消", -1)
                   ]))]),
                   _: 1
@@ -695,9 +673,9 @@ return (_ctx, _cache) => {
                   color: "primary",
                   variant: "flat",
                   loading: __props.saving,
-                  onClick: _cache[17] || (_cache[17] = $event => (saveTask(true)))
+                  onClick: _cache[15] || (_cache[15] = $event => (saveTask(true)))
                 }, {
-                  default: _withCtx$1(() => [...(_cache[40] || (_cache[40] = [
+                  default: _withCtx$1(() => [...(_cache[38] || (_cache[38] = [
                     _createTextVNode$1("保存并应用", -1)
                   ]))]),
                   _: 1
@@ -716,7 +694,7 @@ return (_ctx, _cache) => {
 }
 
 };
-const TaskEditorDialog = /*#__PURE__*/_export_sfc(_sfc_main$1, [['__scopeId',"data-v-fec24c9c"]]);
+const TaskEditorDialog = /*#__PURE__*/_export_sfc(_sfc_main$1, [['__scopeId',"data-v-9ee65364"]]);
 
 const {resolveComponent:_resolveComponent,createVNode:_createVNode,createElementVNode:_createElementVNode,toDisplayString:_toDisplayString,createTextVNode:_createTextVNode,withCtx:_withCtx,openBlock:_openBlock,createBlock:_createBlock,createCommentVNode:_createCommentVNode,mergeProps:_mergeProps,unref:_unref,createElementBlock:_createElementBlock,renderList:_renderList,Fragment:_Fragment,normalizeClass:_normalizeClass,normalizeStyle:_normalizeStyle} = await importShared('vue');
 
@@ -867,7 +845,7 @@ const selectedTask = computed(() => tasks.value.find(item => item.id === selecte
 const selectedState = computed(() => taskStateMeta(selectedTask.value?.state, sequentialMode.value && selectedTask.value?.is_focus === false));
 const rawTaskConfig = computed(() => taskDetail.value?.task?.config || taskDetail.value?.task || {});
 const taskConfig = computed(() => taskDetail.value?.effective_config || effectiveTask(rawTaskConfig.value, status.value.global_defaults));
-const configurationSource = computed(() => rawTaskConfig.value.use_global_defaults === false ? '站点独立设置' : `继承全局 · ${(rawTaskConfig.value.override_fields || []).length} 项覆盖`);
+const configurationSource = computed(() => rawTaskConfig.value.use_global_defaults === false ? '站点独立设置' : (rawTaskConfig.value.override_fields || []).length ? `全局 + ${rawTaskConfig.value.override_fields.length} 项站点设置` : '跟随全局');
 const priorityText = computed(() => selectedTask.value?.priority === 0 ? '新手考核优先' : selectedTask.value?.priority === 1 ? '分享率未达标优先' : '普通轮转');
 const taskRuns = computed(() => taskDetail.value?.runs || []);
 const latestBrushRun = computed(() => taskRuns.value.find(item => item.kind === 'brush') || null);
@@ -1435,7 +1413,7 @@ return (_ctx, _cache) => {
               color: "medium-emphasis"
             }),
             _cache[29] || (_cache[29] = _createElementVNode("div", { class: "text-h6" }, "还没有刷流任务", -1)),
-            _cache[30] || (_cache[30] = _createElementVNode("div", { class: "text-body-2 text-medium-emphasis" }, "先设置统一参数，再添加站点；仅有差异的参数需要单独覆盖。", -1)),
+            _cache[30] || (_cache[30] = _createElementVNode("div", { class: "text-body-2 text-medium-emphasis" }, "先设置统一参数，再添加站点；站点规则留空跟随全局，填写后仅此站生效。", -1)),
             _createVNode(_component_VBtn, {
               color: "primary",
               variant: "flat",
@@ -2392,6 +2370,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const BrushFlowWorkbench = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-16b16de6"]]);
+const BrushFlowWorkbench = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-caadbf32"]]);
 
 export { BrushFlowWorkbench as B };

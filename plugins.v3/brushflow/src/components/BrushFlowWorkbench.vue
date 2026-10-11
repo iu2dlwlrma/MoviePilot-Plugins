@@ -69,7 +69,7 @@ const selectedTask = computed(() => tasks.value.find(item => item.id === selecte
 const selectedState = computed(() => taskStateMeta(selectedTask.value?.state, sequentialMode.value && selectedTask.value?.is_focus === false))
 const rawTaskConfig = computed(() => taskDetail.value?.task?.config || taskDetail.value?.task || {})
 const taskConfig = computed(() => taskDetail.value?.effective_config || effectiveTask(rawTaskConfig.value, status.value.global_defaults))
-const configurationSource = computed(() => rawTaskConfig.value.use_global_defaults === false ? '站点独立设置' : `继承全局 · ${(rawTaskConfig.value.override_fields || []).length} 项覆盖`)
+const configurationSource = computed(() => rawTaskConfig.value.use_global_defaults === false ? '站点独立设置' : (rawTaskConfig.value.override_fields || []).length ? `全局 + ${rawTaskConfig.value.override_fields.length} 项站点设置` : '跟随全局')
 const priorityText = computed(() => selectedTask.value?.priority === 0 ? '新手考核优先' : selectedTask.value?.priority === 1 ? '分享率未达标优先' : '普通轮转')
 const taskRuns = computed(() => taskDetail.value?.runs || [])
 const latestBrushRun = computed(() => taskRuns.value.find(item => item.kind === 'brush') || null)
@@ -480,7 +480,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
     <div v-else-if="!tasks.length" class="brushflow-empty">
       <VIcon icon="mdi-sync-off" size="52" color="medium-emphasis" />
       <div class="text-h6">还没有刷流任务</div>
-      <div class="text-body-2 text-medium-emphasis">先设置统一参数，再添加站点；仅有差异的参数需要单独覆盖。</div>
+      <div class="text-body-2 text-medium-emphasis">先设置统一参数，再添加站点；站点规则留空跟随全局，填写后仅此站生效。</div>
       <VBtn color="primary" variant="flat" prepend-icon="mdi-plus" @click="openCreateTask">创建第一个任务</VBtn>
     </div>
 
