@@ -2,6 +2,10 @@ const taskDefaults = {
   id: '',
   name: '',
   enabled: true,
+  use_global_defaults: true,
+  override_fields: [],
+  novice: false,
+  novice_until: null,
   notify: true,
   site_id: null,
   downloader: '',
@@ -9,18 +13,17 @@ const taskDefaults = {
   check_interval: 5,
   cron: null,
   active_time_range: null,
-  site_ratio_control: false,
-  site_ratio_target: null,
+  site_ratio_target: 2,
   disksize: null,
-  maxupspeed: null,
-  maxdlspeed: null,
-  maxdlcount: null,
   freeleech: 'free',
   hr: 'yes',
   include: null,
   exclude: null,
   size: null,
-  seeder: null,
+  seeder: '1-50',
+  leecher: '1',
+  min_peer_seed_ratio: 0.1,
+  promotion_lead_minutes: 10,
   timezone_offset: 0,
   pubtime: null,
   seed_time: null,
@@ -31,20 +34,33 @@ const taskDefaults = {
   seed_avgspeed: null,
   seed_inactivetime: null,
   delete_size_range: null,
-  up_speed: null,
-  dl_speed: null,
   auto_archive_days: null,
   save_path: null,
   delete_except_tags: null,
   except_subscribe: true,
   proxy_delete: false,
-  del_no_free: false,
+  del_no_free: true,
   qb_category: null,
   site_hr_active: false,
   site_skip_tips: false,
   rss_support: false,
   tag: null,
 };
+
+const siteFields = ['id', 'name', 'enabled', 'site_id', 'novice', 'novice_until', 'timezone_offset', 'site_hr_active', 'site_skip_tips', 'tag'];
+const sharedFields = Object.keys(taskDefaults).filter(key => !siteFields.includes(key) && !['use_global_defaults', 'override_fields'].includes(key));
+const retiredFields = ['site_ratio_control', 'maxdlcount', 'maxupspeed', 'maxdlspeed', 'up_speed', 'dl_speed', 'global_maxdlcount', 'global_maxupspeed', 'global_maxdlspeed'];
+
+function effectiveTask(task = {}, defaults = {}) {
+  const result = cloneTask(task);
+  if (result.use_global_defaults) {
+    const globalValues = { ...taskDefaults, ...defaults };
+    sharedFields.forEach(key => {
+      if (!result.override_fields.includes(key)) result[key] = globalValues[key];
+    });
+  }
+  return result
+}
 
 /** 统一提取宿主 API 客户端与标准响应模型中的业务数据。 */
 function unwrapResponse(response) {
@@ -57,7 +73,11 @@ function unwrapResponse(response) {
 
 /** 基于完整默认值创建可安全编辑的任务深拷贝。 */
 function cloneTask(task = {}) {
-  return JSON.parse(JSON.stringify({ ...taskDefaults, ...(task || {}) }))
+  const result = { ...taskDefaults, ...(task || {}) };
+  result.use_global_defaults = task.use_global_defaults ?? !task.id;
+  result.override_fields = (Array.isArray(task.override_fields) ? task.override_fields : []).filter(key => sharedFields.includes(key));
+  retiredFields.forEach(key => delete result[key]);
+  return JSON.parse(JSON.stringify(result))
 }
 
 /** 把表单空值和数字字段标准化为后端请求模型需要的类型。 */
@@ -65,9 +85,6 @@ function normalizeTask(task) {
   const result = cloneTask(task);
   const nullableNumbers = [
     'disksize',
-    'maxupspeed',
-    'maxdlspeed',
-    'maxdlcount',
     'site_ratio_target',
     'seed_time',
     'hr_seed_time',
@@ -76,8 +93,6 @@ function normalizeTask(task) {
     'download_time',
     'seed_avgspeed',
     'seed_inactivetime',
-    'up_speed',
-    'dl_speed',
     'auto_archive_days',
   ];
   const optionalText = [
@@ -87,12 +102,14 @@ function normalizeTask(task) {
     'exclude',
     'size',
     'seeder',
+    'leecher',
     'pubtime',
     'delete_size_range',
     'save_path',
     'delete_except_tags',
     'qb_category',
     'tag',
+    'novice_until',
   ];
   nullableNumbers.forEach(key => {
     const value = result[key] === '' || result[key] === null ? null : Number(result[key]);
@@ -105,13 +122,21 @@ function normalizeTask(task) {
   result.brush_interval = Number(result.brush_interval || 10);
   result.check_interval = Number(result.check_interval || 5);
   result.timezone_offset = Number(result.timezone_offset || 0);
+  result.min_peer_seed_ratio = result.min_peer_seed_ratio === '' || result.min_peer_seed_ratio == null ? 0 : Number(result.min_peer_seed_ratio);
+  result.promotion_lead_minutes = Number(result.promotion_lead_minutes ?? 10);
+  if (result.novice_until) result.novice_until = new Date(result.novice_until).toISOString();
   return result
+}
+
+function normalizeDefaults(defaults = {}) {
+  const normalized = normalizeTask({ ...taskDefaults, ...defaults });
+  return Object.fromEntries(sharedFields.map(key => [key, normalized[key]]))
 }
 
 /** 把全局设置中的空值、零值和正数标准化为后端请求类型。 */
 function normalizeSettings(settings = {}) {
   const result = { ...(settings || {}) };
-  const limitFields = ['global_disksize', 'global_maxdlcount', 'global_maxupspeed', 'global_maxdlspeed'];
+  const limitFields = ['global_disksize'];
   limitFields.forEach(key => {
     const value = Number(result[key] || 0);
     result[key] = value > 0 ? value : null;
@@ -120,6 +145,8 @@ function normalizeSettings(settings = {}) {
   result.global_delete_size_range = result.global_proxy_delete
     ? String(result.global_delete_size_range || '').trim() || null
     : null;
+  retiredFields.forEach(key => delete result[key]);
+  result.global_defaults = normalizeDefaults(result.global_defaults);
   return result
 }
 
@@ -161,8 +188,6 @@ function taskStateMeta(state) {
     check: { text: '正在检查', color: 'info', icon: 'mdi-progress-check' },
     paused: { text: '已暂停', color: 'secondary', icon: 'mdi-pause-circle-outline' },
     waiting: { text: '等待时段', color: 'warning', icon: 'mdi-clock-outline' },
-    waiting_ratio: { text: '待刷流', color: 'warning', icon: 'mdi-target' },
-    ratio_unavailable: { text: '等待数据', color: 'info', icon: 'mdi-database-clock-outline' },
     disabled: { text: '插件停用', color: 'secondary', icon: 'mdi-stop-circle-outline' },
     error: { text: '运行异常', color: 'error', icon: 'mdi-alert-circle-outline' },
   };
@@ -184,4 +209,4 @@ const _export_sfc = (sfc, props) => {
   return target;
 };
 
-export { _export_sfc as _, formatDateTime as a, formatDuration as b, cloneTask as c, torrentProgress as d, normalizeSettings as e, formatBytes as f, normalizeTask as n, taskStateMeta as t, unwrapResponse as u };
+export { _export_sfc as _, taskDefaults as a, normalizeTask as b, cloneTask as c, formatDateTime as d, effectiveTask as e, formatBytes as f, formatDuration as g, torrentProgress as h, normalizeSettings as i, normalizeDefaults as n, taskStateMeta as t, unwrapResponse as u };

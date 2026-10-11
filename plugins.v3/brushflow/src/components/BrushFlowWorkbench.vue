@@ -3,6 +3,7 @@ import { computed, inject, onMounted, onUnmounted, ref, watch } from 'vue'
 import TaskEditorDialog from './TaskEditorDialog.vue'
 import {
   cloneTask,
+  effectiveTask,
   formatBytes,
   formatDateTime,
   formatDuration,
@@ -41,6 +42,8 @@ const torrentState = ref('active')
 const torrentPage = ref(1)
 const editorOpen = ref(false)
 const editorTask = ref(cloneTask())
+const globalEditorOpen = ref(false)
+const globalEditorTask = ref({})
 const deleteDialog = ref(false)
 const clearDialog = ref(false)
 const settingsMenu = ref(false)
@@ -48,9 +51,7 @@ const settingsDraft = ref({
   enabled: false,
   show_sidebar_nav: true,
   global_disksize: null,
-  global_maxdlcount: null,
-  global_maxupspeed: null,
-  global_maxdlspeed: null,
+  global_defaults: {},
   global_proxy_delete: false,
   global_delete_size_range: null,
 })
@@ -61,7 +62,10 @@ const pluginBase = computed(() => `plugin/${props.pluginId || 'BrushFlow'}`)
 const tasks = computed(() => status.value.tasks || [])
 const selectedTask = computed(() => tasks.value.find(item => item.id === selectedTaskId.value) || null)
 const selectedState = computed(() => taskStateMeta(selectedTask.value?.state))
-const taskConfig = computed(() => taskDetail.value?.task || {})
+const rawTaskConfig = computed(() => taskDetail.value?.task?.config || taskDetail.value?.task || {})
+const taskConfig = computed(() => taskDetail.value?.effective_config || effectiveTask(rawTaskConfig.value, status.value.global_defaults))
+const configurationSource = computed(() => rawTaskConfig.value.use_global_defaults === false ? '站点独立设置' : `继承全局 · ${(rawTaskConfig.value.override_fields || []).length} 项覆盖`)
+const priorityText = computed(() => selectedTask.value?.priority === 0 ? '新手考核优先' : selectedTask.value?.priority === 1 ? '分享率未达标优先' : '普通轮转')
 const taskRuns = computed(() => taskDetail.value?.runs || [])
 const latestBrushRun = computed(() => taskRuns.value.find(item => item.kind === 'brush') || null)
 const torrentData = computed(() => taskDetail.value?.torrents || { items: [], total: 0, page: 1, page_size: 50 })
@@ -122,9 +126,7 @@ async function loadStatus({ preserveSelection = true, loadDetail = true } = {}) 
       enabled: Boolean(status.value.enabled),
       show_sidebar_nav: status.value.show_sidebar_nav !== false,
       global_disksize: status.value.global_disksize ?? null,
-      global_maxdlcount: status.value.global_maxdlcount ?? null,
-      global_maxupspeed: status.value.global_maxupspeed ?? null,
-      global_maxdlspeed: status.value.global_maxdlspeed ?? null,
+      global_defaults: status.value.global_defaults || {},
       global_proxy_delete: Boolean(status.value.global_proxy_delete),
       global_delete_size_range: status.value.global_delete_size_range ?? null,
     }
@@ -181,9 +183,38 @@ function openCreateTask() {
 
 // 打开当前任务的服务端配置快照。
 function openEditTask() {
-  if (!taskConfig.value.id) return
-  editorTask.value = cloneTask(taskConfig.value)
+  if (!rawTaskConfig.value.id) return
+  editorTask.value = cloneTask(rawTaskConfig.value)
   editorOpen.value = true
+}
+
+function openGlobalDefaults() {
+  globalEditorTask.value = JSON.parse(JSON.stringify(status.value.global_defaults || {}))
+  settingsMenu.value = false
+  globalEditorOpen.value = true
+}
+
+async function saveGlobalDefaults(defaults, applyToExisting = false) {
+  saving.value = true
+  try {
+    const payload = normalizeSettings({
+      enabled: status.value.enabled,
+      show_sidebar_nav: status.value.show_sidebar_nav,
+      global_disksize: status.value.global_disksize,
+      global_proxy_delete: status.value.global_proxy_delete,
+      global_delete_size_range: status.value.global_delete_size_range,
+      global_defaults: defaults,
+      apply_defaults_to_existing: applyToExisting,
+    })
+    unwrapResponse(await props.api.post(`${pluginBase.value}/settings`, payload))
+    globalEditorOpen.value = false
+    await loadStatus()
+    notify(applyToExisting ? '统一参数已应用到全部站点' : '全局统一参数已保存，站点覆盖已保留')
+  } catch (err) {
+    notify(err?.message || '保存统一参数失败', 'error')
+  } finally {
+    saving.value = false
+  }
 }
 
 // 通过任务 API 创建或更新任务并刷新调度状态。
@@ -335,7 +366,7 @@ watch(
 onMounted(async () => {
   await loadStatus({ preserveSelection: false })
   refreshTimer = window.setInterval(() => {
-    if (!editorOpen.value && document.visibilityState === 'visible') loadStatus()
+    if (!editorOpen.value && !globalEditorOpen.value && !settingsMenu.value && document.visibilityState === 'visible') loadStatus()
   }, 30000)
 })
 
@@ -353,10 +384,11 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
         <VIcon icon="mdi-sync" color="primary" size="28" />
         <div>
           <h1>站点刷流</h1>
-          <p>多站点任务独立调度与托管</p>
+          <p>统一参数 · 考核与分享率优先 · 多站点轮转</p>
         </div>
       </div>
       <div class="brushflow-page__actions">
+        <VBtn color="primary" variant="tonal" prepend-icon="mdi-tune-variant" :disabled="!statusLoaded || saving" @click="openGlobalDefaults">统一参数</VBtn>
         <VChip v-if="status.summary.task_count" size="small" variant="tonal">
           {{ status.summary.running_count ?? status.summary.enabled_count ?? 0 }} / {{ status.summary.task_count }} 运行
         </VChip>
@@ -399,30 +431,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                 clearable
                 hide-details
               />
-              <VTextField
-                v-model.number="settingsDraft.global_maxdlcount"
-                type="number"
-                min="0"
-                label="全局同时下载任务数"
-                clearable
-                hide-details
-              />
-              <VTextField
-                v-model.number="settingsDraft.global_maxupspeed"
-                type="number"
-                min="0"
-                label="全局总上传带宽（KB/s）"
-                clearable
-                hide-details
-              />
-              <VTextField
-                v-model.number="settingsDraft.global_maxdlspeed"
-                type="number"
-                min="0"
-                label="全局总下载带宽（KB/s）"
-                clearable
-                hide-details
-              />
+              <div class="text-body-2 text-medium-emphasis">插件仅限制空间，并发与速度由下载器管理。</div>
             </VCardText>
             <VCardActions>
               <VSpacer />
@@ -446,7 +455,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
     <div v-else-if="!tasks.length" class="brushflow-empty">
       <VIcon icon="mdi-sync-off" size="52" color="medium-emphasis" />
       <div class="text-h6">还没有刷流任务</div>
-      <div class="text-body-2 text-medium-emphasis">创建任务后可为每个站点分别设置刷新、筛选和删种规则</div>
+      <div class="text-body-2 text-medium-emphasis">先设置统一参数，再添加站点；仅有差异的参数需要单独覆盖。</div>
       <VBtn color="primary" variant="flat" prepend-icon="mdi-plus" @click="openCreateTask">创建第一个任务</VBtn>
     </div>
 
@@ -578,14 +587,13 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                   <VProgressLinear v-if="taskConfig.disksize" :model-value="seedingPercent" height="4" color="primary" />
                 </VSheet>
                 <VSheet class="brushflow-stat app-surface-static">
-                  <span>{{ taskConfig.site_ratio_control ? '站点分享率' : '最近刷新' }}</span>
+                  <span>站点分享率</span>
                   <strong>
-                    {{ taskConfig.site_ratio_control ? formatSiteRatio(selectedTask.site_ratio) : latestBrushRun ? `${latestBrushRun.added_count || 0} / ${latestBrushRun.source_count || 0}` : '-' }}
+                    {{ formatSiteRatio(selectedTask.site_ratio) }}
                   </strong>
-                  <small v-if="taskConfig.site_ratio_control">
-                    {{ selectedTask.site_ratio?.available ? `目标 ${Number(taskConfig.site_ratio_target || 0).toFixed(2)}` : '暂无站点统计数据' }}
+                  <small>
+                    {{ selectedTask.site_ratio?.available ? `目标 ${Number(taskConfig.site_ratio_target || 0).toFixed(2)} · ${priorityText}` : '暂无站点数据，继续轮转' }}
                   </small>
-                  <small v-else>新增 / 候选</small>
                 </VSheet>
               </div>
 
@@ -599,10 +607,12 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                     <VChip :color="selectedState.color" size="small" variant="tonal">{{ selectedState.text }}</VChip>
                   </header>
                   <dl class="brushflow-facts">
-                    <div><dt>刷新周期</dt><dd>{{ taskConfig.cron || `每 ${selectedTask.brush_interval} 分钟` }}</dd></div>
-                    <div><dt>检查周期</dt><dd>每 {{ selectedTask.check_interval }} 分钟</dd></div>
+                    <div><dt>参数来源</dt><dd>{{ configurationSource }}</dd></div>
+                    <div><dt>选种优先级</dt><dd>{{ priorityText }}</dd></div>
+                    <div><dt>刷新周期</dt><dd>{{ taskConfig.cron || `每 ${taskConfig.brush_interval} 分钟` }}</dd></div>
+                    <div><dt>检查周期</dt><dd>每 {{ taskConfig.check_interval }} 分钟</dd></div>
                     <div><dt>开启时段</dt><dd>{{ taskConfig.active_time_range || '全天' }}</dd></div>
-                    <div v-if="taskConfig.site_ratio_control"><dt>站点分享率</dt><dd>{{ formatSiteRatio(selectedTask.site_ratio) }} / {{ Number(taskConfig.site_ratio_target || 0).toFixed(2) }}</dd></div>
+                    <div><dt>站点分享率</dt><dd>{{ formatSiteRatio(selectedTask.site_ratio) }} / {{ taskConfig.site_ratio_target || '不限' }}</dd></div>
                     <div><dt>选种来源</dt><dd>{{ taskConfig.rss_support ? 'RSS' : '站点列表页' }}</dd></div>
                     <div><dt>促销要求</dt><dd>{{ taskConfig.freeleech === '2xfree' ? '2X 免费' : taskConfig.freeleech === 'free' ? '免费' : '全部' }}</dd></div>
                     <div><dt>删种策略</dt><dd>{{ taskConfig.proxy_delete ? `动态 ${taskConfig.delete_size_range || '-' } GB` : '满足任一条件' }}</dd></div>
@@ -787,7 +797,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                   <header class="brushflow-panel__head">
                     <div>
                       <div class="text-subtitle-1 font-weight-medium">任务规则</div>
-                      <div class="text-body-2 text-medium-emphasis">当前服务端生效配置</div>
+                      <div class="text-body-2 text-medium-emphasis">{{ configurationSource }} · 当前服务端生效配置</div>
                     </div>
                   </header>
                   <dl class="brushflow-facts brushflow-facts--two">
@@ -797,12 +807,17 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                     <div><dt>下载器</dt><dd>{{ selectedTask.downloader }}</dd></div>
                     <div><dt>种子大小</dt><dd>{{ taskConfig.size || '不限' }}</dd></div>
                     <div><dt>做种人数</dt><dd>{{ taskConfig.seeder || '不限' }}</dd></div>
+                    <div><dt>下载人数</dt><dd>{{ taskConfig.leecher || '不限' }}</dd></div>
+                    <div><dt>下载 / 做种人数下限</dt><dd>{{ taskConfig.min_peer_seed_ratio ?? '不限' }}</dd></div>
                     <div><dt>发布时间</dt><dd>{{ taskConfig.pubtime ? `${taskConfig.pubtime} 分钟` : '不限' }}</dd></div>
                     <div><dt>排除 H&R</dt><dd>{{ taskConfig.hr === 'yes' ? '是' : '否' }}</dd></div>
                     <div><dt>包含规则</dt><dd>{{ taskConfig.include || '无' }}</dd></div>
                     <div><dt>排除规则</dt><dd>{{ taskConfig.exclude || '无' }}</dd></div>
                     <div><dt>保种上限</dt><dd>{{ taskConfig.disksize ? `${taskConfig.disksize} GB` : '不限' }}</dd></div>
-                    <div><dt>目标分享率</dt><dd>{{ taskConfig.site_ratio_control ? Number(taskConfig.site_ratio_target || 0).toFixed(2) : '关闭' }}</dd></div>
+                    <div><dt>目标分享率</dt><dd>{{ taskConfig.site_ratio_target || '不限' }}（达标继续轮转）</dd></div>
+                    <div><dt>新手考核</dt><dd>{{ selectedTask.novice ? '优先' : taskConfig.novice ? '已到期' : '关闭' }}</dd></div>
+                    <div v-if="taskConfig.novice_until"><dt>考核截止</dt><dd>{{ formatDateTime(taskConfig.novice_until) }}</dd></div>
+                    <div><dt>促销保护</dt><dd>{{ taskConfig.del_no_free ? `提前 ${taskConfig.promotion_lead_minutes ?? 10} 分钟，包含排队任务` : '关闭' }}</dd></div>
                     <div><dt>归档天数</dt><dd>{{ taskConfig.auto_archive_days || '不自动归档' }}</dd></div>
                   </dl>
                 </VSheet>
@@ -840,9 +855,20 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
       :task="editorTask"
       :sites="status.options.sites"
       :downloaders="status.options.downloaders"
+      :global-defaults="status.global_defaults || {}"
       :global-dynamic-delete="Boolean(status.global_proxy_delete)"
       :saving="saving"
       @save="saveTask"
+    />
+
+    <TaskEditorDialog
+      v-model="globalEditorOpen"
+      :task="globalEditorTask"
+      :downloaders="status.options.downloaders"
+      :global-dynamic-delete="Boolean(status.global_proxy_delete)"
+      :saving="saving"
+      global-mode
+      @save="saveGlobalDefaults"
     />
 
     <VDialog v-model="deleteDialog" max-width="28rem">
