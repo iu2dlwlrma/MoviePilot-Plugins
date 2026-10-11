@@ -37,6 +37,7 @@ class BrushTaskPayload(BaseModel):
     cron: Optional[str] = None
     active_time_range: Optional[str] = None
     site_ratio_target: Optional[float] = Field(2, gt=0)
+    rotation_hours: float = Field(24, gt=0, le=168, allow_inf_nan=False)
     disksize: Optional[float] = Field(None, gt=0)
     freeleech: Literal["", "free", "2xfree"] = "free"
     hr: Literal["yes", "no"] = "yes"
@@ -215,6 +216,7 @@ class BrushFlowSettingsPayload(BaseModel):
 
     enabled: bool = True
     show_sidebar_nav: bool = True
+    rotation_mode: Literal["parallel", "sequential"] = "parallel"
     global_defaults: dict = Field(default_factory=lambda: {
         key: DEFAULT_TASK_SETTINGS[key] for key in SHARED_TASK_FIELDS
     })

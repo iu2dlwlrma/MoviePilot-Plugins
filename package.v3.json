@@ -1,12 +1,12 @@
 {
   "BrushFlow": {
     "name": "站点刷流",
-    "description": "多站点优先轮转、下载需求筛选、空间管理与全局统一配置。",
+    "description": "按天单站轮换、下载需求选种、空间管理与全局统一配置。",
     "labels": [
       "刷流",
       "仪表板"
     ],
-    "version": "7.0.0",
+    "version": "7.1.0",
     "icon": "brush.jpg",
     "author": "jxxghp,InfinityPacer,Seed680",
     "level": 2,

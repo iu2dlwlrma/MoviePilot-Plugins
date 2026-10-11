@@ -33,6 +33,16 @@ class BrushFlowModelTests(unittest.TestCase):
         self.assertEqual(task.site_ratio_target, 2)
         self.assertEqual(task.promotion_lead_minutes, 10)
         self.assertTrue(task.del_no_free)
+        self.assertEqual(task.rotation_hours, 24)
+
+    def test_rotation_settings_validation(self):
+        self.assertEqual(self.models.BrushFlowSettingsPayload().rotation_mode, "parallel")
+        self.assertEqual(self.models.BrushFlowSettingsPayload(rotation_mode="sequential").rotation_mode, "sequential")
+        with self.assertRaises(pydantic.ValidationError):
+            self.models.BrushFlowSettingsPayload(rotation_mode="unknown")
+        for hours in (0, -1, 169, float("nan"), float("inf")):
+            with self.subTest(hours=hours), self.assertRaises(pydantic.ValidationError):
+                self.task(rotation_hours=hours)
 
     def test_downloader_required_only_for_independent_tasks(self):
         self.assertIsNone(self.task(downloader="  ").downloader)
