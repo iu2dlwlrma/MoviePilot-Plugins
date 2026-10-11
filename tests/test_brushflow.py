@@ -1,5 +1,6 @@
 import ast
 import copy
+import importlib.util
 import threading
 import unittest
 from datetime import datetime
@@ -22,7 +23,13 @@ def load_plugin():
         "eventmanager": SimpleNamespace(register=lambda *args: lambda func: func),
         "EventType": SimpleNamespace(PluginReload="reload", PluginTriggered="triggered"),
         "logger": Mock(),
+        "settings": SimpleNamespace(TZ="UTC"),
     }
+    for name in ("models", "rules"):
+        spec = importlib.util.spec_from_file_location(f"brushflow_{name}", path.with_name(f"{name}.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        namespace.update({key: value for key, value in vars(module).items() if not key.startswith("_")})
     exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), namespace)
     return namespace
 
@@ -43,6 +50,9 @@ class BrushFlowTests(unittest.TestCase):
         p._brush_lock = threading.Lock()
         p._runtime = {}
         p._task_configs = {}
+        p._global_defaults = {key: self.ns["DEFAULT_TASK_SETTINGS"][key] for key in self.ns["SHARED_TASK_FIELDS"]}
+        p._latest_site_user_data_by_domain = lambda: {}
+        p._build_site_ratio_status = lambda *args, **kwargs: {"available": False}
         p._global_maxdlcount = 5
         p._global_disksize = p._global_maxupspeed = p._global_maxdlspeed = None
         self.data = {}
@@ -97,34 +107,25 @@ class BrushFlowTests(unittest.TestCase):
         for task in tasks:
             self.plugin._queue_brush(task.id)
 
-    def test_nine_sites_share_five_slots_and_never_served_sites_go_first(self):
+    def test_nine_sites_rotate_without_plugin_download_cap(self):
         tasks = [self.add_task(i) for i in range(1, 10)]
         self.queue(*tasks)
         self.plugin._dispatch_brush()
-        self.assertEqual(self.added, ["1", "2", "3", "4", "5"])
-        self.assertEqual(set(self.plugin._pending_brush), {"6", "7", "8", "9"})
-        self.rows["tb"] = [SimpleNamespace(hashString=f"hash-{i}-{i}", labels=[f"site-{i}"],
-                                          percent_done=0.5) for i in range(1, 6)]
-        self.queue(*tasks[:5])
-        self.plugin._dispatch_brush()
-        self.assertEqual(len(self.added), 5)
-        for torrent in self.rows["tb"]:
-            torrent.percent_done = 1
-        self.plugin._dispatch_brush()
-        self.assertEqual(self.added[5:9], ["6", "7", "8", "9"])
-        self.assertEqual(len(self.added), 10)
+        self.assertEqual(self.added, [str(i) for i in range(1, 10)] * 3)
+        self.assertEqual(self.plugin._pending_brush, {})
+        for task in tasks:
+            report = self.plugin._get_task_data(task.id, "runs")[0]
+            self.assertEqual(report["added_count"], 3)
+            self.assertEqual(report["source_count"], 3)
 
-    def test_full_queue_retains_requests_until_completion(self):
+    def test_full_downloader_queue_does_not_block_additions(self):
         tasks = [self.add_task(i) for i in range(1, 7)]
         self.rows["tb"] = [SimpleNamespace(hashString=str(i), labels=[f"site-{i}"],
-                                          status="download pending", percent_done=0.5) for i in range(1, 6)]
+                                          status="download pending", percent_done=0.0) for i in range(1, 6)]
         self.queue(tasks[-1])
         self.plugin._dispatch_brush()
-        self.assertEqual(self.added, [])
-        self.assertIn("6", self.plugin._pending_brush)
-        self.rows["tb"][0].percent_done = 1
-        self.plugin._dispatch_brush()
-        self.assertEqual(self.added, ["6"])
+        self.assertEqual(self.added, ["6"] * 3)
+        self.assertNotIn("6", self.plugin._pending_brush)
 
     def test_unfinished_states_and_seeding_do_not_depend_on_status_spelling(self):
         for state in ["download pending", "download_pending", "stopped", "checking", "downloading"]:
@@ -136,15 +137,15 @@ class BrushFlowTests(unittest.TestCase):
         self.assertFalse(self.cls._unfinished_download({"state": "stalledUP", "progress": 1}))
         self.assertTrue(self.cls._unfinished_download(SimpleNamespace(status="download pending", progress=99)))
 
-    def test_shared_site_across_downloaders_has_one_slot(self):
+    def test_existing_unfinished_site_does_not_limit_downloaders(self):
         first = self.add_task(1)
         second = self.add_task(2, site=1, downloader="qb")
         other = self.add_task(3)
         self.rows["tb"] = [SimpleNamespace(hashString="a", labels=[first.brush_tag], percent_done=0.1)]
         self.queue(second, other)
         self.plugin._dispatch_brush()
-        self.assertEqual(self.added, ["3"])
-        self.assertIn("2", self.plugin._pending_brush)
+        self.assertEqual(self.added, ["2", "3"] * 3)
+        self.assertNotIn("2", self.plugin._pending_brush)
 
     def test_count_deduplicates_hash_and_handles_mixed_downloaders_and_legacy_records(self):
         first = self.add_task(1)
@@ -164,7 +165,7 @@ class BrushFlowTests(unittest.TestCase):
             candidate.allowed = False
         self.queue(*tasks)
         self.plugin._dispatch_brush()
-        self.assertEqual(self.added, ["3"])
+        self.assertEqual(self.added, ["3"] * 3)
 
     def test_failure_to_read_downloader_preserves_pending_and_adds_nothing(self):
         task = self.add_task(1)
@@ -182,7 +183,7 @@ class BrushFlowTests(unittest.TestCase):
         self.plugin._task_locks["1"] = lock
         self.queue(*tasks)
         self.plugin._dispatch_brush()
-        self.assertEqual(self.added, ["2"])
+        self.assertEqual(self.added, ["2"] * 3)
         self.assertIn("1", self.plugin._pending_brush)
         lock.release()
 
@@ -192,7 +193,7 @@ class BrushFlowTests(unittest.TestCase):
         self.plugin._save_task_data("1", "rotation", {"last_added": 10})
         self.queue(second)
         self.plugin.brush(first.id)
-        self.assertEqual(self.added, ["2"])
+        self.assertEqual(self.added, ["2", "1"] * 3)
 
     def test_rotation_survives_empty_recent_run_history(self):
         task = self.add_task(1)
@@ -207,9 +208,9 @@ class BrushFlowTests(unittest.TestCase):
         self.plugin._is_current_time_in_range = lambda task: task.id != "2"
         self.queue(disabled, outside, eligible)
         self.plugin._dispatch_brush()
-        self.assertEqual(self.added, ["3"])
+        self.assertEqual(self.added, ["3"] * 3)
 
-    def test_concurrent_dispatch_cannot_overfill_a_slot(self):
+    def test_concurrent_dispatch_does_not_duplicate_candidates(self):
         tasks = [self.add_task(i) for i in range(1, 3)]
         self.plugin._global_maxdlcount = 1
         entered, finish = threading.Event(), threading.Event()
@@ -229,7 +230,7 @@ class BrushFlowTests(unittest.TestCase):
         finish.set()
         worker.join(3)
         self.assertFalse(worker.is_alive())
-        self.assertEqual(len(self.added), 1)
+        self.assertEqual(self.added, ["1", "2"] * 3)
 
     def test_scheduler_rebuild_keeps_interval_anchor(self):
         self.add_task(1)
@@ -240,9 +241,9 @@ class BrushFlowTests(unittest.TestCase):
         self.assertEqual(first[0]["func"], self.plugin._queue_brush)
         self.assertTrue(all("start_date" in x["kwargs"] for x in first))
 
-    def test_qb_accepted_without_hash_still_reserves_slot(self):
+    def test_qb_accepted_without_hash_reserves_space_and_recovers_identity(self):
         tasks = [self.add_task(i, downloader="qb") for i in range(1, 3)]
-        self.plugin._global_maxdlcount = 1
+        self.plugin._global_disksize = 100 / 1024 ** 3
         self.ns["StringUtils"] = SimpleNamespace(generate_random_str=lambda size: "unique-tag")
         self.plugin._BrushFlow__download = self.cls._BrushFlow__download.__get__(self.plugin)
         downloader = self.services["qb"].instance
@@ -256,8 +257,195 @@ class BrushFlowTests(unittest.TestCase):
         self.queue(*tasks)
         self.plugin._dispatch_brush()
         self.assertEqual(downloader.add_torrent.call_count, 1)
-        self.assertIn("2", self.plugin._pending_brush)
+        records = self.plugin._get_task_data("1", "torrents")
+        self.assertEqual(records["pending:unique-tag"]["size"], 100)
+        self.assertEqual(self.plugin._calculate_global_seeding_size(), 100)
+        self.plugin._resolve_pending_downloads(records, {"real-hash": {"tags": "site-1, unique-tag"}})
+        self.assertNotIn("pending:unique-tag", records)
+        self.assertEqual(records["real-hash"]["size"], 100)
         self.assertGreater(self.plugin._site_last_added(1), 0)
+
+    def test_hash_lookup_exception_keeps_capacity_reserved(self):
+        tasks = [self.add_task(i, downloader="qb") for i in range(1, 3)]
+        self.plugin._global_disksize = 100 / 1024 ** 3
+        self.ns["StringUtils"] = SimpleNamespace(generate_random_str=lambda size: "lookup-error")
+        self.plugin._BrushFlow__download = self.cls._BrushFlow__download.__get__(self.plugin)
+        downloader = self.services["qb"].instance
+        downloader.add_torrent = Mock(return_value=True)
+        downloader.get_torrent_id_by_tag = Mock(side_effect=RuntimeError("unavailable"))
+        for candidates in self.candidates.values():
+            for torrent in candidates:
+                torrent.enclosure = "magnet:?xt=urn:btih:" + "a" * 40
+                torrent.site_proxy = False
+                torrent.site_cookie = None
+        self.queue(*tasks)
+        self.plugin._dispatch_brush()
+        self.assertEqual(downloader.add_torrent.call_count, 1)
+        self.assertEqual(self.plugin._calculate_global_seeding_size(), 100)
+
+    def test_novice_then_low_ratio_then_normal_get_first_round(self):
+        tasks = [self.add_task(i) for i in range(1, 5)]
+        tasks[2].novice = True
+        tasks[3].novice = True
+        tasks[3].novice_until = "2000-01-01T00:00:00+00:00"
+        self.plugin._build_site_ratio_status = lambda task, *args, **kwargs: {
+            "available": True, "reached": task.id != "2",
+        }
+        self.queue(*tasks)
+        self.plugin._dispatch_brush()
+        self.assertEqual(self.added, ["3", "2", "1", "4"] * 3)
+
+    def test_space_reserves_queued_full_size_and_deduplicates_same_hash(self):
+        first, second = self.add_task(1), self.add_task(2)
+        self.plugin._global_disksize = 300 / 1024 ** 3
+        for task in (first, second):
+            self.plugin._save_task_data(task.id, "torrents", {"shared": {"size": 100, "downloaded": 0}})
+        self.queue(first, second)
+        self.plugin._dispatch_brush()
+        self.assertEqual(self.added, ["1", "2"])
+        self.assertEqual(self.plugin._calculate_global_seeding_size(), 300)
+
+    def test_global_inheritance_roundtrip_preserves_false_null_and_site_flags(self):
+        config = self.ns["BrushTaskConfig"]
+        defaults = {"downloader": "qb", "notify": True, "size": "10-100", "leecher": "3"}
+        task = config({"id": "1", "name": "one", "site_id": 1, "override_fields": ["notify", "size"],
+                       "notify": False, "size": None, "site_skip_tips": True}, defaults)
+        self.assertFalse(task.notify)
+        self.assertIsNone(task.size)
+        self.assertEqual(task.leecher, "3")
+        self.assertEqual(task.downloader, "qb")
+        stored = task.to_dict()
+        self.assertNotIn("leecher", stored)
+        restored = config(stored, {**defaults, "leecher": "8"})
+        self.assertEqual(restored.leecher, "8")
+        self.assertFalse(restored.notify)
+        self.assertIsNone(restored.size)
+        self.assertTrue(restored.site_skip_tips)
+
+    def test_legacy_explicit_values_migrate_as_overrides_but_no_count_or_speed_caps(self):
+        task = self.ns["BrushTaskConfig"]({"downloader": "tb", "seed_inactivetime": 1440,
+                                           "site_ratio_target": 9, "maxdlcount": 1, "maxupspeed": 1,
+                                           "up_speed": 5, "del_no_free": False})
+        self.assertEqual(task.site_ratio_target, 9)
+        self.assertIn("site_ratio_target", task.override_fields)
+        self.assertIn("seed_inactivetime", task.override_fields)
+        self.assertEqual(task.leecher, "1")
+        self.assertFalse(task.del_no_free)
+        self.assertIsNone(task.maxdlcount)
+        self.assertIsNone(task.up_speed)
+        self.assertNotIn("maxupspeed", task.to_dict())
+
+    def test_ratio_bytes_fallback_zero_unknown_and_reached_still_allowed(self):
+        task = self.add_task(1)
+        self.ns["StringUtils"] = SimpleNamespace(get_url_domain=lambda value: value)
+        build = self.cls._build_site_ratio_status.__get__(self.plugin)
+        row = SimpleNamespace(ratio=0, upload=20, download=100, updated_day=None, updated_time=None)
+        status = build(task, {"1": row})
+        self.assertEqual(status["current"], 0.2)
+        self.assertTrue(status["estimated"])
+        self.assertEqual(self.plugin._priority_tier(task, status), 1)
+        row.download = 0
+        status = build(task, {"1": row})
+        self.assertTrue(status["unlimited"])
+        self.assertTrue(status["reached"])
+        row.upload = 0
+        self.assertFalse(build(task, {"1": row})["available"])
+        self.plugin._build_site_ratio_status = lambda *args, **kwargs: {"available": True, "reached": True}
+        self.assertTrue(self.cls._evaluate_site_ratio_control(self.plugin, task)[0])
+
+    def test_candidate_selection_combines_demand_seeders_and_promotion_margin(self):
+        from datetime import timedelta, timezone
+        task = self.add_task(1)
+        evaluate = self.cls._BrushFlow__evaluate_conditions_for_brush.__get__(self.plugin)
+        torrent = SimpleNamespace(title="sample", description="", site_name="one", page_url=None,
+                                  size=100, downloadvolumefactor=0, uploadvolumefactor=1,
+                                  hit_and_run=False, seeders=10, peers=1, freedate=None)
+        with self.plugin._task_scope(task.id):
+            self.assertTrue(evaluate(torrent, {})[0])
+            torrent.peers = 0
+            self.assertEqual(evaluate(torrent, {})[1], "下载人数低于下限")
+            torrent.peers = 1
+            torrent.seeders = 50
+            self.assertEqual(evaluate(torrent, {})[1], "下载/做种人数比不足")
+            torrent.seeders = 51
+            self.assertEqual(evaluate(torrent, {})[1], "做种人数不在范围内")
+            torrent.seeders = 10
+            torrent.freedate = (datetime.now(timezone.utc) + timedelta(minutes=9)).isoformat()
+            self.assertEqual(evaluate(torrent, {})[1], "促销剩余时间不足")
+            torrent.freedate = (datetime.now(timezone.utc) + timedelta(minutes=11)).isoformat()
+            self.assertTrue(evaluate(torrent, {})[0])
+
+    def test_unavailable_downloader_keeps_pending_without_blocking_other_sites(self):
+        unavailable = self.add_task(1)
+        healthy = self.add_task(2, downloader="qb")
+        self.services["tb"].instance.get_torrents = lambda: (None, True)
+        self.queue(unavailable, healthy)
+        self.plugin._dispatch_brush()
+        self.assertEqual(self.added, ["2"] * 3)
+        self.assertIn("1", self.plugin._pending_brush)
+
+    def test_global_save_preserves_overrides_and_apply_all_clears_only_shared_fields(self):
+        task = self.add_task(1)
+        task.novice = True
+        task.site_skip_tips = True
+        self.plugin._show_sidebar_nav = True
+        self.plugin._global_proxy_delete = False
+        self.plugin._global_delete_size_range = None
+        self.plugin._save_config = Mock()
+        self.plugin._build_status_data = lambda: {}
+        self.ns["schemas"] = SimpleNamespace(Response=lambda **values: SimpleNamespace(**values))
+        settings_model = self.ns["BrushFlowSettingsPayload"]
+        payload = settings_model(global_defaults={"downloader": "qb", "leecher": "8"})
+        self.assertTrue(self.plugin.update_settings(payload).success)
+        updated = self.plugin._task_configs["1"]
+        self.assertEqual(updated.downloader, "tb")
+        self.assertEqual(updated.leecher, "8")
+        payload = settings_model(global_defaults={"downloader": "qb", "leecher": "9"}, apply_defaults_to_existing=True)
+        self.assertTrue(self.plugin.update_settings(payload).success)
+        updated = self.plugin._task_configs["1"]
+        self.assertEqual(updated.downloader, "qb")
+        self.assertEqual(updated.override_fields, [])
+        self.assertTrue(updated.novice)
+        self.assertTrue(updated.site_skip_tips)
+        self.assertEqual(updated.tag, "site-1")
+
+    def test_settings_do_not_mutate_tasks_while_a_round_is_running(self):
+        task = self.add_task(1)
+        self.ns["schemas"] = SimpleNamespace(Response=lambda **values: SimpleNamespace(**values))
+        self.plugin._brush_lock.acquire()
+        try:
+            response = self.plugin.update_settings(self.ns["BrushFlowSettingsPayload"]())
+            self.assertFalse(response.success)
+            self.assertIs(self.plugin._task_configs["1"], task)
+        finally:
+            self.plugin._brush_lock.release()
+
+    def test_new_promotion_check_is_scheduled_before_next_site_is_added(self):
+        first, second = self.add_task(1), self.add_task(2)
+        self.candidates["1"] = self.candidates["1"][:1]
+        self.candidates["2"] = self.candidates["2"][:1]
+        expiry = datetime.now().astimezone()
+        self.plugin._next_promotion_expiry = lambda task: expiry if task.id in self.added else None
+        order = []
+        download = self.plugin._BrushFlow__download
+        self.plugin._refresh_scheduler = lambda: order.append("schedule")
+        def record_download(torrent):
+            order.append(self.plugin._get_task_config().id)
+            return download(torrent)
+        self.plugin._BrushFlow__download = record_download
+        self.queue(first, second)
+        self.plugin._dispatch_brush()
+        self.assertEqual(order[:3], ["1", "schedule", "2"])
+
+    def test_global_downloader_change_cannot_orphan_existing_torrents(self):
+        self.add_task(1)
+        self.plugin._save_task_data("1", "torrents", {"managed": {"size": 100, "deleted": False}})
+        self.ns["schemas"] = SimpleNamespace(Response=lambda **values: SimpleNamespace(**values))
+        payload = self.ns["BrushFlowSettingsPayload"](global_defaults={"downloader": "qb"}, apply_defaults_to_existing=True)
+        response = self.plugin.update_settings(payload)
+        self.assertFalse(response.success)
+        self.assertEqual(self.plugin._task_configs["1"].downloader, "tb")
+        self.assertEqual(self.plugin._calculate_global_seeding_size(), 100)
 
 
 if __name__ == "__main__":
