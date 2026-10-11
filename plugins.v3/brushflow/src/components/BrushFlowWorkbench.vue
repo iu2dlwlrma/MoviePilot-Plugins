@@ -69,7 +69,6 @@ const selectedTask = computed(() => tasks.value.find(item => item.id === selecte
 const selectedState = computed(() => taskStateMeta(selectedTask.value?.state, sequentialMode.value && selectedTask.value?.is_focus === false))
 const rawTaskConfig = computed(() => taskDetail.value?.task?.config || taskDetail.value?.task || {})
 const taskConfig = computed(() => taskDetail.value?.effective_config || effectiveTask(rawTaskConfig.value, status.value.global_defaults))
-const configurationSource = computed(() => rawTaskConfig.value.use_global_defaults === false ? '站点独立设置' : (rawTaskConfig.value.override_fields || []).length ? `全局 + ${rawTaskConfig.value.override_fields.length} 项站点设置` : '跟随全局')
 const priorityText = computed(() => selectedTask.value?.priority === 0 ? '新手考核优先' : selectedTask.value?.priority === 1 ? '分享率未达标优先' : '普通轮转')
 const taskRuns = computed(() => taskDetail.value?.runs || [])
 const latestBrushRun = computed(() => taskRuns.value.find(item => item.kind === 'brush') || null)
@@ -634,7 +633,6 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                     <VChip :color="selectedState.color" size="small" variant="tonal">{{ selectedState.text }}</VChip>
                   </header>
                   <dl class="brushflow-facts">
-                    <div><dt>参数来源</dt><dd>{{ configurationSource }}</dd></div>
                     <div><dt>选种优先级</dt><dd>{{ priorityText }}</dd></div>
                     <div v-if="sequentialMode"><dt>单站驻留</dt><dd>{{ taskConfig.rotation_hours ?? 24 }} 小时</dd></div>
                     <div v-if="sequentialMode && selectedTask.is_focus && siteRotation.deadline_at"><dt>预计切换</dt><dd>{{ formatDateTime(siteRotation.deadline_at) }}</dd></div>

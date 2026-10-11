@@ -54,7 +54,7 @@ const sections = [
       { key: 'pubtime', label: '发布时间（分钟）', hint: '单值或范围，如 5-120' },
       { key: 'include', label: '包含规则', hint: '支持正则表达式' },
       { key: 'exclude', label: '排除规则', hint: '支持正则表达式' },
-      { key: 'rss_support', label: '使用 RSS', type: 'switch' },
+      { key: 'rss_support', label: '使用 RSS', type: 'switch', siteOnly: true },
       { key: 'except_subscribe', label: '排除订阅', type: 'switch' },
     ],
   },
@@ -104,12 +104,12 @@ function globalValueText(field) {
 
 function fieldItems(field) {
   const items = field.type === 'switch' ? [{ title: '开启', value: true }, { title: '关闭', value: false }] : field.type === 'downloader' ? props.downloaders : field.items
-  return props.globalMode ? items : [{ title: `跟随全局（${globalValueText(field)}）`, value: null }, ...items]
+  return items
 }
 
 function fieldHint(field) {
   if (props.globalMode) return field.globalHint || field.hint
-  return `留空跟随全局：${globalValueText(field)}${field.hint ? `。${field.hint}` : ''}`
+  return field.hint
 }
 
 function fieldLabel(field) {
@@ -201,16 +201,12 @@ async function saveTask(apply = false) {
                 <div class="editor-switches">
                   <VSwitch v-model="localTask.enabled" label="启用任务" color="primary" hide-details inset />
                 </div>
-                <VAlert type="info" variant="tonal" density="compact">规则留空即跟随全局；填写后仅此站点生效，清空即可恢复跟随。</VAlert>
+                <VAlert type="info" variant="tonal" density="compact">留空使用默认值，填写后仅对此站点生效。</VAlert>
               </section>
               <section v-if="section.value === 'base' && !globalMode" class="editor-section">
                 <div class="text-subtitle-1 font-weight-medium">考核与站点保护</div>
                 <VSwitch v-model="localTask.novice" label="新手考核优先" color="primary" hide-details inset />
                 <VTextField v-if="localTask.novice" v-model="localTask.novice_until" type="datetime-local" label="考核截止时间（本地时间，可选）" clearable hint="留空时手动关闭；超过截止时间后自动失去考核优先级。" persistent-hint :rules="[value => !value || !Number.isNaN(new Date(value).getTime()) || '请输入有效时间']" />
-                <VRow>
-                  <VCol cols="12" md="6"><VTextField v-model.number="localTask.timezone_offset" type="number" label="站点时区偏移（小时）" /></VCol>
-                  <VCol cols="12" md="6"><VTextField v-model="localTask.tag" label="下载器标签" hint="留空使用「刷流-站点名」；同站点多任务需使用不同标签。" persistent-hint /></VCol>
-                </VRow>
                 <div class="editor-switches">
                   <VSwitch v-model="localTask.site_hr_active" label="全站 H&R" color="primary" hide-details inset />
                   <VSwitch v-model="localTask.site_skip_tips" label="自动跳过下载提示" color="primary" hide-details inset />
@@ -219,10 +215,10 @@ async function saveTask(apply = false) {
               <section class="editor-section">
                 <header class="editor-section__head"><div><div class="text-subtitle-1 font-weight-medium">{{ section.title }}</div><div class="text-body-2 text-medium-emphasis">{{ section.description }}</div></div></header>
                 <VRow>
-                  <VCol v-for="field in section.fields" :key="field.key" cols="12" :md="globalMode && field.type === 'switch' ? 12 : 6">
-                    <VSwitch v-if="globalMode && field.type === 'switch'" v-model="localTask[field.key]" :label="fieldLabel(field)" color="primary" hide-details inset />
-                    <VSelect v-else-if="['select', 'downloader', 'switch'].includes(field.type)" v-model="localTask[field.key]" :items="fieldItems(field)" :label="fieldLabel(field)" :hint="fieldHint(field)" :persistent-hint="!!fieldHint(field)" :rules="fieldRules(field)" :clearable="!globalMode" />
-                    <VTextField v-else v-model="localTask[field.key]" :type="field.type || 'text'" :label="field.label" :min="field.min" :max="field.max" :step="field.step || 'any'" :placeholder="globalMode ? undefined : `跟随全局：${globalValueText(field)}`" :persistent-placeholder="!globalMode" :hint="fieldHint(field)" :persistent-hint="!!fieldHint(field)" :rules="fieldRules(field)" :clearable="!globalMode || !field.required" />
+                  <VCol v-for="field in section.fields.filter(field => !globalMode || !field.siteOnly)" :key="field.key" cols="12" :md="globalMode && field.type === 'switch' ? 12 : 6">
+                    <VSwitch v-if="(globalMode || field.siteOnly) && field.type === 'switch'" v-model="localTask[field.key]" :label="fieldLabel(field)" color="primary" hide-details inset />
+                    <VSelect v-else-if="['select', 'downloader', 'switch'].includes(field.type)" v-model="localTask[field.key]" :items="fieldItems(field)" :placeholder="globalMode ? undefined : globalValueText(field)" :persistent-placeholder="!globalMode" :label="fieldLabel(field)" :hint="fieldHint(field)" :persistent-hint="!!fieldHint(field)" :rules="fieldRules(field)" :clearable="!globalMode" />
+                    <VTextField v-else v-model="localTask[field.key]" :type="field.type || 'text'" :label="field.label" :min="field.min" :max="field.max" :step="field.step || 'any'" :placeholder="globalMode ? undefined : globalValueText(field)" :persistent-placeholder="!globalMode" :hint="fieldHint(field)" :persistent-hint="!!fieldHint(field)" :rules="fieldRules(field)" :clearable="!globalMode || !field.required" />
                   </VCol>
                 </VRow>
               </section>
@@ -236,7 +232,6 @@ async function saveTask(apply = false) {
             <div class="text-subtitle-1 font-weight-medium">生效参数预览</div>
             <dl>
               <div v-if="!globalMode"><dt>站点</dt><dd>{{ siteName }}</dd></div>
-              <div v-if="!globalMode"><dt>参数来源</dt><dd>{{ overrideFields.length ? `全局 + ${overrideFields.length} 项站点设置` : '跟随全局' }}</dd></div>
               <div v-if="!globalMode"><dt>新手考核</dt><dd>{{ noviceActive ? '优先' : localTask.novice ? '已到期' : '关闭' }}</dd></div>
               <div><dt>下载器</dt><dd>{{ previewTask.downloader || '未选择' }}</dd></div>
               <div><dt>刷新</dt><dd>{{ scheduleText }}</dd></div>

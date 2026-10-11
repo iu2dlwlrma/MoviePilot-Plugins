@@ -204,6 +204,15 @@ class BrushFlowTests(unittest.TestCase):
                            SimpleNamespace(hashString="queued", percent_done=0, labels=[])]
         self.assertEqual(self.plugin._site_completed_count(1), 1)
 
+    def test_rss_is_site_specific_even_when_global_defaults_change(self):
+        config = {"site_id": 1, "downloader": "tb", "use_global_defaults": True,
+                  "override_fields": [], "rss_support": True}
+        task = self.ns["BrushTaskConfig"](config, {"rss_support": False})
+        self.assertTrue(task.rss_support)
+        config["rss_support"] = False
+        self.assertFalse(self.ns["BrushTaskConfig"](config, {"rss_support": True}).rss_support)
+        self.assertNotIn("rss_support", self.ns["SHARED_TASK_FIELDS"])
+
     def add_task(self, tid, site=None, downloader="tb", enabled=True):
         task = self.ns["BrushTaskConfig"]({
             "id": str(tid), "name": str(tid), "site_id": site or int(tid),

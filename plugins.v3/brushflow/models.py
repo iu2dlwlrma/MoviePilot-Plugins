@@ -197,7 +197,7 @@ DEFAULT_TASK_SETTINGS = {
 }
 SHARED_TASK_FIELDS = frozenset(DEFAULT_TASK_SETTINGS) - {
     "enabled", "use_global_defaults", "override_fields", "novice", "novice_until",
-    "tag", "timezone_offset", "site_hr_active", "site_skip_tips",
+    "tag", "timezone_offset", "site_hr_active", "site_skip_tips", "rss_support",
 }
 
 

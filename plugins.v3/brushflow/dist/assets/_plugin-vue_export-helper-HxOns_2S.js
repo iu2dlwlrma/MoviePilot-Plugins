@@ -48,7 +48,7 @@ const taskDefaults = {
   tag: null,
 };
 
-const siteFields = ['id', 'name', 'enabled', 'site_id', 'novice', 'novice_until', 'timezone_offset', 'site_hr_active', 'site_skip_tips', 'tag'];
+const siteFields = ['id', 'name', 'enabled', 'site_id', 'novice', 'novice_until', 'timezone_offset', 'site_hr_active', 'site_skip_tips', 'tag', 'rss_support'];
 const sharedFields = Object.keys(taskDefaults).filter(key => !siteFields.includes(key) && !['use_global_defaults', 'override_fields'].includes(key));
 const retiredFields = ['site_ratio_control', 'maxdlcount', 'maxupspeed', 'maxdlspeed', 'up_speed', 'dl_speed', 'global_maxdlcount', 'global_maxupspeed', 'global_maxdlspeed'];
 const nullableNumbers = ['disksize', 'site_ratio_target', 'seed_time', 'hr_seed_time', 'seed_ratio', 'seed_size', 'download_time', 'seed_avgspeed', 'seed_inactivetime', 'auto_archive_days'];

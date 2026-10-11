@@ -256,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.1.3"
+    plugin_version = "7.1.4"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -320,6 +320,10 @@ class BrushFlow(_PluginBase):
         for row in task_rows:
             if not isinstance(row, dict):
                 continue
+            old_defaults = raw_config.get("global_defaults") or {}
+            if "rss_support" in old_defaults and row.get("use_global_defaults", True) \
+                    and "rss_support" not in (row.get("override_fields") or []):
+                row = {**row, "rss_support": bool(old_defaults["rss_support"])}
             task = BrushTaskConfig(row, self._global_defaults)
             if not self._validate_task_reference(task, notify=False):
                 task.enabled = False
