@@ -255,7 +255,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.1.1"
+    plugin_version = "7.1.2"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -1430,7 +1430,7 @@ class BrushFlow(_PluginBase):
         return latest
 
     def _is_focus_site(self, site_id: int) -> bool:
-        """驻留只控制新增种子，状态检查和已有下载不受影响。"""
+        """驻留控制新增种子和排队优先级，已有下载继续运行。"""
         if getattr(self, "_rotation_mode", "parallel") != "sequential":
             return True
         state = self.get_data("site_rotation") or {}
@@ -1501,6 +1501,7 @@ class BrushFlow(_PluginBase):
         try:
             site_data = self._latest_site_user_data_by_domain()
             self._select_rotation_site(site_data)
+            self._prioritize_download_queue(site_data)
             with self._runtime_lock:
                 for tid in list(self._pending_brush):
                     if tid not in self._task_configs or not self._task_configs[tid].enabled:
@@ -1566,7 +1567,52 @@ class BrushFlow(_PluginBase):
                         delattr(self._task_context, key)
                 self._brush_lock.release()
                 if any(report.get("added_count") for report in reports.values()):
+                    self._prioritize_download_queue(self._latest_site_user_data_by_domain())
                     self._refresh_scheduler()
+
+    def _prioritize_download_queue(self, site_data: dict) -> None:
+        """同步待下载顺序，不启动暂停任务或抢占正在下载的任务。"""
+        tasks = [task for task in self._task_configs.values() if task.enabled]
+        helper = DownloaderHelper()
+        for name in {task.downloader for task in tasks if task.downloader}:
+            try:
+                service = helper.get_service(name=name)
+                if not service or not service.instance:
+                    continue
+                downloader = service.instance
+                tr = getattr(downloader, "trc", None)
+                qb = getattr(downloader, "qbc", None)
+                if tr:
+                    rows = tr.get_torrents(arguments=["hashString", "status", "queuePosition", "labels"])
+                    queued = [(row.hashString, row.queue_position, set(row.labels or []))
+                              for row in rows if str(row.status) == "download pending"]
+                elif qb:
+                    rows = qb.torrents_info()
+                    queued = [(row["hash"], row["priority"], self._download_labels(row))
+                              for row in rows if row.get("state") == "queuedDL"]
+                else:
+                    continue
+                queued.sort(key=lambda row: row[1])
+                ranks = {}
+                for task in tasks:
+                    if task.downloader != name or not self._is_focus_site(task.site_id):
+                        continue
+                    records = self._get_task_data(task.id, "torrents") or {}
+                    tier = self._priority_tier(task, self._build_site_ratio_status(task, site_data))
+                    for torrent_hash, position, tags in queued:
+                        if torrent_hash in records or task.brush_tag in tags:
+                            ranks[torrent_hash] = min(ranks.get(torrent_hash, tier), tier)
+                desired = [row[0] for row in sorted(queued, key=lambda row: (ranks.get(row[0], 3), row[1]))
+                           if row[0] in ranks]
+                if [row[0] for row in queued[:len(desired)]] == desired:
+                    continue
+                for torrent_hash in reversed(desired):
+                    if tr:
+                        tr.queue_top(ids=[torrent_hash])
+                    else:
+                        qb.torrents_top_priority(torrent_hashes=[torrent_hash])
+            except Exception:
+                logger.warning(f"下载器 {name} 刷流队列排序失败，等待重试")
 
     def _execute_brush(self, task: BrushTaskConfig, report: Optional[dict] = None) -> Optional[dict]:
         """在分配锁内执行一个站点轮次，检查占用时保留请求。"""

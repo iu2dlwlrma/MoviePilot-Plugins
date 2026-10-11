@@ -91,6 +91,52 @@ class BrushFlowTests(unittest.TestCase):
 
         p._BrushFlow__download = download
 
+    def test_focus_queue_priority_preserves_paused_and_running(self):
+        self.add_task(1)
+        self.add_task(2)
+        self.add_task(3, enabled=False)
+        self.plugin._rotation_mode = "sequential"
+        self.data["site_rotation"] = {"site_id": 2, "deadline_at": 9999999999}
+        client = Mock()
+        self.services["tb"].instance.trc = client
+        client.get_torrents.return_value = [
+            SimpleNamespace(hashString=h, queue_position=i, labels=[tag], status=status)
+            for i, (h, tag, status) in enumerate([
+                ("other", "site-1", "download pending"),
+                ("disabled", "site-3", "download pending"),
+                ("paused", "site-2", "stopped"),
+                ("active", "site-2", "downloading"),
+                ("focus-a", "site-2", "download pending"),
+                ("focus-b", "site-2", "download pending"),
+            ])]
+        self.plugin._prioritize_download_queue({})
+        self.assertEqual([call.kwargs["ids"] for call in client.queue_top.call_args_list],
+                         [["focus-b"], ["focus-a"]])
+
+    def test_queue_priority_noop_when_already_ordered(self):
+        self.add_task(1)
+        client = Mock()
+        self.services["tb"].instance.trc = client
+        client.get_torrents.return_value = [
+            SimpleNamespace(hashString="a", queue_position=4, labels=["site-1"], status="download pending")]
+        self.plugin._prioritize_download_queue({})
+        client.queue_top.assert_not_called()
+
+    def test_qb_queue_priority_uses_site_tiers_and_records(self):
+        self.add_task(1, downloader="qb")
+        task = self.add_task(2, downloader="qb")
+        task.novice = True
+        self.data["task.2.torrents"] = {"novice": {}}
+        client = Mock()
+        self.services["qb"].instance.qbc = client
+        client.torrents_info.return_value = [
+            {"hash": "normal", "priority": 1, "tags": "site-1", "state": "queuedDL"},
+            {"hash": "novice", "priority": 2, "tags": "", "state": "queuedDL"},
+            {"hash": "paused", "priority": 3, "tags": "site-2", "state": "stoppedDL"}]
+        self.plugin._prioritize_download_queue({})
+        self.assertEqual([call.kwargs["torrent_hashes"] for call in client.torrents_top_priority.call_args_list],
+                         [["normal"], ["novice"]])
+
     def add_task(self, tid, site=None, downloader="tb", enabled=True):
         task = self.ns["BrushTaskConfig"]({
             "id": str(tid), "name": str(tid), "site_id": site or int(tid),
