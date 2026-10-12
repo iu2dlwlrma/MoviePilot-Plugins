@@ -256,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.9"
+    plugin_version = "7.2.10"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -2148,8 +2148,9 @@ class BrushFlow(_PluginBase):
             pages[task.id] = {"page": 0, "done": False, "seen": set(), "previous": None}
         source = pages[task.id]
         if not queues[task.id] and not source["done"]:
+            minimum_size = float(task.size.split("-")[0]) * 1024 ** 3 if task.size else 0
             passed, reason = self.__evaluate_size_condition_for_brush(
-                self.__calculate_seeding_torrents_size(torrent_tasks), 1,
+                self.__calculate_seeding_torrents_size(torrent_tasks), minimum_size or 1,
                 global_torrents_size=global_seeding_size,
             )
             if not passed:

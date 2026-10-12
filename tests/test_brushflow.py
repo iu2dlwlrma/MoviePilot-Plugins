@@ -510,6 +510,45 @@ class BrushFlowTests(unittest.TestCase):
                 report = self.plugin._get_task_data(task.id, "runs")[0]
                 self.assertEqual(report["result"], "precondition_blocked")
 
+    def test_page_fetch_requires_room_for_configured_minimum_torrent_size(self):
+        for constraint in ("global_space", "site_space"):
+            for size in ("0.2-30", "0.2"):
+                for remaining, expected in ((0.05, 1), (0.2, 2)):
+                    with self.subTest(constraint=constraint, size=size, remaining=remaining):
+                        self.setUp()
+                        task = self.add_task(1)
+                        task.size = size
+                        if constraint == "global_space":
+                            self.plugin._global_disksize = 1 + remaining
+                        else:
+                            task.disksize = 1 + remaining
+                        first, second = self.candidates["1"][:2]
+                        first.size, second.size = 1024 ** 3, 0.2 * 1024 ** 3
+                        source = Mock(side_effect=[[first], [second], []])
+                        self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=source)
+                        self.queue(task)
+                        self.plugin._dispatch_brush()
+                        self.assertEqual(source.call_count, expected)
+                        self.assertEqual(len(self.added), expected)
+                        report = self.plugin._get_task_data(task.id, "runs")[0]
+                        self.assertEqual(report["result"], "precondition_blocked")
+
+    def test_unset_or_zero_minimum_keeps_one_byte_page_capacity_probe(self):
+        for size in (None, "0", "0-30"):
+            with self.subTest(size=size):
+                self.setUp()
+                task = self.add_task(1)
+                task.size = size
+                self.plugin._global_disksize = 1 + 1 / 1024 ** 3
+                first, second = self.candidates["1"][:2]
+                first.size, second.size = 1024 ** 3, 1
+                source = Mock(side_effect=[[first], [second], []])
+                self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=source)
+                self.queue(task)
+                self.plugin._dispatch_brush()
+                self.assertEqual(source.call_count, 2)
+                self.assertEqual(len(self.added), 2)
+
     def test_first_page_exception_uses_source_failure_retry_without_private_text(self):
         task = self.add_task(1)
         self.plugin._rotation_mode = "sequential"
