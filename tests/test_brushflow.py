@@ -139,6 +139,134 @@ class BrushFlowTests(unittest.TestCase):
         self.assertEqual([call.kwargs["torrent_hashes"] for call in client.torrents_top_priority.call_args_list],
                          [["normal"], ["novice"]])
 
+    def priority_client(self):
+        self.add_task(1)
+        self.add_task(2).novice = True
+        self.plugin._rotation_mode = "parallel"
+        client = Mock()
+        self.services["tb"].instance.trc = client
+        client.get_session.return_value = SimpleNamespace(download_queue_enabled=True)
+        rows = [SimpleNamespace(hashString=h, queue_position=i, labels=[tag], status=status)
+                for i, (h, tag, status) in enumerate([
+                    ("low", "site-1", "downloading"),
+                    ("high", "site-2", "download pending"),
+                    ("manual", "site-2", "stopped"),
+                    ("seeding", "site-1", "seeding"),
+                    ("external", "other", "downloading"),
+                ])]
+        client.get_torrents.return_value = rows
+        def stop(ids):
+            for row in rows:
+                if row.hashString in ids:
+                    row.status = "stopped"
+            rows[1].status = "downloading"
+        def start(ids, bypass_queue=False):
+            self.assertFalse(bypass_queue)
+            for row in rows:
+                if row.hashString in ids:
+                    row.status = "download pending"
+        client.stop_torrent.side_effect = stop
+        client.start_torrent.side_effect = start
+        return client, rows
+
+    def test_priority_reclaims_active_slot_and_returns_victim_to_queue(self):
+        client, rows = self.priority_client()
+        self.plugin._prioritize_download_queue({})
+        self.assertEqual({r.hashString for r in rows if r.status == "downloading"}, {"high", "external"})
+        self.assertEqual([c.kwargs["ids"] for c in client.start_torrent.call_args_list],
+                         [["low"]])
+        self.assertFalse(self.data.get("priority_requeue.tb"))
+
+    def test_priority_does_not_preempt_equal_tier_or_sequential_downloads(self):
+        for mode, novice in [("parallel", False), ("sequential", True)]:
+            with self.subTest(mode=mode):
+                client, rows = self.priority_client()
+                self.plugin._task_configs["2"].novice = novice
+                self.plugin._rotation_mode = mode
+                self.data["site_rotation"] = {"site_id": 2, "deadline_at": 9999999999}
+                self.plugin._prioritize_download_queue({})
+                client.stop_torrent.assert_not_called()
+
+    def test_priority_without_downloader_queue_does_not_stop_downloads(self):
+        client, rows = self.priority_client()
+        client.get_session.return_value.download_queue_enabled = False
+        self.plugin._prioritize_download_queue({})
+        client.stop_torrent.assert_not_called()
+
+    def test_priority_failed_confirmation_restores_victim(self):
+        client, rows = self.priority_client()
+        self.plugin._wait_transmission_allocation = Mock(side_effect=[RuntimeError("offline"), None])
+        self.plugin._prioritize_download_queue({})
+        self.assertEqual([c.kwargs["ids"] for c in client.start_torrent.call_args_list],
+                         [["low"]])
+        self.assertFalse(self.data.get("priority_requeue.tb"))
+
+    def test_priority_does_not_restart_ambiguous_pause_after_interruption(self):
+        client, rows = self.priority_client()
+        client.start_torrent.side_effect = RuntimeError("offline")
+        self.plugin._prioritize_download_queue({})
+        self.assertEqual(self.data.get("priority_requeue.tb"), ["low"])
+        rows[0].status = "stopped"
+        client.reset_mock()
+        client.start_torrent.side_effect = None
+        self.plugin._prioritize_download_queue({})
+        client.start_torrent.assert_not_called()
+        self.assertEqual(self.data.get("allocation_alert.tb"), ["low"])
+        self.assertFalse(self.data.get("priority_requeue.tb"))
+
+    def test_priority_does_not_release_stalled_download_that_uses_no_slot(self):
+        client, rows = self.priority_client()
+        client.get_session.return_value.queue_stalled_enabled = True
+        rows[0].is_stalled = True
+        self.plugin._prioritize_download_queue({})
+        client.stop_torrent.assert_not_called()
+
+    def test_priority_recovery_respects_disabled_site(self):
+        client, rows = self.priority_client()
+        self.data["priority_requeue.tb"] = ["low"]
+        rows[0].status = "stopped"
+        self.plugin._task_configs["1"].enabled = False
+        self.plugin._prioritize_download_queue({})
+        client.start_torrent.assert_not_called()
+        self.assertEqual(self.data.get("allocation_alert.tb"), ["low"])
+        self.assertFalse(self.data.get("priority_requeue.tb"))
+
+    def test_priority_eight_slots_follow_tiers_without_repeated_preemption(self):
+        client, rows = self.priority_client()
+        self.add_task(3)
+        self.plugin._build_site_ratio_status = lambda task, data: {"available": task.id == "3", "met": False}
+        self.plugin._priority_tier = lambda task, status: {"1": 2, "2": 0, "3": 1}[task.id]
+        rows[:] = [SimpleNamespace(hashString=f"low-{i}", queue_position=i,
+                                   labels=["site-1"], status="downloading") for i in range(7)]
+        rows += [SimpleNamespace(hashString=f"high-{i}", queue_position=7+i,
+                                 labels=["site-2"], status="downloading" if i == 0 else "download pending")
+                 for i in range(3)]
+        rows.append(SimpleNamespace(hashString="ratio", queue_position=10,
+                                    labels=["site-3"], status="download pending"))
+        def stop(ids):
+            for row in rows:
+                if row.hashString in ids:
+                    row.status = "stopped"
+            for row in rows:
+                if row.status == "download pending":
+                    row.status = "downloading"
+        def start(ids, bypass_queue=False):
+            self.assertFalse(bypass_queue)
+            for torrent_hash in ids:
+                row = next(row for row in rows if row.hashString == torrent_hash)
+                if row.status == "downloading":
+                    continue
+                row.status = "downloading" if sum(r.status == "downloading" for r in rows) < 8 else "download pending"
+        client.stop_torrent.side_effect = stop
+        client.start_torrent.side_effect = start
+        self.plugin._prioritize_download_queue({})
+        active = [row.hashString for row in rows if row.status == "downloading"]
+        self.assertEqual(len(active), 8)
+        self.assertTrue({"high-0", "high-1", "high-2", "ratio"}.issubset(active))
+        client.stop_torrent.reset_mock()
+        self.plugin._prioritize_download_queue({})
+        client.stop_torrent.assert_not_called()
+
     def test_rotation_retries_five_times_ten_minutes_apart_then_skips(self):
         self.add_task(1)
         self.add_task(2)
@@ -758,6 +886,258 @@ class BrushFlowTests(unittest.TestCase):
         self.assertFalse(response.success)
         self.assertEqual(self.plugin._task_configs["1"].downloader, "tb")
         self.assertEqual(self.plugin._calculate_global_seeding_size(), 100)
+
+
+class BrushFlowRuntimeTests(unittest.TestCase):
+    setUp = BrushFlowTests.setUp
+    add_task = BrushFlowTests.add_task
+
+    def budget_client(self, ceiling=8):
+        if "1" not in self.plugin._task_configs:
+            self.add_task(1)
+        client = Mock()
+        session = SimpleNamespace(download_queue_enabled=True, download_queue_size=ceiling,
+                                  speed_limit_up_enabled=True, speed_limit_up=2500,
+                                  speed_limit_down_enabled=True, speed_limit_down=10000,
+                                  queue_stalled_enabled=False)
+        client.get_session.return_value = session
+        client.set_session.side_effect = lambda **values: [setattr(session, key, value) for key, value in values.items()]
+        self.services["tb"].instance.trc = client
+        rows = [SimpleNamespace(hashString=f"owned-{i}", labels=["site-1"], queue_position=i,
+                                status="downloading" if i < ceiling else "download pending")
+                for i in range(10)]
+        self.plugin._rotation_mode = "parallel"
+        return client, session, rows
+
+    def configure_settings_api(self):
+        self.plugin._global_proxy_delete = False
+        self.plugin._global_delete_size_range = None
+        self.plugin._save_config = Mock()
+        self.plugin._build_status_data = lambda: {}
+        self.ns["schemas"] = SimpleNamespace(Response=lambda **values: SimpleNamespace(**values))
+
+    def test_initial_owned_download_budget_never_exceeds_user_ceiling(self):
+        for ceiling in (1, 3, 8):
+            with self.subTest(ceiling=ceiling):
+                self.data.clear()
+                client, session, rows = self.budget_client(ceiling)
+                self.plugin._adjust_download_budget(client, rows, "tb")
+                self.assertGreaterEqual(session.download_queue_size, 1)
+                self.assertLessEqual(session.download_queue_size, ceiling)
+                self.assertEqual(self.data["download_budget.tb"]["ceiling"], ceiling)
+                self.assertEqual(session.download_queue_size, min(ceiling, 4))
+
+    def test_foreign_torrent_restores_user_ceiling_and_releases_budget(self):
+        client, session, rows = self.budget_client()
+        self.plugin._adjust_download_budget(client, rows, "tb")
+        self.assertEqual(session.download_queue_size, 4)
+        rows.append(SimpleNamespace(hashString="normal-download", labels=[], status="download pending"))
+        self.plugin._adjust_download_budget(client, rows, "tb")
+        self.assertEqual(session.download_queue_size, 8)
+        self.assertFalse(self.data["download_budget.tb"])
+        client.set_session.reset_mock()
+        self.plugin._adjust_download_budget(client, rows, "tb")
+        client.set_session.assert_not_called()
+
+    def test_manual_queue_limit_replaces_old_ceiling_and_is_not_restored_over(self):
+        client, session, rows = self.budget_client()
+        self.plugin._adjust_download_budget(client, rows, "tb")
+        session.download_queue_size = 3
+        self.plugin._adjust_download_budget(client, rows, "tb")
+        self.assertEqual(self.data["download_budget.tb"]["ceiling"], 3)
+        self.assertEqual(session.download_queue_size, 3)
+        session.download_queue_size = 6
+        client.set_session.reset_mock()
+        self.plugin._restore_download_budgets()
+        client.set_session.assert_not_called()
+        self.assertEqual(session.download_queue_size, 6)
+        self.assertFalse(self.data["download_budget.tb"])
+
+    def test_stop_restores_owned_budget(self):
+        client, session, rows = self.budget_client()
+        self.plugin._adjust_download_budget(client, rows, "tb")
+        self.plugin.stop_service()
+        self.assertEqual(session.download_queue_size, 8)
+        self.assertTrue(self.plugin._stopping)
+        self.assertFalse(self.data["download_budget.tb"])
+
+    def test_disabling_or_leaving_parallel_restores_owned_budget(self):
+        for payload_values in ({"enabled": False}, {"enabled": True, "rotation_mode": "sequential"}):
+            with self.subTest(payload=payload_values):
+                self.setUp()
+                client, session, rows = self.budget_client()
+                self.plugin._adjust_download_budget(client, rows, "tb")
+                self.configure_settings_api()
+                response = self.plugin.update_settings(self.ns["BrushFlowSettingsPayload"](**payload_values))
+                self.assertTrue(response.success)
+                self.assertEqual(session.download_queue_size, 8)
+                self.assertFalse(self.data["download_budget.tb"])
+
+    def test_nullable_counters_remain_unknown_through_downloader_adapter(self):
+        for downloader in ("qb", "tb"):
+            with self.subTest(downloader=downloader):
+                self.setUp()
+                task = self.add_task(1, downloader=downloader)
+                self.data["task.1.torrents"] = {"unknown": {"deleted": False}}
+                row = ({"hash": "unknown", "state": "downloading", "progress": 0}
+                       if downloader == "qb" else SimpleNamespace(
+                           hashString="unknown", status="downloading", percent_done=0))
+                self.rows[downloader] = [row]
+                with self.plugin._task_scope(task.id):
+                    info = self.plugin._BrushFlow__get_torrent_info(row)
+                self.assertEqual(info["uploaded"], 0)
+                self.assertIsNone(info["sample_uploaded"])
+                self.assertIsNone(info["sample_downloaded"])
+                for at in (1000, 1030):
+                    with patch.object(self.ns["time"], "time", return_value=at):
+                        self.plugin._sample_transfers()
+                metrics = self.data["task.1.metrics"]
+                self.assertTrue(metrics["partial"])
+                self.assertTrue(metrics["gap"])
+                self.assertTrue(self.data["metrics"]["partial"])
+
+    def test_locked_task_marks_global_window_partial(self):
+        self.add_task(1)
+        self.add_task(2)
+        lock = threading.Lock()
+        self.plugin._task_locks["1"] = lock
+        lock.acquire()
+        try:
+            self.plugin._sample_transfers()
+        finally:
+            lock.release()
+        self.assertTrue(self.data["metrics"]["partial"])
+        self.assertTrue(self.data["metrics"]["gap"])
+
+    def test_partial_active_station_prevents_budget_growth(self):
+        client, session, rows = self.budget_client()
+        self.add_task(2)
+        session.download_queue_size = 4
+        self.data["download_budget.tb"] = {"ceiling": 8, "applied": 4, "changed_at": 100}
+        self.data["task.1.metrics"] = {"seconds": 600, "uploaded": 0, "downloaded": 0,
+                                       "downloading": 4, "gap": False, "partial": False}
+        self.data["task.2.metrics"] = {"seconds": 600, "uploaded": 0, "downloaded": None,
+                                       "queued": 2, "gap": True, "partial": True}
+        with patch.object(self.ns["time"], "time", return_value=1000):
+            self.plugin._adjust_download_budget(client, rows, "tb")
+        client.set_session.assert_not_called()
+        self.assertEqual(session.download_queue_size, 4)
+
+    def test_locked_station_does_not_reuse_old_metrics_for_budget_growth(self):
+        client, session, rows = self.budget_client()
+        session.download_queue_size = 4
+        self.data["download_budget.tb"] = {"ceiling": 8, "applied": 4, "changed_at": 100}
+        self.data["task.1.metrics"] = {"sampled_at": 700, "seconds": 600, "uploaded": 0, "downloaded": 0,
+                                       "downloading": 4, "gap": False, "partial": False}
+        lock = threading.Lock()
+        self.plugin._task_locks["1"] = lock
+        with patch.object(self.ns["time"], "time", return_value=1000):
+            lock.acquire()
+            try:
+                self.plugin._sample_transfers()
+            finally:
+                lock.release()
+            self.plugin._adjust_download_budget(client, rows, "tb")
+        client.set_session.assert_not_called()
+        self.assertEqual(session.download_queue_size, 4)
+
+    def test_interrupted_journal_does_not_restart_ambiguous_manual_pause(self):
+        client, session, rows = self.budget_client()
+        rows[0].status = "stopped"
+        self.data["priority_requeue.tb"] = [rows[0].hashString]
+        self.plugin._rebalance_transmission_downloads(client, rows, {row.hashString: (2, 0) for row in rows}, "tb")
+        client.start_torrent.assert_not_called()
+        client.stop_torrent.assert_not_called()
+
+    def test_ambiguous_paused_journal_does_not_block_other_station_allocation(self):
+        self.add_task(1)
+        self.add_task(2)
+        client = Mock()
+        client.get_session.return_value = SimpleNamespace(download_queue_enabled=True, download_queue_size=1,
+                                                          queue_stalled_enabled=False)
+        rows = [SimpleNamespace(hashString="low", labels=["site-1"], status="downloading", queue_position=0),
+                SimpleNamespace(hashString="high", labels=["site-2"], status="download pending", queue_position=1),
+                SimpleNamespace(hashString="manual", labels=["site-1"], status="stopped", queue_position=2)]
+        states = {row.hashString: row.status for row in rows}
+
+        def stop(ids):
+            self.assertEqual(ids, ["low"])
+            states.update(low="stopped", high="downloading")
+
+        def start(ids, bypass_queue):
+            self.assertEqual(ids, ["low"])
+            self.assertFalse(bypass_queue)
+            states["low"] = "download pending"
+
+        client.stop_torrent.side_effect = stop
+        client.start_torrent.side_effect = start
+        client.get_torrents.side_effect = lambda ids, arguments: [
+            SimpleNamespace(hashString=h, status=states[h]) for h in ids]
+        self.data["priority_requeue.tb"] = ["manual"]
+        self.plugin._rotation_mode = "parallel"
+        with patch.object(self.ns["time"], "sleep"):
+            for _ in range(2):
+                self.plugin._rebalance_transmission_downloads(client, rows, {"low": (2, 0), "high": (0, 0)}, "tb")
+        client.stop_torrent.assert_called_once_with(ids=["low"])
+        self.assertEqual(states["manual"], "stopped")
+        self.assertEqual(states["high"], "downloading")
+
+    def test_async_stop_waits_for_auto_promotion_before_resuming_victim(self):
+        self.add_task(1)
+        self.add_task(2)
+        client = Mock()
+        client.get_session.return_value = SimpleNamespace(download_queue_enabled=True, download_queue_size=1,
+                                                          queue_stalled_enabled=False)
+        rows = [SimpleNamespace(hashString="low", labels=["site-1"], status="downloading", queue_position=0),
+                SimpleNamespace(hashString="high", labels=["site-2"], status="download pending", queue_position=1),
+                SimpleNamespace(hashString="manual", labels=["site-1"], status="stopped", queue_position=2)]
+        states = {row.hashString: row.status for row in rows}
+        phase = {"name": "initial", "polls": 0}
+        events = []
+
+        def stop(ids):
+            self.assertEqual(ids, ["low"])
+            phase.update(name="stopping", polls=0)
+            events.append("stop")
+
+        def read(ids, arguments):
+            phase["polls"] += 1
+            if phase["name"] == "stopping":
+                if phase["polls"] >= 2:
+                    states["low"] = "stopped"
+                if phase["polls"] >= 3:
+                    states["high"] = "downloading"
+                    events.append("promoted")
+            elif phase["name"] == "resuming" and phase["polls"] >= 2:
+                states["low"] = "download pending"
+            return [SimpleNamespace(hashString=h, status=states[h]) for h in ids]
+
+        def start(ids, bypass_queue):
+            self.assertEqual(ids, ["low"])
+            self.assertFalse(bypass_queue)
+            self.assertEqual(states["high"], "downloading")
+            phase.update(name="resuming", polls=0)
+            events.append("resume")
+
+        client.stop_torrent.side_effect = stop
+        client.get_torrents.side_effect = read
+        client.start_torrent.side_effect = start
+        self.plugin._rotation_mode = "parallel"
+        with patch.object(self.ns["time"], "sleep") as sleep:
+            self.plugin._rebalance_transmission_downloads(client, rows, {"low": (2, 0), "high": (0, 0)}, "tb")
+        self.assertEqual(events, ["stop", "promoted", "resume"])
+        self.assertEqual(states["low"], "download pending")
+        self.assertEqual(states["manual"], "stopped")
+        self.assertGreaterEqual(sleep.call_count, 3)
+        self.assertFalse(self.data["priority_requeue.tb"])
+
+    def test_async_allocation_timeout_keeps_failure_visible(self):
+        client = Mock()
+        client.get_torrents.return_value = [SimpleNamespace(hashString="low", status="downloading")]
+        with patch.object(self.ns["time"], "sleep"):
+            with self.assertRaises(RuntimeError):
+                self.plugin._wait_transmission_allocation(client, ["low"], [])
+        self.assertEqual(client.get_torrents.call_count, 12)
 
 
 if __name__ == "__main__":

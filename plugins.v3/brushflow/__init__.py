@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
-from .rules import demand_rank, download_has_started, evaluate_peer_demand, promotion_deadline, publication_age_minutes
+from .rules import demand_rank, download_has_started, evaluate_peer_demand, promotion_deadline, publication_age_minutes, update_transfer_sample, transfer_window, allocate_downloads
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import Query
@@ -256,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.1.4"
+    plugin_version = "7.2.0"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -266,7 +266,7 @@ class BrushFlow(_PluginBase):
     DATA_SCHEMA_VERSION = 3
     MAX_RUN_HISTORY = 50
     GLOBAL_BRUSH_TAG = "刷流"
-    TASK_DATA_NAMES = ("torrents", "archived", "unmanaged", "statistic", "runs", "rotation")
+    TASK_DATA_NAMES = ("torrents", "archived", "unmanaged", "statistic", "runs", "rotation", "metrics")
 
     def init_plugin(self, config: dict = None) -> None:
         """初始化全局开关、任务配置、运行锁和历史数据迁移"""
@@ -542,10 +542,25 @@ class BrushFlow(_PluginBase):
     def stop_service(self) -> None:
         """插件不再维护私有调度器，公共服务由宿主统一停止"""
         self._stopping = True
+        self._restore_download_budgets()
         with getattr(self, "_runtime_lock", threading.Lock()):
             getattr(self, "_pending_brush", {}).clear()
-            for runtime in getattr(self, "_runtime", {}).values():
-                runtime.update({"state": "idle", "operation": None})
+
+    def _restore_download_budgets(self) -> None:
+        """只撤销仍与本插件最后一次写入一致的并发设置。"""
+        for name in {task.downloader for task in getattr(self, "_task_configs", {}).values() if task.downloader}:
+            key = f"download_budget.{name}"
+            state = self.get_data(key) or {}
+            if not state.get("ceiling"):
+                continue
+            try:
+                service = DownloaderHelper().get_service(name=name)
+                tr = getattr(service.instance, "trc", None) if service and service.instance else None
+                if tr and tr.get_session().download_queue_size == state.get("applied"):
+                    tr.set_session(download_queue_size=state["ceiling"])
+                self.save_data(key, {})
+            except Exception:
+                logger.warning(f"下载器 {name} 并发设置恢复失败，保留恢复记录")
 
     @property
     def service_info(self) -> Optional[ServiceInfo]:
@@ -614,6 +629,8 @@ class BrushFlow(_PluginBase):
         if rotation_mode != getattr(self, "_rotation_mode", "parallel"):
             self.save_data("site_rotation", {})
         self._rotation_mode = rotation_mode
+        if not self._enabled or rotation_mode != "parallel":
+            self._restore_download_budgets()
         for field in GLOBAL_LIMIT_FIELDS:
             setattr(self, f"_{field}", getattr(payload, field))
         for field in GLOBAL_DYNAMIC_DELETE_FIELDS:
@@ -1159,6 +1176,10 @@ class BrushFlow(_PluginBase):
             self._task_summary(task_id, site_user_data_by_domain=site_user_data)
             for task_id in self._task_configs
         ]
+        ordered = sorted(task_rows, key=lambda row: (not row["enabled"], row["priority"],
+                         -(row.get("site_ratio", {}).get("deficit_fraction") or 0), row["id"]))
+        for position, row in enumerate(ordered, 1):
+            row["priority_order"] = position
         aggregate = {
             "task_count": len(task_rows),
             "enabled_count": sum(1 for row in task_rows if row.get("enabled")),
@@ -1188,6 +1209,8 @@ class BrushFlow(_PluginBase):
             **{field: getattr(self, f"_{field}", None) for field in GLOBAL_LIMIT_FIELDS},
             **{field: getattr(self, f"_{field}", None) for field in GLOBAL_DYNAMIC_DELETE_FIELDS},
             "summary": aggregate,
+            "metrics": self.get_data("metrics") or {},
+            "download_slots": self.get_data("download_slots") or {},
             "tasks": task_rows,
             "options": {"sites": site_options, "downloaders": downloader_options},
         }
@@ -1242,6 +1265,11 @@ class BrushFlow(_PluginBase):
             "seeding_size": self.__calculate_seeding_torrents_size(torrents),
             "site_ratio": site_ratio,
             "priority": self._priority_tier(task, site_ratio),
+            "priority_reason": "新手考核" if self._novice_active(task) else (
+                "账号数据待刷新" if not site_ratio.get("available") or site_ratio.get("stale")
+                else "分享率未达标" if not site_ratio.get("reached") else "普通轮转"),
+            "ratio_deficit_bytes": site_ratio.get("deficit_bytes"),
+            "metrics": self._get_task_data(task_id, "metrics") or {},
             "novice": self._novice_active(task),
             "is_focus": self._is_focus_site(task.site_id),
         }
@@ -1310,6 +1338,9 @@ class BrushFlow(_PluginBase):
                 "available": True,
                 "unlimited": unlimited,
                 "reached": unlimited or bool(task.site_ratio_target and float(ratio) >= float(task.site_ratio_target)),
+                "deficit_bytes": max(float(task.site_ratio_target or 0) * download - upload, 0),
+                "download_headroom": max(upload / float(task.site_ratio_target or 1) - download, 0),
+                "deficit_fraction": max(1 - float(ratio or 0) / float(task.site_ratio_target or 1), 0) if not unlimited else 0,
                 "updated_at": " ".join(value for value in (updated_day, updated_time) if value) or None,
             }
         )
@@ -1342,9 +1373,86 @@ class BrushFlow(_PluginBase):
         """考核优先，其次未达目标分享率，其余站点轮转。"""
         if self._novice_active(task):
             return 0
-        if status.get("available") and task.site_ratio_target and not status.get("reached"):
+        if status.get("available") and not status.get("stale") and task.site_ratio_target and not status.get("reached"):
             return 1
         return 2
+
+    def _sample_transfers(self) -> None:
+        """集中读取下载器并保存各站真实窗口，界面请求不触发网络采样。"""
+        snapshot = self._read_downloads(allow_partial=True)
+        now = time.time()
+        all_metrics = []
+        seen = set()
+        for task in self._task_configs.values():
+            task_lock = self._task_locks.setdefault(task.id, threading.Lock())
+            if not task_lock.acquire(blocking=False):
+                all_metrics.append({"seconds": 0, "uploaded": None, "downloaded": None,
+                                    "gap": True, "partial": True})
+                continue
+            try:
+                records = self._get_task_data(task.id, "torrents") or {}
+                metrics = {"sampled_at": now, "seconds": 0, "uploaded": 0, "downloaded": 0,
+                           "upspeed": 0, "dlspeed": 0, "downloading": 0, "queued": 0,
+                           "seeding": 0, "paused": 0, "gap": False, "partial": False}
+                if task.downloader not in snapshot:
+                    metrics.update(uploaded=None, downloaded=None, gap=True, reason="下载器不可用")
+                    self._save_task_data(task.id, "metrics", metrics)
+                    all_metrics.append(metrics)
+                    continue
+                with self._task_scope(task.id):
+                    for torrent_hash, record in records.items():
+                        row = snapshot[task.downloader].get(torrent_hash)
+                        if record.get("deleted") and record.get("transfer_sample"):
+                            previous = record["transfer_sample"]
+                            update_transfer_sample(record, {"uploaded": previous["uploaded"],
+                                "transfer_downloaded": previous["downloaded"], "completed": True,
+                                "is_downloading": False}, now)
+                        if row is not None and not record.get("deleted"):
+                            info = self.__get_torrent_info(row)
+                            update_transfer_sample(record, info, now)
+                            metrics["upspeed"] += info.get("upspeed", 0)
+                            metrics["dlspeed"] += info.get("dlspeed", 0)
+                            if info["state"] in {"stopped", "stoppeddl", "pauseddl", "pausedup", "stoppedup"}:
+                                metrics["paused"] += 1
+                            elif info["completed"]:
+                                metrics["seeding"] += 1
+                            elif info["is_downloading"]:
+                                metrics["downloading"] += 1
+                            elif info["state"] in {"download pending", "queueddl"}:
+                                metrics["queued"] += 1
+                            else:
+                                metrics["paused"] += 1
+                        window = transfer_window(record, now)
+                        if record.get("deleted") and now - (record.get("deleted_time") or 0) > 1800:
+                            continue
+                        if (task.downloader, torrent_hash) in seen:
+                            continue
+                        seen.add((task.downloader, torrent_hash))
+                        for field in ("uploaded", "downloaded"):
+                            if window[field] is None:
+                                metrics["partial"] = True
+                            else:
+                                metrics[field] += window[field]
+                        metrics["seconds"] = max(metrics["seconds"], window["seconds"])
+                        metrics["gap"] = metrics["gap"] or window["gap"]
+                self._save_task_data(task.id, "torrents", records)
+                metrics["reason"] = ("正在下载" if metrics["downloading"] else "等待下载名额" if metrics["queued"]
+                                     else "正在做种" if metrics["seeding"] else "等待合格种子")
+                alert = self.get_data(f"allocation_alert.{task.downloader}") or []
+                if any(h in snapshot[task.downloader] and str(getattr(snapshot[task.downloader][h], "status", "")) == "stopped" for h in alert):
+                    metrics["reason"] = "上次调度恢复未确认，请检查暂停任务"
+                    metrics["gap"] = True
+                self._save_task_data(task.id, "metrics", metrics)
+                all_metrics.append(metrics)
+            finally:
+                task_lock.release()
+        if all_metrics:
+            aggregate = {key: sum(item.get(key) or 0 for item in all_metrics)
+                         for key in ("uploaded", "downloaded", "upspeed", "dlspeed", "downloading", "queued", "seeding", "paused")}
+            aggregate.update(sampled_at=now, seconds=max(item["seconds"] for item in all_metrics),
+                             gap=any(item["gap"] for item in all_metrics),
+                             partial=any(item.get("partial") or item["uploaded"] is None for item in all_metrics))
+            self.save_data("metrics", aggregate)
 
     def _evaluate_site_ratio_control(
         self,
@@ -1555,6 +1663,7 @@ class BrushFlow(_PluginBase):
         reports = {}
         self._task_context.candidates = {}
         try:
+            self._sample_transfers()
             site_data = self._latest_site_user_data_by_domain()
             self._select_rotation_site(site_data)
             if not self._check_rotation_site():
@@ -1574,7 +1683,7 @@ class BrushFlow(_PluginBase):
             self._task_context.site_user_data = site_data
             priorities = {task.id: self._priority_tier(task, self._build_site_ratio_status(task, site_data))
                           for task in tasks}
-            tasks.sort(key=lambda task: (priorities[task.id], self._site_last_added(task.site_id),
+            tasks.sort(key=lambda task: (priorities[task.id], -(self._build_site_ratio_status(task, site_data).get("deficit_fraction") or 0), self._site_last_added(task.site_id),
                                          pending[task.id], task.id))
             scheduled_deadlines = {task.id: self._next_promotion_expiry(task) for task in tasks}
             self._task_context.downloads = self._read_downloads(allow_partial=True)
@@ -1623,13 +1732,15 @@ class BrushFlow(_PluginBase):
                 for key in ("downloads", "candidates", "site_user_data"):
                     if hasattr(self._task_context, key):
                         delattr(self._task_context, key)
-                self._brush_lock.release()
-                if any(report.get("added_count") for report in reports.values()):
-                    self._prioritize_download_queue(self._latest_site_user_data_by_domain())
-                    self._refresh_scheduler()
+                try:
+                    if any(report.get("added_count") for report in reports.values()):
+                        self._prioritize_download_queue(self._latest_site_user_data_by_domain())
+                        self._refresh_scheduler()
+                finally:
+                    self._brush_lock.release()
 
     def _prioritize_download_queue(self, site_data: dict) -> None:
-        """同步待下载顺序，不启动暂停任务或抢占正在下载的任务。"""
+        """同步等待顺序，并让 Transmission 并行下载按站点优先级让位。"""
         tasks = [task for task in self._task_configs.values() if task.enabled]
         helper = DownloaderHelper()
         for name in {task.downloader for task in tasks if task.downloader}:
@@ -1641,13 +1752,17 @@ class BrushFlow(_PluginBase):
                 tr = getattr(downloader, "trc", None)
                 qb = getattr(downloader, "qbc", None)
                 if tr:
-                    rows = tr.get_torrents(arguments=["hashString", "status", "queuePosition", "labels"])
+                    rows = tr.get_torrents(arguments=["hashString", "status", "queuePosition", "labels", "isStalled",
+                                                     "rateDownload", "rateUpload"])
+                    candidates = [(row.hashString, row.queue_position, set(row.labels or []))
+                                  for row in rows if str(row.status) in {"downloading", "download pending"}]
                     queued = [(row.hashString, row.queue_position, set(row.labels or []))
                               for row in rows if str(row.status) == "download pending"]
                 elif qb:
                     rows = qb.torrents_info()
                     queued = [(row["hash"], row["priority"], self._download_labels(row))
                               for row in rows if row.get("state") == "queuedDL"]
+                    candidates = queued
                 else:
                     continue
                 queued.sort(key=lambda row: row[1])
@@ -1657,20 +1772,157 @@ class BrushFlow(_PluginBase):
                         continue
                     records = self._get_task_data(task.id, "torrents") or {}
                     tier = self._priority_tier(task, self._build_site_ratio_status(task, site_data))
-                    for torrent_hash, position, tags in queued:
+                    ratio = self._build_site_ratio_status(task, site_data)
+                    rank = (tier, -(ratio.get("deficit_fraction") or 0) if tier == 1 else 0)
+                    for torrent_hash, position, tags in candidates:
                         if torrent_hash in records or task.brush_tag in tags:
-                            ranks[torrent_hash] = min(ranks.get(torrent_hash, tier), tier)
-                desired = [row[0] for row in sorted(queued, key=lambda row: (ranks.get(row[0], 3), row[1]))
+                            ranks[torrent_hash] = min(ranks.get(torrent_hash, rank), rank)
+                desired = [row[0] for row in sorted(queued, key=lambda row: (ranks.get(row[0], (3, 0)), row[1]))
                            if row[0] in ranks]
-                if [row[0] for row in queued[:len(desired)]] == desired:
-                    continue
-                for torrent_hash in reversed(desired):
-                    if tr:
-                        tr.queue_top(ids=[torrent_hash])
-                    else:
-                        qb.torrents_top_priority(torrent_hashes=[torrent_hash])
+                if [row[0] for row in queued[:len(desired)]] != desired:
+                    for torrent_hash in reversed(desired):
+                        if tr:
+                            tr.queue_top(ids=[torrent_hash])
+                        else:
+                            qb.torrents_top_priority(torrent_hashes=[torrent_hash])
+                if tr:
+                    self._adjust_download_budget(tr, rows, name)
+                    self._rebalance_transmission_downloads(tr, rows, ranks, name)
             except Exception:
                 logger.warning(f"下载器 {name} 刷流队列排序失败，等待重试")
+
+    def _adjust_download_budget(self, tr, rows, name: str) -> None:
+        """专用刷流下载器在用户上限内小步调整并发，共用下载器不改全局设置。"""
+        if getattr(self, "_stopping", False) or not self.get_state() or getattr(self, "_rotation_mode", "parallel") != "parallel":
+            return
+        session = tr.get_session()
+        limit = getattr(session, "download_queue_size", None)
+        if session.download_queue_enabled is not True or not isinstance(limit, int) or limit < 1:
+            return
+        tasks = [task for task in self._task_configs.values() if task.downloader == name]
+        records = {h for task in tasks for h in (self._get_task_data(task.id, "torrents") or {})}
+        tags = {task.brush_tag for task in tasks}
+        if any(row.hashString not in records and not tags.intersection(row.labels or []) for row in rows):
+            state = self.get_data(f"download_budget.{name}") or {}
+            if limit == state.get("applied") and state.get("ceiling"):
+                tr.set_session(download_queue_size=state["ceiling"])
+            self.save_data(f"download_budget.{name}", {})
+            return
+        key = f"download_budget.{name}"
+        state = self.get_data(key) or {}
+        now = time.time()
+        if limit != state.get("applied"):
+            state = {"ceiling": limit, "applied": limit, "changed_at": 0}
+        ceiling = state["ceiling"]
+        demand = sum(str(row.status) in {"downloading", "download pending"} for row in rows)
+        active = sum(str(row.status) == "downloading" and not (
+            getattr(session, "queue_stalled_enabled", False) is True and getattr(row, "is_stalled", False)) for row in rows)
+        budget = limit
+        reason = "保持并发"
+        if not state["changed_at"] and demand:
+            budget = min(ceiling, max(2, min(demand, 4)))
+            reason = "从少量并发试跑"
+        elif demand and now - state["changed_at"] >= 300:
+            metrics = [self._get_task_data(task.id, "metrics") or {} for task in tasks]
+            valid = [item for item in metrics if item.get("seconds", 0) >= 300
+                     and not item.get("gap") and not item.get("partial")
+                     and now - item.get("sampled_at", 0) <= 90]
+            complete = valid and all(item in valid for item in metrics
+                                     if item.get("downloading") or item.get("queued") or item.get("seeding")) \
+                and not (self.get_data("metrics") or {}).get("partial")
+            upload = sum((item.get("uploaded") or 0) / item["seconds"] for item in valid)
+            download = sum((item.get("downloaded") or 0) / item["seconds"] for item in valid)
+            up_limit = getattr(session, "speed_limit_up", 0) if getattr(session, "speed_limit_up_enabled", False) else 0
+            down_limit = getattr(session, "speed_limit_down", 0) if getattr(session, "speed_limit_down_enabled", False) else 0
+            if complete and up_limit and upload >= up_limit * 1000 * .9:
+                budget = max(min(2, ceiling), limit - 1)
+                reason = "上传已接近预算，减少新增下载竞争"
+            elif complete and demand > limit and (not down_limit or download < down_limit * 1000 * .85):
+                budget = min(ceiling, limit + 1)
+                reason = "有排队需求且带宽有余量，增加一个名额"
+            state["changed_at"] = now
+        if budget != limit:
+            tr.set_session(download_queue_size=budget)
+            state.update(applied=budget, changed_at=now)
+        elif not state["changed_at"] and demand:
+            state["changed_at"] = now
+        self.save_data(key, state)
+        self.save_data("download_slots", {"active": active, "budget": budget, "limit": ceiling,
+                                          "reason": reason, "downloader": name})
+
+    def _rebalance_transmission_downloads(self, tr, rows, ranks: dict, name: str) -> None:
+        """仅把低优先级刷流下载退回普通队列，不绕过下载器并发上限。"""
+        key = f"priority_requeue.{name}"
+        pending = self.get_data(key) or []
+        if pending:
+            existing = {row.hashString: row for row in rows}
+            for torrent_hash in list(pending):
+                row = existing.get(torrent_hash)
+                if row and str(row.status) == "stopped":
+                    logger.warning(f"下载器 {name} 上次让位任务仍暂停，保留人工处理")
+                    alerts = self.get_data(f"allocation_alert.{name}") or []
+                    self.save_data(f"allocation_alert.{name}", list(dict.fromkeys(alerts + [torrent_hash])))
+                pending.remove(torrent_hash)
+                self.save_data(key, pending)
+            return
+        if getattr(self, "_rotation_mode", "parallel") != "parallel":
+            return
+        session = tr.get_session()
+        if session.download_queue_enabled is not True:
+            return
+        active = [row for row in rows if str(row.status) == "downloading"
+                  and not (getattr(session, "queue_stalled_enabled", False) is True
+                           and getattr(row, "is_stalled", False))]
+        limit = getattr(session, "download_queue_size", None)
+        slots = max(limit - sum(row.hashString not in ranks for row in active), 0) if isinstance(limit, int) else sum(row.hashString in ranks for row in active)
+        owner = {}
+        for task in self._task_configs.values():
+            if not task.enabled or task.downloader != name:
+                continue
+            records = self._get_task_data(task.id, "torrents") or {}
+            for row in rows:
+                if row.hashString in records or task.brush_tag in (row.labels or []):
+                    owner.setdefault(row.hashString, task.site_id)
+        active_hashes = {row.hashString for row in active if row.hashString in ranks}
+        candidates = [{"hash": row.hashString, "site_id": owner.get(row.hashString),
+                       "priority": ranks[row.hashString], "active": row.hashString in active_hashes,
+                       "position": row.queue_position}
+                      for row in rows if row.hashString in ranks and
+                      (row.hashString in active_hashes or str(row.status) == "download pending")]
+        desired = allocate_downloads(candidates, slots)
+        victims = sorted(active_hashes - set(desired))
+        promoted = [h for h in desired if h not in active_hashes]
+        if not victims:
+            return
+        allocation_key = f"allocation.{name}"
+        allocation = self.get_data(allocation_key) or {}
+        if time.time() - allocation.get("at", 0) < 120 and allocation.get("slots") == slots:
+            return
+        for torrent_hash in reversed(desired):
+            tr.queue_top(ids=[torrent_hash])
+        self.save_data(key, victims)
+        try:
+            tr.stop_torrent(ids=victims)
+            self._wait_transmission_allocation(tr, victims, promoted)
+        finally:
+            # 只恢复本次短事务；中断后的暂停状态留待处理，避免覆盖人工暂停。
+            tr.start_torrent(ids=victims, bypass_queue=False)
+            self._wait_transmission_allocation(tr, [], [], resumed=victims)
+            self.save_data(key, [])
+            self.save_data(allocation_key, {"at": time.time(), "slots": slots})
+
+    @staticmethod
+    def _wait_transmission_allocation(tr, stopped: list, active: list, resumed: list = None) -> None:
+        wanted = set(stopped + active + (resumed or []))
+        for attempt in range(12):
+            rows = tr.get_torrents(ids=list(wanted), arguments=["hashString", "status"])
+            states = {row.hashString: str(row.status) for row in rows}
+            if all(states.get(h) == "stopped" for h in stopped) \
+                    and all(states.get(h) in {"downloading", "seeding", "seed pending"} for h in active) \
+                    and all(h in states and states[h] != "stopped" for h in (resumed or [])):
+                return
+            time.sleep(.25)
+        raise RuntimeError("下载器未确认调度状态，等待后续检查")
 
     def _execute_brush(self, task: BrushTaskConfig, report: Optional[dict] = None) -> Optional[dict]:
         """在分配锁内执行一个站点轮次，检查占用时保留请求。"""
@@ -1961,6 +2213,9 @@ class BrushFlow(_PluginBase):
             return False, "任务配置不存在"
         if self._site_completed_count(task.site_id) >= 50:
             return False, "本站已完成保种达到 50 个，等待按删除规则释放名额"
+        budget = (self.get_data(f"download_budget.{task.downloader}") or {}).get("applied")
+        if isinstance(budget, int) and self._site_downloading_count(task.site_id) >= max(4, budget * 2):
+            return False, "本站已有足够待下载任务，等待释放名额后重新选种"
         return True, None
 
     def __evaluate_conditions_for_brush(
@@ -1993,10 +2248,24 @@ class BrushFlow(_PluginBase):
             return False, "非免费种子"
         if task.freeleech == "2xfree" and torrent.uploadvolumefactor != 2:
             return False, "非双倍上传种子"
+        if torrent.downloadvolumefactor != 0 and task.site_ratio_target:
+            ratio_status = self._build_site_ratio_status(task, getattr(self._task_context, "site_user_data", None))
+            if not ratio_status.get("available") or ratio_status.get("stale") or not ratio_status.get("reached"):
+                return False, "账号分享率不足或数据待刷新，仅选择免费种子"
+            reserved = sum(max((item.get("size") or 0) - (item.get("downloaded") or 0), 0)
+                           * float(item.get("downloadvolumefactor") or 0) for item in torrent_tasks.values()
+                           if item.get("site") == task.site_id and not item.get("deleted") and not item.get("completed"))
+            if reserved + torrent.size * float(torrent.downloadvolumefactor or 1) > ratio_status.get("download_headroom", 0):
+                return False, "新增记账下载会低于目标分享率"
         if task.del_no_free:
             deadline = self._promotion_expiry_at(torrent.freedate, task.timezone_offset, task.promotion_lead_minutes)
             if deadline and deadline <= datetime.now().astimezone():
                 return False, "促销剩余时间不足"
+            metrics = self._get_task_data(task.id, "metrics") or {}
+            per_torrent_speed = (metrics.get("downloaded") or 0) / max(metrics.get("seconds", 0), 1) / max(metrics.get("downloading", 0), 1)
+            if deadline and metrics.get("seconds", 0) >= 300 and not metrics.get("gap") \
+                    and per_torrent_speed > 0 and torrent.size / per_torrent_speed * 1.5 > (deadline - datetime.now().astimezone()).total_seconds():
+                return False, "按近期下载速度预计无法在促销保护时间前完成"
         if task.hr == "yes" and torrent.hit_and_run:
             return False, "存在 H&R"
         if task.include:
@@ -2143,6 +2412,7 @@ class BrushFlow(_PluginBase):
             if not torrent_task:
                 continue
             torrent_info = self.__get_torrent_info(torrent)
+            update_transfer_sample(torrent_task, torrent_info, time.time())
             if download_has_started(torrent_info, torrent_task):
                 now_timestamp = time.time()
                 started_at = BrushTaskConfig._parse_number(torrent_task.get("download_started_at"))
@@ -2250,16 +2520,20 @@ class BrushFlow(_PluginBase):
         if task.seed_size and torrent_info.get("uploaded", 0) >= float(task.seed_size) * 1024 ** 3:
             return True, f"上传量达到 {task.seed_size} GB"
         started_at = BrushTaskConfig._parse_number(torrent_task.get("download_started_at"))
-        download_elapsed = max(time.time() - started_at, 0) if started_at and started_at > 0 else 0
+        download_elapsed = torrent_task.get("actual_download_seconds", max(time.time() - started_at, 0) if started_at and started_at > 0 else 0)
         if (
             task.download_time
             and not torrent_info.get("completed", False)
             and download_elapsed >= float(task.download_time) * 3600
         ):
             return True, f"下载耗时达到 {task.download_time} 小时"
+        window = transfer_window(torrent_task, time.time())
+        if not torrent_info.get("completed") and window["seconds"] >= 1200 and not window["gap"] \
+                and window["active_download_seconds"] >= 1200 and window["uploaded"] == 0 and window["downloaded"] == 0:
+            return True, "实际运行满 20 分钟仍无上传和下载进展"
         if (
-            task.seed_avgspeed
-            and torrent_info.get("avg_upspeed", 0) <= float(task.seed_avgspeed) * 1024
+            task.seed_avgspeed and window["seconds"] >= 1200 and not window["gap"]
+            and window["avg_upspeed"] is not None and window["avg_upspeed"] <= float(task.seed_avgspeed) * 1024
             and torrent_info.get("seeding_time", 0) >= 30 * 60
         ):
             return True, f"平均上传速度低于 {task.seed_avgspeed} KB/s"
@@ -2328,7 +2602,7 @@ class BrushFlow(_PluginBase):
             torrent_info = self.__get_torrent_info(torrent)
             expired, reason = self.__promotion_expired(torrent_info, torrent_task)
             started_at = BrushTaskConfig._parse_number(torrent_task.get("download_started_at"))
-            download_elapsed = max(time.time() - started_at, 0) if started_at and started_at > 0 else 0
+            download_elapsed = torrent_task.get("actual_download_seconds", max(time.time() - started_at, 0) if started_at and started_at > 0 else 0)
             timed_out = bool(
                 task.download_time
                 and download_has_started(torrent_info, torrent_task)
@@ -2434,8 +2708,8 @@ class BrushFlow(_PluginBase):
                 and candidate.get("completed")
                 and not candidate.get("hit_and_run")
             ),
-            key=lambda item: item.get("seeding_time", 0),
-            reverse=True,
+            key=lambda item: BrushFlow._retention_rank(item.get("torrent_task") or {}, item.get("size") or 0,
+                                                     item.get("seeding_time", 0)),
         )
         for candidate in fallback_candidates:
             if remaining_size <= min_size:
@@ -2525,7 +2799,7 @@ class BrushFlow(_PluginBase):
                     if not torrent_task.get("hit_and_run"):
                         expired, expired_reason = self.__promotion_expired(torrent_info, torrent_task)
                         started_at = BrushTaskConfig._parse_number(torrent_task.get("download_started_at"))
-                        download_elapsed = max(time.time() - started_at, 0) if started_at and started_at > 0 else 0
+                        download_elapsed = torrent_task.get("actual_download_seconds", max(time.time() - started_at, 0) if started_at and started_at > 0 else 0)
                         timed_out = bool(
                             task.download_time
                             and download_has_started(torrent_info, torrent_task)
@@ -2794,7 +3068,8 @@ class BrushFlow(_PluginBase):
                 if not info.get("completed") or not download_has_started(info, record):
                     continue
                 candidates.append((torrent_hash, info))
-            candidates.sort(key=lambda item: item[1].get("seeding_time", 0), reverse=True)
+            candidates.sort(key=lambda item: self._retention_rank(torrent_tasks[item[0]],
+                             item[1].get("total_size") or 0, item[1].get("seeding_time", 0)))
             for torrent_hash, torrent_info in candidates:
                 if total_size <= min_size:
                     break
@@ -2808,6 +3083,13 @@ class BrushFlow(_PluginBase):
                 f"任务：{task.name}\n删除：{len(delete_hashes)} 个种子\n当前做种：{self.__bytes_to_gb(total_size):.1f} GB",
             )
         return delete_hashes
+
+    @staticmethod
+    def _retention_rank(record: dict, size: float, seeding_time: float) -> tuple:
+        window = transfer_window(record, time.time())
+        if window["seconds"] >= 1200 and not window["gap"] and window["avg_upspeed"] is not None:
+            return window["avg_upspeed"] / max(size, 1), -seeding_time
+        return math.inf, -seeding_time
 
     def __update_undeleted_torrents_missing_in_downloader(
         self,
@@ -3077,6 +3359,8 @@ class BrushFlow(_PluginBase):
             ratio = torrent.get("ratio") or 0
             uploaded = torrent.get("uploaded") or 0
             transfer_downloaded = torrent.get("downloaded") or 0
+            sample_uploaded = torrent.get("uploaded")
+            sample_downloaded = torrent.get("downloaded")
             total_size = torrent.get("size") or torrent.get("total_size") or 0
             progress = torrent.get("progress")
             downloaded = torrent.get("completed")
@@ -3087,7 +3371,9 @@ class BrushFlow(_PluginBase):
                 or total_size > 0 and downloaded >= total_size
             )
             state = str(torrent.get("state") or "").lower().replace("_", " ")
-            is_downloading = state in {"downloading", "forceddl"} or (torrent.get("dlspeed") or 0) > 0
+            is_downloading = state in {"downloading", "forceddl", "stalleddl"} or (torrent.get("dlspeed") or 0) > 0
+            upspeed = torrent.get("upspeed") or 0
+            dlspeed = torrent.get("dlspeed") or 0
             tags = torrent.get("tags") or ""
             tracker = torrent.get("tracker") or ""
         else:
@@ -3119,8 +3405,12 @@ class BrushFlow(_PluginBase):
             completed = progress >= 1
             ratio = read_field("ratio", 0) or 0
             uploaded = read_field("uploaded_ever", 0) or 0
+            sample_uploaded = read_field("uploaded_ever")
+            sample_downloaded = read_field("downloaded_ever")
             state = str(read_field("status", "") or "").lower().replace("_", " ")
             is_downloading = state == "downloading" or (read_field("rate_download", 0) or 0) > 0
+            upspeed = read_field("rate_upload", 0) or 0
+            dlspeed = read_field("rate_download", 0) or 0
             tags = read_field("labels") or ""
             tracker_list = read_field("tracker_list")
             tracker = tracker_list[0] if tracker_list else ""
@@ -3131,6 +3421,8 @@ class BrushFlow(_PluginBase):
             "seeding_time": seeding_time,
             "ratio": ratio,
             "uploaded": uploaded,
+            "sample_uploaded": sample_uploaded,
+            "sample_downloaded": sample_downloaded,
             "downloaded": downloaded,
             "transfer_downloaded": transfer_downloaded,
             "completed": completed,
@@ -3138,6 +3430,8 @@ class BrushFlow(_PluginBase):
             "is_downloading": is_downloading,
             "download_started_at": download_started_at,
             "avg_upspeed": avg_upspeed,
+            "upspeed": upspeed,
+            "dlspeed": dlspeed,
             "iatime": iatime,
             "dltime": dltime,
             "total_size": total_size,

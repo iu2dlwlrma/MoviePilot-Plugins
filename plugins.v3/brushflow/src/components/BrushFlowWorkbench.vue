@@ -39,6 +39,8 @@ const status = ref({
 })
 const taskDetail = ref(null)
 const selectedTaskId = ref('')
+const siteSort = ref('priority')
+const detailPanel = ref(null)
 const activeTab = ref(props.initialTab)
 const torrentState = ref('active')
 const torrentPage = ref(1)
@@ -63,13 +65,34 @@ let refreshTimer
 
 const pluginBase = computed(() => `plugin/${props.pluginId || 'BrushFlow'}`)
 const tasks = computed(() => status.value.tasks || [])
+const metrics = computed(() => status.value.metrics || {})
+const downloadSlots = computed(() => status.value.download_slots || {})
+const sortedTasks = computed(() => [...tasks.value].sort((left, right) => {
+  if (siteSort.value === 'upload') {
+    const difference = metricNumber(right.metrics, 'uploaded', -1) - metricNumber(left.metrics, 'uploaded', -1)
+    if (difference) return difference
+  }
+  if (siteSort.value === 'ratio') {
+    const difference = comparableRatio(left) - comparableRatio(right)
+    if (difference) return difference
+  }
+  if (siteSort.value === 'error') {
+    const difference = Number(hasTaskError(right)) - Number(hasTaskError(left))
+    if (difference) return difference
+  }
+  const enabled = Number(Boolean(right.enabled)) - Number(Boolean(left.enabled))
+  if (enabled) return enabled
+  if (left.priority_order != null && right.priority_order != null) return left.priority_order - right.priority_order
+  return Number(left.priority ?? 2) - Number(right.priority ?? 2)
+    || Number(right.ratio_deficit_bytes || 0) - Number(left.ratio_deficit_bytes || 0)
+}))
 const siteRotation = computed(() => status.value.site_rotation || {})
 const sequentialMode = computed(() => (status.value.rotation_mode || siteRotation.value.mode) === 'sequential')
 const selectedTask = computed(() => tasks.value.find(item => item.id === selectedTaskId.value) || null)
 const selectedState = computed(() => taskStateMeta(selectedTask.value?.state, sequentialMode.value && selectedTask.value?.is_focus === false))
 const rawTaskConfig = computed(() => taskDetail.value?.task?.config || taskDetail.value?.task || {})
 const taskConfig = computed(() => taskDetail.value?.effective_config || effectiveTask(rawTaskConfig.value, status.value.global_defaults))
-const priorityText = computed(() => selectedTask.value?.priority === 0 ? '新手考核优先' : selectedTask.value?.priority === 1 ? '分享率未达标优先' : '普通轮转')
+const priorityText = computed(() => taskPriorityText(selectedTask.value))
 const taskRuns = computed(() => taskDetail.value?.runs || [])
 const latestBrushRun = computed(() => taskRuns.value.find(item => item.kind === 'brush') || null)
 const torrentData = computed(() => taskDetail.value?.torrents || { items: [], total: 0, page: 1, page_size: 50 })
@@ -136,7 +159,7 @@ async function loadStatus({ preserveSelection = true, loadDetail = true } = {}) 
       global_delete_size_range: status.value.global_delete_size_range ?? null,
     }
     const selectedStillExists = tasks.value.some(item => item.id === selectedTaskId.value)
-    if (!preserveSelection || !selectedStillExists) selectedTaskId.value = tasks.value[0]?.id || ''
+    if (!preserveSelection || !selectedStillExists) selectedTaskId.value = sortedTasks.value[0]?.id || ''
     if (loadDetail && selectedTaskId.value) await loadTaskDetail()
   } catch (err) {
     error.value = err?.message || '加载刷流任务失败'
@@ -151,26 +174,34 @@ async function loadTaskDetail() {
     taskDetail.value = null
     return
   }
+  const taskId = selectedTaskId.value
   taskLoading.value = true
   try {
     const query = `state=${torrentState.value}&page=${torrentPage.value}&page_size=50`
-    taskDetail.value = unwrapResponse(
-      await props.api.get(`${pluginBase.value}/tasks/${selectedTaskId.value}?${query}`),
+    const detail = unwrapResponse(
+      await props.api.get(`${pluginBase.value}/tasks/${taskId}?${query}`),
     )
+    if (taskId === selectedTaskId.value) taskDetail.value = detail
   } catch (err) {
-    error.value = err?.message || '加载任务详情失败'
+    if (taskId === selectedTaskId.value) error.value = err?.message || '加载任务详情失败'
   } finally {
-    taskLoading.value = false
+    if (taskId === selectedTaskId.value) taskLoading.value = false
   }
 }
 
-// 切换左侧任务并从第一页加载对应明细。
+// 切换任务并从第一页加载对应明细。
 async function selectTask(taskId) {
   if (!taskId || taskId === selectedTaskId.value) return
   selectedTaskId.value = taskId
+  taskDetail.value = null
   torrentState.value = 'active'
   torrentPage.value = 1
   await loadTaskDetail()
+}
+
+async function openTask(taskId) {
+  await selectTask(taskId)
+  detailPanel.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 // 同时刷新任务摘要和当前任务详情。
@@ -188,7 +219,7 @@ function openCreateTask() {
 
 // 打开当前任务的服务端配置快照。
 function openEditTask() {
-  if (!rawTaskConfig.value.id) return
+  if (!rawTaskConfig.value.id || rawTaskConfig.value.id !== selectedTaskId.value) return
   editorTask.value = cloneTask(rawTaskConfig.value)
   editorOpen.value = true
 }
@@ -253,7 +284,7 @@ async function toggleSelectedTask() {
       }),
     )
     await loadStatus()
-    notify(selectedTask.value?.enabled ? '刷流任务已启用' : '刷流任务已暂停')
+    notify(selectedTask.value?.enabled ? '站点管理已启用' : '已停止选种与检查，下载器任务继续运行')
   } catch (err) {
     notify(err?.message || '更新任务状态失败', 'error')
   } finally {
@@ -362,6 +393,53 @@ function formatSiteRatio(siteRatio) {
   return Number(siteRatio.current || 0).toFixed(2)
 }
 
+function taskPriorityText(task) {
+  return task?.priority_reason || (task?.priority === 0 ? '新手考核优先' : task?.priority === 1 ? '分享率未达标' : '普通轮转')
+}
+
+function hasTaskError(task) {
+  return task.state === 'error' || Boolean(task.last_error) || task.last_run?.success === false || Boolean(task.metrics?.gap)
+}
+
+function comparableRatio(task) {
+  if (!task.site_ratio?.available || task.site_ratio.unlimited) return Infinity
+  return Number(task.site_ratio.current || 0)
+}
+
+function metricNumber(value, key, fallback = null) {
+  const number = value?.[key]
+  return number == null || !Number.isFinite(Number(number)) ? fallback : Number(number)
+}
+
+function metricBytes(value, key = 'uploaded') {
+  const number = metricNumber(value, key)
+  if (number == null || (key === 'uploaded' && !Number(value?.seconds))) return '—'
+  return `${value?.partial && key === 'uploaded' ? '≥ ' : ''}${formatBytes(number)}`
+}
+
+function metricCount(value, key) {
+  return metricNumber(value, key) ?? '—'
+}
+
+function metricWindow(value) {
+  const seconds = Number(value?.seconds || 0)
+  if (!seconds) return value?.gap ? '采样中断，等待恢复' : '等待累积样本'
+  const duration = seconds < 60 ? `${Math.round(seconds)} 秒` : `${(seconds / 60).toFixed(1)} 分钟`
+  const qualifier = value?.gap ? ' · 存在采样缺口' : seconds < 1200 ? ' · 不足 20 分钟' : ''
+  return `实测 ${duration}${qualifier}${value?.partial ? ' · 部分任务未统计' : ''}`
+}
+
+function sampledTime(value) {
+  if (!value) return '等待采样'
+  return formatDateTime(typeof value === 'number' && value < 1e12 ? value * 1000 : value)
+}
+
+function taskStatusText(task) {
+  if (!task.enabled) return '已停止选种与检查'
+  if (task.last_error || task.last_run?.success === false) return '运行异常，查看诊断'
+  return task.metrics?.reason || taskStateMeta(task.state, sequentialMode.value && task.is_focus === false).text
+}
+
 watch(
   () => props.initialTab,
   value => {
@@ -447,7 +525,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                 clearable
                 hide-details
               />
-              <div class="text-body-2 text-medium-emphasis">插件仅限制空间，并发与速度由下载器管理。</div>
+              <div class="text-body-2 text-medium-emphasis">插件在下载器上限内分配下载名额，速度上限在下载器设置。</div>
             </VCardText>
             <VCardActions>
               <VSpacer />
@@ -483,60 +561,96 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
       <VBtn color="primary" variant="flat" prepend-icon="mdi-plus" @click="openCreateTask">创建第一个任务</VBtn>
     </div>
 
-    <template v-else>
-      <VSelect
-        class="brushflow-mobile-select"
-        :model-value="selectedTaskId"
-        :items="tasks"
-        item-title="name"
-        item-value="id"
-        label="当前任务"
-        hide-details
-        @update:model-value="selectTask"
-      >
-        <template #item="{ props: itemProps, item }">
-          <VListItem v-bind="itemProps" :subtitle="item.raw.site_name">
-            <template #prepend>
-              <VIcon :icon="taskStateMeta(item.raw.state, sequentialMode && item.raw.is_focus === false).icon" :color="taskStateMeta(item.raw.state, sequentialMode && item.raw.is_focus === false).color" />
-            </template>
-          </VListItem>
-        </template>
-      </VSelect>
+    <div v-else class="brushflow-content">
+      <div class="brushflow-stat-grid brushflow-global-stats">
+        <VSheet class="brushflow-stat app-surface-static">
+          <span>近 30 分钟上传</span>
+          <strong>{{ metricBytes(metrics) }}</strong>
+          <small>{{ metricWindow(metrics) }}</small>
+        </VSheet>
+        <VSheet class="brushflow-stat app-surface-static">
+          <span>当前上传</span>
+          <strong>{{ metricBytes(metrics, 'upspeed') }}<template v-if="metricNumber(metrics, 'upspeed') != null">/s</template></strong>
+          <small>{{ metrics.sampled_at ? `采样 ${sampledTime(metrics.sampled_at)}` : '等待采样' }}</small>
+        </VSheet>
+        <VSheet class="brushflow-stat app-surface-static">
+          <span>下载 / 排队 / 做种</span>
+          <strong>{{ metricCount(metrics, 'downloading') }} / {{ metricCount(metrics, 'queued') }} / {{ metricCount(metrics, 'seeding') }}</strong>
+          <small v-if="downloadSlots.budget != null">下载名额 {{ downloadSlots.active ?? metricCount(metrics, 'downloading') }} / {{ downloadSlots.budget }}<template v-if="downloadSlots.limit != null"> · 上限 {{ downloadSlots.limit }}</template></small>
+          <small v-else>托管任务的下载器状态</small>
+        </VSheet>
+        <VSheet class="brushflow-stat app-surface-static">
+          <span>托管空间</span>
+          <strong>{{ formatBytes(status.summary.seeding_size) }}</strong>
+          <small>{{ status.global_disksize ? `上限 ${status.global_disksize} GB` : '未设插件空间上限' }} · 含未完成任务预留</small>
+        </VSheet>
+      </div>
+
+      <VSheet tag="section" class="brushflow-panel brushflow-sites app-surface-static">
+        <header class="brushflow-panel__head">
+          <div>
+            <div class="text-subtitle-1 font-weight-medium">全部站点 <span class="text-medium-emphasis">{{ tasks.length }}</span></div>
+            <div class="text-body-2 text-medium-emphasis">点击站点查看种子与运行详情</div>
+          </div>
+          <div class="brushflow-site-actions">
+            <VSelect
+              v-model="siteSort"
+              :items="[
+                { title: '调度优先', value: 'priority' },
+                { title: '上传量高优先', value: 'upload' },
+                { title: '分享率低优先', value: 'ratio' },
+                { title: '异常优先', value: 'error' },
+              ]"
+              label="显示排序"
+              density="compact"
+              hide-details
+              class="brushflow-site-sort"
+            />
+            <VBtn color="primary" variant="tonal" prepend-icon="mdi-plus" @click="openCreateTask">添加站点</VBtn>
+          </div>
+        </header>
+        <div class="brushflow-site-table-wrap">
+          <table class="brushflow-site-table">
+            <thead>
+              <tr><th>站点 / 优先级</th><th>分享率 / 目标</th><th>下载 / 排队 / 做种</th><th>近 30 分钟上传</th><th>运行情况</th></tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="task in sortedTasks"
+                :key="task.id"
+                :class="{ 'brushflow-site-row--selected': task.id === selectedTaskId }"
+                @click="openTask(task.id)"
+              >
+                <td class="brushflow-site-name">
+                  <button type="button" :aria-current="task.id === selectedTaskId ? 'true' : undefined" @click.stop="openTask(task.id)">{{ task.name }}</button>
+                  <small>{{ task.enabled ? taskPriorityText(task) : '站点管理已停用' }}</small>
+                </td>
+                <td data-label="分享率 / 目标">
+                  <strong>{{ formatSiteRatio(task.site_ratio) }} / {{ task.site_ratio?.target ?? '—' }}</strong>
+                  <small v-if="Number(task.ratio_deficit_bytes) > 0">待补上传 {{ formatBytes(task.ratio_deficit_bytes) }}</small>
+                  <small v-else-if="!task.site_ratio?.available">账号数据待刷新</small>
+                </td>
+                <td data-label="下载 / 排队 / 做种">
+                  <strong>{{ metricCount(task.metrics, 'downloading') }} / {{ metricCount(task.metrics, 'queued') }} / {{ metricCount(task.metrics, 'seeding') }}</strong>
+                  <small v-if="metricNumber(task.metrics, 'paused', 0) > 0">暂停 {{ task.metrics.paused }} 个</small>
+                </td>
+                <td data-label="近 30 分钟上传">
+                  <strong>{{ metricBytes(task.metrics) }}</strong>
+                  <small :class="{ 'text-warning': task.metrics?.gap }">{{ metricWindow(task.metrics) }}</small>
+                </td>
+                <td data-label="运行情况" class="brushflow-site-status">
+                  <span :class="{ 'text-error': hasTaskError(task) }">{{ taskStatusText(task) }}</span>
+                  <small v-if="task.metrics?.gap">统计有缺口</small>
+                  <small v-else-if="task.metrics?.upspeed != null">上传 {{ formatBytes(task.metrics.upspeed) }}/s</small>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </VSheet>
 
       <div class="brushflow-layout">
-        <VSheet tag="aside" class="brushflow-task-rail app-surface-static">
-          <div class="brushflow-task-rail__head">
-            <span class="text-subtitle-2">刷流任务</span>
-            <VChip size="x-small" variant="tonal">{{ tasks.length }}</VChip>
-          </div>
-          <div class="brushflow-task-list">
-            <button
-              v-for="task in tasks"
-              :key="task.id"
-              type="button"
-              class="brushflow-task-item"
-              :class="{ 'brushflow-task-item--selected': task.id === selectedTaskId }"
-              :aria-pressed="task.id === selectedTaskId"
-              @click="selectTask(task.id)"
-            >
-              <span class="brushflow-task-item__title">
-                <strong>{{ task.name }}</strong>
-                <span class="brushflow-status-dot" :class="`brushflow-status-dot--${taskStateMeta(task.state, sequentialMode && task.is_focus === false).color}`" />
-              </span>
-              <span>{{ task.site_name }} · {{ task.downloader }}</span>
-              <span v-if="sequentialMode && task.enabled">{{ task.is_focus ? '当前重点站' : taskStateMeta(task.state, task.is_focus === false).text }}</span>
-              <span class="brushflow-task-item__meta">
-                <span>{{ task.statistic.active || 0 }} 个种子</span>
-                <span>{{ task.next_run_at ? formatDateTime(task.next_run_at) : '暂无计划' }}</span>
-              </span>
-            </button>
-          </div>
-          <VBtn class="brushflow-create-task" block variant="tonal" prepend-icon="mdi-plus" @click="openCreateTask">
-            新建任务
-          </VBtn>
-        </VSheet>
-
-        <main v-if="selectedTask" class="brushflow-workspace">
+        <main v-if="selectedTask" ref="detailPanel" class="brushflow-workspace">
           <section class="brushflow-task-head">
             <div class="brushflow-task-head__identity">
               <VAvatar color="primary" variant="tonal" rounded size="42">
@@ -567,11 +681,12 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                   <VBtn v-bind="tipProps" icon="mdi-progress-check" variant="text" :loading="selectedTask.operation === 'check'" @click="runOperation('check')" />
                 </template>
               </VTooltip>
-              <VTooltip :text="selectedTask.enabled ? '暂停任务' : '启用任务'">
+              <VTooltip :text="selectedTask.enabled ? '停用站点管理：停止选种与检查，下载器任务继续' : '启用站点管理'">
                 <template #activator="{ props: tipProps }">
                   <VBtn
                     v-bind="tipProps"
-                    :icon="selectedTask.enabled ? 'mdi-pause' : 'mdi-play'"
+                    :icon="selectedTask.enabled ? 'mdi-stop-circle-outline' : 'mdi-play'"
+                    :aria-label="selectedTask.enabled ? '停用站点管理' : '启用站点管理'"
                     variant="text"
                     @click="toggleSelectedTask"
                   />
@@ -579,7 +694,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
               </VTooltip>
               <VTooltip text="编辑任务">
                 <template #activator="{ props: tipProps }">
-                  <VBtn v-bind="tipProps" icon="mdi-pencil-outline" variant="text" @click="openEditTask" />
+                  <VBtn v-bind="tipProps" icon="mdi-pencil-outline" variant="text" :disabled="taskLoading || rawTaskConfig.id !== selectedTaskId" @click="openEditTask" />
                 </template>
               </VTooltip>
             </div>
@@ -602,12 +717,12 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                   <small>{{ selectedTask.statistic.unarchived || 0 }} 个待归档</small>
                 </VSheet>
                 <VSheet class="brushflow-stat app-surface-static">
-                  <span>累计上传 / 下载</span>
-                  <strong>{{ formatBytes(selectedTask.statistic.uploaded) }} / {{ formatBytes(selectedTask.statistic.downloaded) }}</strong>
-                  <small>当前任务累计</small>
+                  <span>近 30 分钟上传</span>
+                  <strong>{{ metricBytes(selectedTask.metrics) }}</strong>
+                  <small>{{ metricWindow(selectedTask.metrics) }}</small>
                 </VSheet>
                 <VSheet class="brushflow-stat app-surface-static">
-                  <span>当前做种</span>
+                  <span>托管空间</span>
                   <strong>{{ formatBytes(selectedTask.seeding_size) }}</strong>
                   <small>{{ taskConfig.disksize ? `上限 ${taskConfig.disksize} GB` : '未设置体积上限' }}</small>
                   <VProgressLinear v-if="taskConfig.disksize" :model-value="seedingPercent" height="4" color="primary" />
@@ -618,7 +733,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                     {{ formatSiteRatio(selectedTask.site_ratio) }}
                   </strong>
                   <small>
-                    {{ selectedTask.site_ratio?.available ? `目标 ${Number(taskConfig.site_ratio_target || 0).toFixed(2)} · ${priorityText}` : '暂无站点数据，继续轮转' }}
+                    {{ selectedTask.site_ratio?.available ? `目标 ${Number(taskConfig.site_ratio_target || 0).toFixed(2)} · ${priorityText}` : '账号数据待刷新' }}
                   </small>
                 </VSheet>
               </div>
@@ -824,11 +939,11 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                   <header class="brushflow-panel__head">
                     <div>
                       <div class="text-subtitle-1 font-weight-medium">任务规则</div>
-                      <div class="text-body-2 text-medium-emphasis">{{ configurationSource }} · 当前服务端生效配置</div>
+                      <div class="text-body-2 text-medium-emphasis">当前生效配置</div>
                     </div>
                   </header>
                   <dl class="brushflow-facts brushflow-facts--two">
-                    <div><dt>任务状态</dt><dd>{{ selectedTask.enabled ? '启用' : '暂停' }}</dd></div>
+                    <div><dt>任务状态</dt><dd>{{ selectedTask.enabled ? '管理中' : '已停止选种与检查' }}</dd></div>
                     <div><dt>通知</dt><dd>{{ taskConfig.notify ? '发送' : '关闭' }}</dd></div>
                     <div><dt>站点</dt><dd>{{ selectedTask.site_name }}</dd></div>
                     <div><dt>下载器</dt><dd>{{ selectedTask.downloader }}</dd></div>
@@ -876,7 +991,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
           </VWindow>
         </main>
       </div>
-    </template>
+    </div>
 
     <TaskEditorDialog
       v-model="editorOpen"
@@ -947,8 +1062,6 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
 .brushflow-task-head__actions,
 .brushflow-panel__head,
 .brushflow-panel__title-row,
-.brushflow-task-item__title,
-.brushflow-task-item__meta,
 .brushflow-mobile-torrent__head,
 .brushflow-mobile-torrent__meta,
 .brushflow-diagnostic-head {
@@ -1026,111 +1139,97 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
   text-align: center;
 }
 
-.brushflow-mobile-select {
-  display: none;
-}
-
-.brushflow-layout {
-  display: grid;
-  grid-template-columns: minmax(13.5rem, 0.3fr) minmax(0, 1.7fr);
-  align-items: start;
+.brushflow-content {
+  display: flex;
+  flex-direction: column;
   gap: 18px;
   min-inline-size: 0;
 }
 
-.brushflow-task-rail {
-  position: sticky;
-  top: 76px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-block-size: calc(100dvh - 104px);
-  padding: 12px;
-  overflow-y: auto;
-  border: var(--app-surface-border);
-  border-radius: var(--app-surface-radius);
+.brushflow-layout {
+  min-inline-size: 0;
 }
 
-.brushflow-task-rail__head {
+.brushflow-site-actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding-inline: 4px;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
-.brushflow-task-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+.brushflow-site-sort {
+  inline-size: 10.5rem;
+  flex: 0 0 10.5rem;
 }
 
-.brushflow-create-task {
-  flex: 0 0 auto;
+.brushflow-site-table-wrap {
+  margin-block-start: 12px;
+  overflow-x: auto;
 }
 
-.brushflow-task-item {
-  appearance: none;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+.brushflow-site-table {
   inline-size: 100%;
-  padding: 11px 12px;
-  border: 1px solid transparent;
-  border-radius: var(--app-control-radius);
-  color: rgb(var(--v-theme-on-surface));
-  background: transparent;
-  font: inherit;
+  border-collapse: collapse;
+  font-size: 0.875rem;
   text-align: start;
+}
+
+.brushflow-site-table th,
+.brushflow-site-table td {
+  padding: 12px;
+  text-align: start;
+  border-block-end: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+
+.brushflow-site-table th {
+  color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.brushflow-site-table tr:last-child td {
+  border-block-end: 0;
+}
+
+.brushflow-site-table tbody tr {
   cursor: pointer;
 }
 
-.brushflow-task-item:hover {
+.brushflow-site-table tbody tr:hover {
   background: rgba(var(--v-theme-primary), 0.05);
 }
 
-.brushflow-task-item:focus-visible {
+.brushflow-site-row--selected {
+  background: rgba(var(--v-theme-primary), 0.08);
+}
+
+.brushflow-site-table small {
+  display: block;
+  margin-block-start: 3px;
+  color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
+  font-size: 0.75rem;
+}
+
+.brushflow-site-name button {
+  color: rgb(var(--v-theme-primary));
+  font: inherit;
+  font-weight: 600;
+  text-align: start;
+}
+
+.brushflow-site-name button:focus-visible {
   outline: 2px solid rgb(var(--v-theme-primary));
-  outline-offset: 2px;
+  outline-offset: 4px;
 }
 
-.brushflow-task-item--selected {
-  border-color: rgba(var(--v-theme-primary), 0.28);
-  background: rgba(var(--v-theme-primary), 0.1);
-}
-
-.brushflow-task-item__title,
-.brushflow-task-item__meta {
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.brushflow-task-item__title strong {
-  min-inline-size: 0;
+.brushflow-site-status {
+  max-inline-size: 20rem;
   overflow-wrap: anywhere;
 }
 
-.brushflow-task-item > span:not(.brushflow-task-item__title) {
-  color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
-  font-size: 0.78rem;
-}
-
-.brushflow-status-dot {
-  inline-size: 8px;
-  block-size: 8px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: rgb(var(--v-theme-secondary));
-}
-
-.brushflow-status-dot--success { background: rgb(var(--v-theme-success)); }
-.brushflow-status-dot--primary { background: rgb(var(--v-theme-primary)); }
-.brushflow-status-dot--info { background: rgb(var(--v-theme-info)); }
-.brushflow-status-dot--warning { background: rgb(var(--v-theme-warning)); }
-.brushflow-status-dot--error { background: rgb(var(--v-theme-error)); }
-
 .brushflow-workspace {
   min-inline-size: 0;
+  scroll-margin-block-start: 80px;
 }
 
 .brushflow-task-head {
@@ -1403,40 +1502,13 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
 }
 
 @media (min-width: 960px) {
-  /* 详情弹窗由宿主提供固定高度，内部只让右侧工作区承担页面滚动。 */
   .brushflow-page--compact {
     block-size: calc(100dvh - 48px);
     min-block-size: 0;
     overflow: hidden;
   }
 
-  .brushflow-page--compact .brushflow-layout {
-    flex: 1 1 auto;
-    grid-template-rows: minmax(0, 1fr);
-    align-items: stretch;
-    min-block-size: 0;
-    overflow: hidden;
-  }
-
-  .brushflow-page--compact .brushflow-task-rail {
-    position: static;
-    block-size: 100%;
-    min-block-size: 0;
-    max-block-size: none;
-    overflow: hidden;
-  }
-
-  .brushflow-page--compact .brushflow-task-list {
-    flex: 1 1 auto;
-    min-block-size: 0;
-    padding-inline-end: 2px;
-    overflow-y: auto;
-    overscroll-behavior: contain;
-    scrollbar-gutter: stable;
-  }
-
-  .brushflow-page--compact .brushflow-workspace {
-    block-size: 100%;
+  .brushflow-page--compact .brushflow-content {
     min-block-size: 0;
     padding-inline-end: 4px;
     overflow-y: auto;
@@ -1476,18 +1548,6 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
     align-items: flex-start;
   }
 
-  .brushflow-task-rail {
-    display: none;
-  }
-
-  .brushflow-mobile-select {
-    display: block;
-  }
-
-  .brushflow-layout {
-    grid-template-columns: 1fr;
-  }
-
   .brushflow-overview-grid,
   .brushflow-diagnostic-grid,
   .brushflow-config-grid {
@@ -1496,6 +1556,45 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
 }
 
 @media (max-width: 699px) {
+  .brushflow-site-table thead {
+    display: none;
+  }
+
+  .brushflow-site-table,
+  .brushflow-site-table tbody {
+    display: block;
+  }
+
+  .brushflow-site-table tbody tr {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    padding: 14px 10px;
+    border-block-end: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  }
+
+  .brushflow-site-table td {
+    display: block;
+    padding: 0;
+    border: 0;
+  }
+
+  .brushflow-site-table td::before {
+    content: attr(data-label);
+    display: block;
+    margin-block-end: 3px;
+    color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
+    font-size: 0.75rem;
+  }
+
+  .brushflow-site-name {
+    grid-column: 1 / -1;
+  }
+
+  .brushflow-site-actions {
+    inline-size: 100%;
+  }
+
   .brushflow-task-head {
     flex-direction: column;
   }
@@ -1605,6 +1704,10 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
 @media (max-width: 419px) {
   .brushflow-stat-grid {
     grid-template-columns: 1fr;
+  }
+
+  .brushflow-global-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .brushflow-page:not(.brushflow-page--compact) .brushflow-page__identity p {
