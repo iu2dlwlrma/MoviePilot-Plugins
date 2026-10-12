@@ -256,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.11"
+    plugin_version = "7.2.12"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -271,6 +271,7 @@ class BrushFlow(_PluginBase):
     def init_plugin(self, config: dict = None) -> None:
         """初始化全局开关、任务配置、运行锁和历史数据迁移"""
         raw_config = config or {}
+        self._download_budget_lock = getattr(self, "_download_budget_lock", threading.RLock())
         self._task_context = threading.local()
         self._task_locks: Dict[str, threading.Lock] = {}
         self._brush_lock = threading.Lock()
@@ -548,23 +549,24 @@ class BrushFlow(_PluginBase):
 
     def _restore_download_budgets(self) -> None:
         """只撤销仍与本插件最后一次写入一致的并发设置。"""
-        for name in {task.downloader for task in getattr(self, "_task_configs", {}).values() if task.downloader}:
-            key = f"download_budget.{name}"
-            state = self.get_data(key) or {}
-            if not state.get("ceiling"):
-                continue
-            try:
-                service = DownloaderHelper().get_service(name=name)
-                tr = getattr(service.instance, "trc", None) if service and service.instance else None
-                if not tr:
-                    raise RuntimeError("下载器不可用")
-                if tr.get_session().download_queue_size == state.get("applied"):
-                    tr.set_session(download_queue_size=state["ceiling"])
-                self.save_data(key, {})
-                if (self.get_data("download_slots") or {}).get("downloader") == name:
-                    self.save_data("download_slots", {})
-            except Exception:
-                logger.warning(f"下载器 {name} 并发设置恢复失败，保留恢复记录")
+        with getattr(self, "_download_budget_lock", threading.RLock()):
+            for name in {task.downloader for task in getattr(self, "_task_configs", {}).values() if task.downloader}:
+                key = f"download_budget.{name}"
+                state = self.get_data(key) or {}
+                if not state.get("ceiling"):
+                    continue
+                try:
+                    service = DownloaderHelper().get_service(name=name)
+                    tr = getattr(service.instance, "trc", None) if service and service.instance else None
+                    if not tr:
+                        raise RuntimeError("下载器不可用")
+                    if tr.get_session().download_queue_size == state.get("applied"):
+                        tr.set_session(download_queue_size=state["ceiling"])
+                    self.save_data(key, {})
+                    if (self.get_data("download_slots") or {}).get("downloader") == name:
+                        self.save_data("download_slots", {})
+                except Exception:
+                    logger.warning(f"下载器 {name} 并发设置恢复失败，保留恢复记录")
 
     @property
     def service_info(self) -> Optional[ServiceInfo]:
@@ -1889,65 +1891,66 @@ class BrushFlow(_PluginBase):
 
     def _adjust_download_budget(self, tr, rows, name: str) -> None:
         """专用刷流下载器在用户上限内小步调整并发，共用下载器不改全局设置。"""
-        if getattr(self, "_stopping", False) or not self.get_state():
-            return
-        session = tr.get_session()
-        limit = getattr(session, "download_queue_size", None)
-        if session.download_queue_enabled is not True or not isinstance(limit, int) or limit < 1:
-            return
-        tasks = [task for task in self._task_configs.values() if task.downloader == name]
-        records = {h for task in tasks for h, record in (self._get_task_data(task.id, "torrents") or {}).items()
-                   if not record.get("deleted")}
-        tags = {task.brush_tag for task in tasks}
-        if any(row.hashString not in records and not tags.intersection(row.labels or []) for row in rows):
-            state = self.get_data(f"download_budget.{name}") or {}
-            if limit == state.get("applied") and state.get("ceiling"):
-                tr.set_session(download_queue_size=state["ceiling"])
-            self.save_data(f"download_budget.{name}", {})
-            if (self.get_data("download_slots") or {}).get("downloader") == name:
-                self.save_data("download_slots", {})
-            return
-        key = f"download_budget.{name}"
-        state = self.get_data(key) or {}
-        now = time.time()
-        if limit != state.get("applied"):
-            state = {"ceiling": limit, "applied": limit, "changed_at": 0}
-        ceiling = state["ceiling"]
-        demand = sum(str(row.status) in {"downloading", "download pending"} for row in rows)
-        active = sum(str(row.status) == "downloading" and not (
-            getattr(session, "queue_stalled_enabled", False) is True and getattr(row, "is_stalled", False)) for row in rows)
-        budget = limit
-        reason = "保持并发"
-        if not state["changed_at"] and demand:
-            budget = min(ceiling, max(2, min(demand, 4)))
-            reason = "从少量并发试跑"
-        elif demand and now - state["changed_at"] >= 300:
-            metrics = [self._get_task_data(task.id, "metrics") or {} for task in tasks]
-            valid = [item for item in metrics if item.get("seconds", 0) >= 300
-                     and not item.get("gap") and not item.get("partial")
-                     and now - item.get("sampled_at", 0) <= 90]
-            complete = valid and all(item in valid for item in metrics
-                                     if item.get("downloading") or item.get("queued") or item.get("seeding")) \
-                and not (self.get_data("metrics") or {}).get("partial")
-            upload = sum((item.get("uploaded") or 0) / item["seconds"] for item in valid)
-            download = sum((item.get("downloaded") or 0) / item["seconds"] for item in valid)
-            up_limit = getattr(session, "speed_limit_up", 0) if getattr(session, "speed_limit_up_enabled", False) else 0
-            down_limit = getattr(session, "speed_limit_down", 0) if getattr(session, "speed_limit_down_enabled", False) else 0
-            if complete and up_limit and upload >= up_limit * 1000 * .9:
-                budget = max(min(2, ceiling), limit - 1)
-                reason = "上传已接近预算，减少新增下载竞争"
-            elif complete and demand > limit and (not down_limit or download < down_limit * 1000 * .85):
-                budget = min(ceiling, limit + 1)
-                reason = "有排队需求且带宽有余量，增加一个名额"
-            state["changed_at"] = now
-        if budget != limit:
-            tr.set_session(download_queue_size=budget)
-            state.update(applied=budget, changed_at=now)
-        elif not state["changed_at"] and demand:
-            state["changed_at"] = now
-        self.save_data(key, state)
-        self.save_data("download_slots", {"active": active, "budget": budget, "limit": ceiling,
-                                          "reason": reason, "downloader": name})
+        with self._download_budget_lock:
+            if getattr(self, "_stopping", False) or not self.get_state():
+                return
+            session = tr.get_session()
+            limit = getattr(session, "download_queue_size", None)
+            if session.download_queue_enabled is not True or not isinstance(limit, int) or limit < 1:
+                return
+            tasks = [task for task in self._task_configs.values() if task.downloader == name]
+            records = {h for task in tasks for h, record in (self._get_task_data(task.id, "torrents") or {}).items()
+                       if not record.get("deleted")}
+            tags = {task.brush_tag for task in tasks}
+            if any(row.hashString not in records and not tags.intersection(row.labels or []) for row in rows):
+                state = self.get_data(f"download_budget.{name}") or {}
+                if limit == state.get("applied") and state.get("ceiling"):
+                    tr.set_session(download_queue_size=state["ceiling"])
+                self.save_data(f"download_budget.{name}", {})
+                if (self.get_data("download_slots") or {}).get("downloader") == name:
+                    self.save_data("download_slots", {})
+                return
+            key = f"download_budget.{name}"
+            state = self.get_data(key) or {}
+            now = time.time()
+            if limit != state.get("applied"):
+                state = {"ceiling": limit, "applied": limit, "changed_at": 0}
+            ceiling = state["ceiling"]
+            demand = sum(str(row.status) in {"downloading", "download pending"} for row in rows)
+            active = sum(str(row.status) == "downloading" and not (
+                getattr(session, "queue_stalled_enabled", False) is True and getattr(row, "is_stalled", False)) for row in rows)
+            budget = limit
+            reason = "保持并发"
+            if not state["changed_at"] and demand:
+                budget = min(ceiling, max(2, min(demand, 4)))
+                reason = "从少量并发试跑"
+            elif demand and now - state["changed_at"] >= 300:
+                metrics = [self._get_task_data(task.id, "metrics") or {} for task in tasks]
+                valid = [item for item in metrics if item.get("seconds", 0) >= 300
+                         and not item.get("gap") and not item.get("partial")
+                         and now - item.get("sampled_at", 0) <= 90]
+                complete = valid and all(item in valid for item in metrics
+                                         if item.get("downloading") or item.get("queued") or item.get("seeding")) \
+                    and not (self.get_data("metrics") or {}).get("partial")
+                upload = sum((item.get("uploaded") or 0) / item["seconds"] for item in valid)
+                download = sum((item.get("downloaded") or 0) / item["seconds"] for item in valid)
+                up_limit = getattr(session, "speed_limit_up", 0) if getattr(session, "speed_limit_up_enabled", False) else 0
+                down_limit = getattr(session, "speed_limit_down", 0) if getattr(session, "speed_limit_down_enabled", False) else 0
+                if complete and up_limit and upload >= up_limit * 1000 * .9:
+                    budget = max(min(2, ceiling), limit - 1)
+                    reason = "上传已接近预算，减少新增下载竞争"
+                elif complete and demand > limit and (not down_limit or download < down_limit * 1000 * .85):
+                    budget = min(ceiling, limit + 1)
+                    reason = "有排队需求且带宽有余量，增加一个名额"
+                state["changed_at"] = now
+            if budget != limit:
+                tr.set_session(download_queue_size=budget)
+                state.update(applied=budget, changed_at=now)
+            elif not state["changed_at"] and demand:
+                state["changed_at"] = now
+            self.save_data(key, state)
+            self.save_data("download_slots", {"active": active, "budget": budget, "limit": ceiling,
+                                              "reason": reason, "downloader": name})
 
     def _rebalance_transmission_downloads(self, tr, rows, ranks: dict, name: str) -> None:
         """仅把低优先级刷流下载退回普通队列，不绕过下载器并发上限。"""

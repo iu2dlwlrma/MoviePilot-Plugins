@@ -48,6 +48,7 @@ class BrushFlowTests(unittest.TestCase):
         p._task_locks = {}
         p._runtime_lock = threading.Lock()
         p._brush_lock = threading.Lock()
+        p._download_budget_lock = threading.RLock()
         p._runtime = {}
         p._task_configs = {}
         p._global_defaults = {key: self.ns["DEFAULT_TASK_SETTINGS"][key] for key in self.ns["SHARED_TASK_FIELDS"]}
@@ -1596,6 +1597,68 @@ class BrushFlowRuntimeTests(unittest.TestCase):
         self.assertTrue(self.plugin._stopping)
         self.assertFalse(self.data["download_budget.tb"])
         self.assertFalse(self.data["download_slots"])
+
+    def test_stop_restore_cannot_be_overwritten_by_inflight_budget_adjustment(self):
+        client, session, rows = self.budget_client()
+        session.download_queue_size = 6
+        self.data["download_budget.tb"] = {"ceiling": 8, "applied": 6, "changed_at": 100}
+        self.data["download_slots"] = {"downloader": "tb", "budget": 6, "limit": 8}
+        reached = threading.Event()
+        resume = threading.Event()
+        errors = []
+
+        def read_session():
+            snapshot = copy.copy(session)
+            if threading.current_thread() is adjuster:
+                reached.set()
+                if not resume.wait(3):
+                    raise RuntimeError("budget test timed out")
+            return snapshot
+
+        def adjust():
+            try:
+                self.plugin._adjust_download_budget(client, rows, "tb")
+            except Exception as err:
+                errors.append(err)
+
+        def stop():
+            try:
+                self.plugin.stop_service()
+            except Exception as err:
+                errors.append(err)
+            finally:
+                reached.set()
+
+        client.get_session.side_effect = read_session
+        adjuster = threading.Thread(target=adjust, daemon=True)
+        stopper = threading.Thread(target=stop, daemon=True)
+        adjuster.start()
+        try:
+            self.assertTrue(reached.wait(2))
+            reached.clear()
+            stopper.start()
+            reached.wait(.2)
+            self.assertTrue(self.plugin._stopping)
+        finally:
+            resume.set()
+            adjuster.join(3)
+            if stopper.ident is not None:
+                stopper.join(3)
+        self.assertFalse(adjuster.is_alive())
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(session.download_queue_size, 8)
+        self.assertFalse(self.data["download_budget.tb"])
+        self.assertFalse(self.data["download_slots"])
+        self.assertEqual([call.kwargs["download_queue_size"] for call in client.set_session.call_args_list], [8])
+        client.stop_torrent.assert_not_called()
+        client.start_torrent.assert_not_called()
+
+    def test_reinitializing_preserves_download_budget_lock(self):
+        budget_lock = self.plugin._download_budget_lock
+        self.plugin.update_config = Mock()
+        self.plugin.init_plugin({"enabled": False, "tasks": []})
+        self.assertIs(self.plugin._download_budget_lock, budget_lock)
 
     def test_restore_failure_retains_budget_until_downloader_recovers(self):
         for failure in ("service", "instance", "client", "session_read", "session_write"):
