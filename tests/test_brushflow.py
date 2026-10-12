@@ -1842,13 +1842,13 @@ class BrushFlowRuntimeTests(unittest.TestCase):
         client.set_session.assert_not_called()
         self.assertEqual(session.download_queue_size, 4)
 
-    def test_full_download_bandwidth_and_low_upload_grow_budget_to_user_ceiling(self):
+    def test_spare_download_bandwidth_and_low_upload_grow_budget_to_user_ceiling(self):
         client, session, rows = self.budget_client()
         session.download_queue_size = 4
         self.data["download_budget.tb"] = {"ceiling": 8, "applied": 4, "changed_at": 100}
         for at, expected in ((1000, 5), (1299, 5), (1300, 6), (1600, 7), (1900, 8), (2200, 8)):
             self.data["task.1.metrics"] = {
-                "sampled_at": at, "seconds": 600, "uploaded": 200000 * 600, "downloaded": 10000000 * 600,
+                "sampled_at": at, "seconds": 600, "uploaded": 200000 * 600, "downloaded": 8000000 * 600,
                 "downloading": 4, "queued": 6, "gap": False, "partial": False,
             }
             with patch.object(self.ns["time"], "time", return_value=at):
@@ -1860,7 +1860,8 @@ class BrushFlowRuntimeTests(unittest.TestCase):
         self.assertTrue(all(set(call.kwargs) == {"download_queue_size"} for call in client.set_session.call_args_list))
 
     def test_budget_keeps_upload_pressure_and_complete_sample_guards(self):
-        for scenario, expected in (("upload_full", 3), ("no_upload_limit", 4), ("short_window", 4),
+        for scenario, expected in (("upload_full", 3), ("download_full", 4), ("download_at_threshold", 4),
+                                   ("no_download_limit", 5), ("no_upload_limit", 4), ("short_window", 4),
                                    ("gap", 4), ("partial", 4), ("stale", 4), ("global_partial", 4)):
             with self.subTest(scenario=scenario):
                 self.setUp()
@@ -1868,12 +1869,20 @@ class BrushFlowRuntimeTests(unittest.TestCase):
                 session.download_queue_size = 4
                 self.data["download_budget.tb"] = {"ceiling": 8, "applied": 4, "changed_at": 100}
                 metrics = {"sampled_at": 1000, "seconds": 600,
-                           "uploaded": 200000 * 600, "downloaded": 10000000 * 600,
+                           "uploaded": 200000 * 600, "downloaded": 8000000 * 600,
                            "downloading": 4, "queued": 6, "gap": False, "partial": False}
                 if scenario == "upload_full":
                     metrics["uploaded"] = 2250000 * 600
+                elif scenario == "download_full":
+                    metrics["downloaded"] = 10000000 * 600
+                elif scenario == "download_at_threshold":
+                    metrics["downloaded"] = 8500000 * 600
+                elif scenario == "no_download_limit":
+                    session.speed_limit_down_enabled = False
+                    metrics["downloaded"] = 10000000 * 600
                 elif scenario == "no_upload_limit":
                     session.speed_limit_up_enabled = False
+                    metrics["downloaded"] = 10000000 * 600
                 elif scenario == "short_window":
                     metrics["seconds"] = 299
                 elif scenario == "stale":
