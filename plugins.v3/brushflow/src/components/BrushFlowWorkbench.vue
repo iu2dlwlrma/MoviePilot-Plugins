@@ -88,6 +88,7 @@ const sortedTasks = computed(() => [...tasks.value].sort((left, right) => {
 }))
 const siteRotation = computed(() => status.value.site_rotation || {})
 const sequentialMode = computed(() => (status.value.rotation_mode || siteRotation.value.mode) === 'sequential')
+const ratioPhase = computed(() => siteRotation.value.phase === 'ratio')
 const selectedTask = computed(() => tasks.value.find(item => item.id === selectedTaskId.value) || null)
 const selectedState = computed(() => taskStateMeta(selectedTask.value?.state, sequentialMode.value && selectedTask.value?.is_focus === false))
 const rawTaskConfig = computed(() => taskDetail.value?.task?.config || taskDetail.value?.task || {})
@@ -495,9 +496,9 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                 label="站点轮换模式"
                 :items="[
                   { title: '多站并行', value: 'parallel' },
-                  { title: '单站按驻留时间轮换', value: 'sequential' },
+                  { title: '单站达标后轮转', value: 'sequential' },
                 ]"
-                hint="单站模式默认每天重点一个站，驻留时间可在统一参数中设置或按站覆盖。"
+                hint="单站按优先级刷至分享率达标；全部达标后按配置顺序轮转，默认每站 24 小时。"
                 persistent-hint
               />
               <VDivider />
@@ -544,10 +545,11 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
     <VAlert v-if="statusLoaded && sequentialMode" type="info" variant="tonal">
       <div class="d-flex flex-wrap align-center ga-2 mb-2">
         <strong>当前重点站：{{ siteRotation.site_name || '等待选择站点' }}</strong>
-        <VChip v-if="siteRotation.deadline_at" size="small" variant="tonal">预计切换 {{ formatDateTime(siteRotation.deadline_at) }}</VChip>
-        <span v-if="siteRotation.remaining_seconds != null" class="text-body-2">{{ Number(siteRotation.remaining_seconds) > 0 ? '剩余约 ' : '' }}{{ formatRemainingTime(siteRotation.remaining_seconds) }}</span>
+        <VChip v-if="ratioPhase" size="small" variant="tonal">达标后切换</VChip>
+        <VChip v-else-if="siteRotation.deadline_at" size="small" variant="tonal">预计切换 {{ formatDateTime(siteRotation.deadline_at) }}</VChip>
+        <span v-if="!ratioPhase && siteRotation.deadline_at && siteRotation.remaining_seconds != null" class="text-body-2">{{ Number(siteRotation.remaining_seconds) > 0 ? '剩余约 ' : '' }}{{ formatRemainingTime(siteRotation.remaining_seconds) }}</span>
       </div>
-      切换站点后，原有种子继续下载与做种，直到满足原删除条件。分享率只影响下一站优先级，不会提前切走；等待站点仍正常检查种子。
+      每次仅当前站新增。未达标站按优先级刷至达标，全部达标后按配置顺序定时轮转；旧种继续下载、做种并按删除规则清理。
     </VAlert>
 
     <div v-if="loading && !tasks.length" class="brushflow-loading">
@@ -749,8 +751,9 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                   </header>
                   <dl class="brushflow-facts">
                     <div><dt>选种优先级</dt><dd>{{ priorityText }}</dd></div>
-                    <div v-if="sequentialMode"><dt>单站驻留</dt><dd>{{ taskConfig.rotation_hours ?? 24 }} 小时</dd></div>
-                    <div v-if="sequentialMode && selectedTask.is_focus && siteRotation.deadline_at"><dt>预计切换</dt><dd>{{ formatDateTime(siteRotation.deadline_at) }}</dd></div>
+                    <div v-if="sequentialMode"><dt>达标后每站驻留</dt><dd>{{ taskConfig.rotation_hours ?? 24 }} 小时</dd></div>
+                    <div v-if="sequentialMode && selectedTask.is_focus && ratioPhase"><dt>切换条件</dt><dd>分享率达标后切换</dd></div>
+                    <div v-else-if="sequentialMode && selectedTask.is_focus && siteRotation.deadline_at"><dt>预计切换</dt><dd>{{ formatDateTime(siteRotation.deadline_at) }}</dd></div>
                     <div><dt>刷新周期</dt><dd>{{ taskConfig.cron || `每 ${taskConfig.brush_interval} 分钟` }}</dd></div>
                     <div><dt>检查周期</dt><dd>每 {{ taskConfig.check_interval }} 分钟</dd></div>
                     <div><dt>开启时段</dt><dd>{{ taskConfig.active_time_range || '全天' }}</dd></div>
@@ -956,8 +959,8 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                     <div><dt>包含规则</dt><dd>{{ taskConfig.include || '无' }}</dd></div>
                     <div><dt>排除规则</dt><dd>{{ taskConfig.exclude || '无' }}</dd></div>
                     <div><dt>保种上限</dt><dd>{{ taskConfig.disksize ? `${taskConfig.disksize} GB` : '不限' }}</dd></div>
-                    <div><dt>目标分享率</dt><dd>{{ taskConfig.site_ratio_target || '不限' }}（达标继续轮转）</dd></div>
-                    <div><dt>单站驻留时间</dt><dd>{{ taskConfig.rotation_hours ?? 24 }} 小时{{ sequentialMode ? '' : '（单站轮换模式生效）' }}</dd></div>
+                    <div><dt>目标分享率</dt><dd>{{ taskConfig.site_ratio_target || '不限' }}{{ sequentialMode ? '（达标后切换）' : '' }}</dd></div>
+                    <div><dt>达标后每站驻留时间</dt><dd>{{ taskConfig.rotation_hours ?? 24 }} 小时{{ sequentialMode ? '' : '（单站轮换模式生效）' }}</dd></div>
                     <div><dt>新手考核</dt><dd>{{ selectedTask.novice ? '优先' : taskConfig.novice ? '已到期' : '关闭' }}</dd></div>
                     <div v-if="taskConfig.novice_until"><dt>考核截止</dt><dd>{{ formatDateTime(taskConfig.novice_until) }}</dd></div>
                     <div><dt>促销保护</dt><dd>{{ taskConfig.del_no_free ? `提前 ${taskConfig.promotion_lead_minutes ?? 10} 分钟，包含排队任务` : '关闭' }}</dd></div>

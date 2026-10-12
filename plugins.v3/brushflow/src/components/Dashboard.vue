@@ -56,8 +56,9 @@ onUnmounted(() => {
     </div>
     <div v-if="sequentialMode" class="brushflow-dashboard__rotation">
       <strong>当前重点站：{{ status.site_rotation?.site_name || '等待选择站点' }}</strong>
-      <span v-if="status.site_rotation?.deadline_at">预计切换 {{ formatDateTime(status.site_rotation.deadline_at) }} · {{ Number(status.site_rotation.remaining_seconds) > 0 ? '剩余约 ' : '' }}{{ formatRemainingTime(status.site_rotation.remaining_seconds) }}</span>
-      <span>旧种继续下载与做种，按原删除条件处理；分享率只决定优先级，不提前切换。</span>
+      <span v-if="status.site_rotation?.phase === 'ratio'">达标后切换</span>
+      <span v-else-if="status.site_rotation?.deadline_at">预计切换 {{ formatDateTime(status.site_rotation.deadline_at) }} · {{ Number(status.site_rotation.remaining_seconds) > 0 ? '剩余约 ' : '' }}{{ formatRemainingTime(status.site_rotation.remaining_seconds) }}</span>
+      <span>每次仅当前站新增；全部站点达标后按配置顺序定时轮转。旧种继续下载、做种和按规则清理。</span>
     </div>
     <VDivider />
     <div class="brushflow-dashboard__tasks">
