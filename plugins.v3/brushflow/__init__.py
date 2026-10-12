@@ -256,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.4"
+    plugin_version = "7.2.5"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -1291,20 +1291,23 @@ class BrushFlow(_PluginBase):
         return result
 
     @staticmethod
-    def _site_ratio_values(user_data: Any) -> Optional[Tuple[Optional[float], float, float, bool, bool]]:
+    def _site_ratio_values(user_data: Any) -> Optional[Tuple[Optional[float], Optional[float], Optional[float], bool, bool]]:
         if not user_data or getattr(user_data, "err_msg", None):
             return None
-        ratio = BrushTaskConfig._parse_number(getattr(user_data, "ratio", None))
-        upload = BrushTaskConfig._parse_number(getattr(user_data, "upload", None)) or 0
-        download = BrushTaskConfig._parse_number(getattr(user_data, "download", None)) or 0
-        unlimited = float(upload) > 0 and float(download) == 0
-        estimated = (ratio is None or ratio <= 0) and download > 0
+        ratio, upload, download = (
+            None if isinstance(value, bool) else BrushTaskConfig._parse_number(value)
+            for value in (getattr(user_data, "ratio", None), getattr(user_data, "upload", None),
+                          getattr(user_data, "download", None))
+        )
+        upload = upload if upload is not None and upload >= 0 else None
+        download = download if download is not None and download >= 0 else None
+        known_bytes = upload is not None and download is not None
+        unlimited = known_bytes and upload > 0 and download == 0
+        estimated = (ratio is None or ratio <= 0) and known_bytes and download > 0
         if estimated:
             ratio = upload / download
         # 解析器的全零默认值不能当作真实低分享率。
-        if (ratio is None or ratio == 0) and float(upload) <= 0 and float(download) <= 0:
-            return None
-        if ratio is None and not unlimited:
+        if (ratio is None or ratio <= 0) and not estimated and not unlimited:
             return None
         return ratio, upload, download, unlimited, estimated
 
@@ -1340,6 +1343,7 @@ class BrushFlow(_PluginBase):
         if values is None:
             return status
         ratio, upload, download, unlimited, estimated = values
+        known_bytes = upload is not None and download is not None
         updated_day = getattr(user_data, "updated_day", None)
         updated_time = getattr(user_data, "updated_time", None)
         status.update(
@@ -1349,8 +1353,8 @@ class BrushFlow(_PluginBase):
                 "unlimited": unlimited,
                 "estimated": estimated,
                 "reached": unlimited or bool(task.site_ratio_target and float(ratio) >= float(task.site_ratio_target)),
-                "deficit_bytes": max(float(task.site_ratio_target or 0) * download - upload, 0),
-                "download_headroom": max(upload / float(task.site_ratio_target or 1) - download, 0),
+                "deficit_bytes": max(float(task.site_ratio_target or 0) * download - upload, 0) if known_bytes else None,
+                "download_headroom": max(upload / float(task.site_ratio_target or 1) - download, 0) if known_bytes else None,
                 "deficit_fraction": max(1 - float(ratio or 0) / float(task.site_ratio_target or 1), 0) if not unlimited else 0,
                 "updated_at": " ".join(value for value in (updated_day, updated_time) if value) or None,
             }
@@ -2129,6 +2133,11 @@ class BrushFlow(_PluginBase):
                     report["result"] = "source_unavailable"
                     report["error"] = "站点连接或登录认证失败，请检查站点状态"
                     report["reason_counts"][report["error"]] += 1
+                    state = self.get_data("site_rotation") or {}
+                    if getattr(self, "_rotation_mode", "parallel") == "sequential" \
+                            and state.get("site_id") == task.site_id and not state.get("retry_at"):
+                        state.update(health_checked=False, retry_count=0, retry_at=time.time() + 600)
+                        self.save_data("site_rotation", state)
                 return
             report["source_count"] = len(torrents)
             if task.except_subscribe:
@@ -2338,10 +2347,13 @@ class BrushFlow(_PluginBase):
             ratio_status = self._build_site_ratio_status(task, getattr(self._task_context, "site_user_data", None))
             if not ratio_status.get("available") or ratio_status.get("stale") or not ratio_status.get("reached"):
                 return False, "账号分享率不足或数据待刷新，仅选择免费种子"
+            headroom = ratio_status.get("download_headroom")
+            if headroom is None:
+                return False, "账号上传下载量待刷新，仅选择免费种子"
             reserved = sum(max((item.get("size") or 0) - (item.get("downloaded") or 0), 0)
                            * float(item.get("downloadvolumefactor") or 0) for item in torrent_tasks.values()
                            if item.get("site") == task.site_id and not item.get("deleted") and not item.get("completed"))
-            if reserved + torrent.size * float(torrent.downloadvolumefactor or 1) > ratio_status.get("download_headroom", 0):
+            if reserved + torrent.size * float(torrent.downloadvolumefactor or 1) > headroom:
                 return False, "新增记账下载会低于目标分享率"
         if task.del_no_free:
             deadline = self._promotion_expiry_at(torrent.freedate, task.timezone_offset, task.promotion_lead_minutes)

@@ -1117,6 +1117,86 @@ class BrushFlowRatioRotationTests(unittest.TestCase):
                     p._refresh_focus_ratio()
                 self.assertTrue(self.data["ratio_refresh.1"]["success"])
 
+    def test_unknown_account_bytes_do_not_become_unlimited_or_zero_ratio(self):
+        for upload, download in ((100, None), (100, "invalid"), (100, -1), (100, False),
+                                 (None, 100), ("invalid", 100), (-1, 100), (True, 0)):
+            for ratio in (None, 0):
+                with self.subTest(upload=upload, download=download, ratio=ratio):
+                    data = SimpleNamespace(ratio=ratio, upload=upload, download=download)
+                    self.assertIsNone(self.cls._site_ratio_values(data))
+        for ratio in (True, False):
+            with self.subTest(ratio=ratio):
+                self.assertIsNone(self.cls._site_ratio_values(SimpleNamespace(ratio=ratio)))
+
+    def test_known_ratio_with_missing_bytes_preserves_priority_without_download_budget(self):
+        task = self.add_task(1)
+        self.ns["StringUtils"] = SimpleNamespace(get_url_domain=lambda value: value)
+        self.plugin._build_site_ratio_status = self.cls._build_site_ratio_status.__get__(self.plugin)
+        for ratio in (1, 3):
+            for upload, download in ((100, None), (None, 100)):
+                with self.subTest(ratio=ratio, upload=upload, download=download):
+                    row = SimpleNamespace(ratio=ratio, upload=upload, download=download)
+                    self.plugin._task_context.site_user_data = {"1": row}
+                    status = self.plugin._build_site_ratio_status(task, {"1": row})
+                    self.assertTrue(status["available"])
+                    self.assertFalse(status["unlimited"])
+                    self.assertEqual(status["current"], ratio)
+                    self.assertEqual(status["reached"], ratio >= task.site_ratio_target)
+                    self.assertIsNone(status["deficit_bytes"])
+                    self.assertIsNone(status["download_headroom"])
+                    self.assertEqual(self.plugin._priority_tier(task, status), 1 if ratio == 1 else 2)
+                    task.freeleech = ""
+                    torrent = SimpleNamespace(title="sample", site_name="one", page_url=None,
+                                              size=1, downloadvolumefactor=1)
+                    with self.plugin._task_scope(task.id):
+                        allowed, reason = self.cls._BrushFlow__evaluate_conditions_for_brush(self.plugin, torrent, {})
+                    self.assertFalse(allowed)
+                    self.assertIn("仅选择免费种子", reason)
+
+    def test_focus_source_failure_starts_five_retries_then_skips(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        task = self.add_task(1)
+        self.add_task(2)
+        p._refresh_focus_ratio = Mock()
+        self.data["site_rotation"] = {"site_id": 1, "phase": "ratio", "health_checked": True}
+        self.candidates["1"] = []
+        self.site_test.return_value = (False, "private")
+        self.queue(task)
+        with patch.object(self.ns["time"], "time", return_value=100):
+            p._dispatch_brush()
+        state = self.data["site_rotation"]
+        self.assertFalse(state["health_checked"])
+        self.assertEqual(state["retry_count"], 0)
+        self.assertEqual(state["retry_at"], 700)
+        self.assertFalse(p._check_rotation_site(699))
+        self.assertEqual(self.site_test.call_count, 1)
+        for attempt in range(1, 6):
+            self.assertFalse(p._check_rotation_site(100 + attempt * 600))
+            self.assertEqual(self.data["site_rotation"]["retry_count"], attempt)
+        self.assertEqual(self.site_test.call_count, 6)
+        self.assertEqual(p._select_rotation_site({}, 3100), 2)
+
+    def test_source_failure_does_not_overwrite_other_focus_or_pending_retry(self):
+        task = self.add_task(1)
+        self.candidates["1"] = []
+        self.site_test.return_value = (False, "private")
+        for mode, state in (
+            ("parallel", {"site_id": 1, "health_checked": True}),
+            ("sequential", {"site_id": 2, "health_checked": True}),
+            ("sequential", {"site_id": 1, "health_checked": False, "retry_at": 700, "retry_count": 3}),
+        ):
+            with self.subTest(mode=mode, state=state):
+                self.plugin._rotation_mode = mode
+                self.data["site_rotation"] = copy.deepcopy(state)
+                self.plugin._task_context.candidates = {}
+                with self.plugin._task_scope(task.id):
+                    self.plugin._BrushFlow__brush_site_torrents(
+                        SimpleNamespace(name="one", domain="1"), {}, {}, set(),
+                        self.plugin._new_run_report("brush"), 0,
+                    )
+                self.assertEqual(self.data["site_rotation"], state)
+
     def test_empty_source_distinguishes_connection_failure_from_empty_results(self):
         for healthy in (True, False, None):
             with self.subTest(healthy=healthy):

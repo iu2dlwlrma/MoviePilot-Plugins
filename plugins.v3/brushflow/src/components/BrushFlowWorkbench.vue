@@ -680,7 +680,8 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                 </div>
                 <p>
                   {{ selectedTask.site_name }} · 最近 {{ selectedTask.last_run ? formatDateTime(selectedTask.last_run.started_at) : '尚未运行' }}
-                  · 下次 {{ selectedTask.next_run_at ? formatDateTime(selectedTask.next_run_at) : '暂无计划' }}
+                  · {{ isRetryingTask(selectedTask) ? '下次重试' : '下次' }}
+                  {{ isRetryingTask(selectedTask) ? formatDateTime(siteRotation.retry_at * 1000) : selectedTask.next_run_at ? formatDateTime(selectedTask.next_run_at) : '暂无计划' }}
                 </p>
               </div>
             </div>

@@ -1719,7 +1719,7 @@ return (_ctx, _cache) => {
                               _: 1
                             }, 8, ["color", "prepend-icon"])
                           ]),
-                          _createElementVNode("p", null, _toDisplayString(selectedTask.value.site_name) + " · 最近 " + _toDisplayString(selectedTask.value.last_run ? _unref(formatDateTime)(selectedTask.value.last_run.started_at) : '尚未运行') + " · 下次 " + _toDisplayString(selectedTask.value.next_run_at ? _unref(formatDateTime)(selectedTask.value.next_run_at) : '暂无计划'), 1)
+                          _createElementVNode("p", null, _toDisplayString(selectedTask.value.site_name) + " · 最近 " + _toDisplayString(selectedTask.value.last_run ? _unref(formatDateTime)(selectedTask.value.last_run.started_at) : '尚未运行') + " · " + _toDisplayString(isRetryingTask(selectedTask.value) ? '下次重试' : '下次') + " " + _toDisplayString(isRetryingTask(selectedTask.value) ? _unref(formatDateTime)(siteRotation.value.retry_at * 1000) : selectedTask.value.next_run_at ? _unref(formatDateTime)(selectedTask.value.next_run_at) : '暂无计划'), 1)
                         ])
                       ]),
                       _createElementVNode("div", _hoisted_35, [
@@ -2538,6 +2538,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const BrushFlowWorkbench = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-f7dbded3"]]);
+const BrushFlowWorkbench = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-b6b1479b"]]);
 
 export { BrushFlowWorkbench as B };
