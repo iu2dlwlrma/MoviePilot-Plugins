@@ -194,7 +194,7 @@ export function taskStateMeta(state, waitingRotation = false) {
     running: { text: '运行中', color: 'success', icon: 'mdi-check-circle-outline' },
     brush: { text: '正在刷新', color: 'primary', icon: 'mdi-sync' },
     check: { text: '正在检查', color: 'info', icon: 'mdi-progress-check' },
-    paused: { text: '已暂停', color: 'secondary', icon: 'mdi-pause-circle-outline' },
+    paused: { text: '管理已停用', color: 'secondary', icon: 'mdi-stop-circle-outline' },
     waiting: { text: '等待时段', color: 'warning', icon: 'mdi-clock-outline' },
     waiting_rotation: { text: '等待轮转', color: 'info', icon: 'mdi-clock-outline' },
     disabled: { text: '插件停用', color: 'secondary', icon: 'mdi-stop-circle-outline' },

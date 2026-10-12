@@ -58,6 +58,34 @@ def demand_rank(peers: Any, seeders: Any, age_minutes: float | None) -> tuple[fl
     return demand * freshness, -age
 
 
+def allocate_downloads(rows: list[dict], slots: int) -> list[str]:
+    """先给每站一个机会，剩余名额按优先级分配，尽量保留活跃下载。"""
+    limit = _count(slots)
+    if not limit:
+        return []
+    unique = {}
+    for row in rows:
+        if row.get("hash"):
+            unique.setdefault(row["hash"], row)
+    sites = {}
+    for row in unique.values():
+        sites.setdefault(row["site_id"], []).append(row)
+    groups = sorted(sites.values(), key=lambda group: (
+        min(row["priority"] for row in group),
+        min(row["position"] for row in group),
+        str(group[0]["site_id"]),
+    ))
+    selected = []
+    for group in groups[:limit]:
+        first = min(group, key=lambda row: (not row["active"], row["position"], row["hash"]))
+        selected.append(first["hash"])
+    chosen = set(selected)
+    remaining = sorted((row for row in unique.values() if row["hash"] not in chosen),
+                       key=lambda row: (row["priority"], not row["active"], row["position"], row["hash"]))
+    selected.extend(row["hash"] for row in remaining[:limit - len(selected)])
+    return selected
+
+
 def evaluate_peer_demand(
     peers: Any,
     seeders: Any,
@@ -135,3 +163,87 @@ def download_has_started(info: dict, record: dict) -> bool:
         return True
     state = re.sub(r"[\s_-]", "", str(info.get("state") or "").lower())
     return state in {"downloading", "forceddl", "forceddownload"}
+
+
+def update_transfer_sample(record: dict, info: dict, now: float) -> None:
+    """保存实际计数增量；排队、暂停和采样中断不累加下载用时。"""
+    current = _number(now)
+    if current is None:
+        return
+    previous = record.get("transfer_sample") or {}
+    previous_at = _number(previous.get("at"))
+    if previous_at is not None and current <= previous_at:
+        return
+    uploaded = _count(info.get("sample_uploaded", info.get("uploaded")))
+    downloaded = _count(info.get("sample_downloaded", info.get("transfer_downloaded")))
+    state = re.sub(r"[\s_-]", "", str(info.get("state") or "").lower())
+    downloading = info.get("is_downloading", state in {
+        "downloading", "forceddl", "forceddownload", "stalleddl",
+    }) is True and info.get("completed") is not True
+    active_seconds = _number(record.get("actual_download_seconds")) or 0
+    snapshot = dict(previous.get("snapshot") or {
+        "uploaded": 0, "downloaded": 0,
+        "upload_errors": 0, "download_errors": 0, "gaps": 0,
+    })
+    if previous_at is not None:
+        elapsed = current - previous_at
+        for name, counter in (("uploaded", uploaded), ("downloaded", downloaded)):
+            prior = _count(previous.get(name))
+            error_key = "upload_errors" if name == "uploaded" else "download_errors"
+            if counter is None or prior is None or counter < prior:
+                snapshot[error_key] += 1
+            else:
+                snapshot[name] += counter - prior
+        if elapsed > 180:
+            snapshot["gaps"] += 1
+        elif downloading and previous.get("downloading") is True:
+            active_seconds += elapsed
+    snapshot.update(at=current, active_download_seconds=active_seconds)
+    record["actual_download_seconds"] = active_seconds
+    record["transfer_sample"] = {
+        "at": current, "uploaded": uploaded, "downloaded": downloaded,
+        "downloading": downloading, "snapshot": snapshot,
+    }
+    samples = [sample for sample in record.get("transfer_samples", [])
+               if current - 2100 <= sample.get("at", -1) <= current]
+    if not samples or int(samples[-1]["at"] // 60) != int(current // 60):
+        samples.append(dict(snapshot))
+    record["transfer_samples"] = samples
+
+
+def transfer_window(record: dict, now: float, seconds: float = 1800) -> dict:
+    """缺失或重置的字节计数返回未知，不用瞬时速率补齐统计。"""
+    result = {
+        "uploaded": None, "downloaded": None, "seconds": 0,
+        "gap": False, "avg_upspeed": None, "active_download_seconds": 0,
+    }
+    current, duration = _number(now), _number(seconds)
+    if current is None or duration is None or duration == 0:
+        return result
+    samples = list(record.get("transfer_samples") or [])
+    latest = (record.get("transfer_sample") or {}).get("snapshot")
+    if latest:
+        samples.append(latest)
+    samples = sorted((sample for sample in samples
+                      if current - duration <= sample.get("at", -1) <= current),
+                     key=lambda sample: sample["at"])
+    if not samples:
+        result["gap"] = bool(latest)
+        return result
+    first, last = samples[0], samples[-1]
+    elapsed = last["at"] - first["at"]
+    result["gap"] = current - last["at"] > 180 or last["gaps"] != first["gaps"]
+    if elapsed <= 0:
+        return result
+    result["seconds"] = elapsed
+    result["active_download_seconds"] = max(
+        0, last["active_download_seconds"] - first["active_download_seconds"],
+    )
+    for name, error_key in (("uploaded", "upload_errors"), ("downloaded", "download_errors")):
+        if last[error_key] != first[error_key] or last[name] < first[name]:
+            result["gap"] = True
+        else:
+            result[name] = last[name] - first[name]
+    if result["uploaded"] is not None:
+        result["avg_upspeed"] = result["uploaded"] / elapsed
+    return result

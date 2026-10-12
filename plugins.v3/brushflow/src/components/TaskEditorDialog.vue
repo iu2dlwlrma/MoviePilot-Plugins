@@ -27,7 +27,7 @@ const positive = value => value === '' || value == null || Number(value) > 0 || 
 const sections = [
   {
     value: 'base', title: '常用与调度', icon: 'mdi-calendar-clock',
-    description: '单站轮换按驻留时间切换。分享率决定优先级，不会提前切走；并发和速度由下载器管理。',
+    description: '单站轮换按驻留时间切换。分享率决定优先级；下载名额在下载器上限内分配。',
     fields: [
       { key: 'downloader', label: '下载器', type: 'downloader', required: true },
       { key: 'save_path', label: '保存目录', globalHint: '留空使用下载器默认目录' },
@@ -199,7 +199,7 @@ async function saveTask(apply = false) {
                   <VCol cols="12" md="6"><VTextField v-model="localTask.name" label="任务名称" :rules="[required]" /></VCol>
                 </VRow>
                 <div class="editor-switches">
-                  <VSwitch v-model="localTask.enabled" label="启用任务" color="primary" hide-details inset />
+                  <VSwitch v-model="localTask.enabled" label="启用站点管理" hint="关闭后停止选种与检查，下载器任务继续运行。" persistent-hint color="primary" inset />
                 </div>
                 <VAlert type="info" variant="tonal" density="compact">留空使用默认值，填写后仅对此站点生效。</VAlert>
               </section>

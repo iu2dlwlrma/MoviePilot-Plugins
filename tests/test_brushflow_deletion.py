@@ -122,7 +122,9 @@ class BrushFlowDeletionTests(unittest.TestCase):
         paused = self.torrent(state="pausedDL")
         self.plugin._BrushFlow__update_torrent_tasks_state([paused], self.records)
         self.assertEqual(record["download_started_at"], started_at)
-        self.assertTrue(self.evaluate(paused, record)[0])
+        self.assertFalse(self.evaluate(paused, record)[0])
+        record["actual_download_seconds"] = 3601
+        self.assertTrue(self.evaluate(downloading, record)[0])
 
     def test_transmission_missing_optional_properties_preserves_transfer_totals(self):
         class Torrent(SimpleNamespace):
@@ -146,6 +148,20 @@ class BrushFlowDeletionTests(unittest.TestCase):
         self.assertEqual(info["uploaded"], 4321)
         self.assertFalse(info["completed"])
         self.assertTrue(rules.download_has_started(info, {}))
+
+    def test_no_progress_requires_observed_running_time_and_protects_hr(self):
+        for downloading, received, protected, expected in [
+            (True, 0, False, True), (False, 0, False, False),
+            (True, 1, False, False), (True, 0, True, False),
+        ]:
+            with self.subTest(downloading=downloading, received=received, protected=protected):
+                record = {"download_started": True, "hit_and_run": protected}
+                end = self.now.timestamp()
+                for seconds in range(0, 1201, 30):
+                    rules.update_transfer_sample(record, {"uploaded": 0, "transfer_downloaded": received * seconds,
+                        "is_downloading": downloading, "completed": False}, end - 1200 + seconds)
+                torrent = self.torrent(state="downloading" if downloading else "queuedDL")
+                self.assertEqual(self.evaluate(torrent, record)[0], expected)
 
     def test_promotion_scheduler_uses_lead_and_does_not_repeat_expired_item(self):
         self.records.update({
