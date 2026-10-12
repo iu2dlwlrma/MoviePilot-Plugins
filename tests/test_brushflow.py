@@ -774,6 +774,8 @@ class BrushFlowTests(unittest.TestCase):
         torrent = SimpleNamespace(title="sample", description="", site_name="one", page_url=None,
                                   size=100, downloadvolumefactor=0, uploadvolumefactor=1,
                                   hit_and_run=False, seeders=10, peers=1, freedate=None)
+        self.data["task.1.metrics"] = {"seconds": 0, "downloaded": None, "downloading": None,
+                                       "gap": True, "partial": True}
         with self.plugin._task_scope(task.id):
             self.assertTrue(evaluate(torrent, {})[0])
             torrent.peers = 0
@@ -1325,16 +1327,64 @@ class BrushFlowRuntimeTests(unittest.TestCase):
 
     def test_locked_task_marks_global_window_partial(self):
         self.add_task(1)
-        self.add_task(2)
+        self.add_task(2, downloader="qb")
+        self.data["task.2.torrents"] = {"known": {"deleted": False}}
+        self.rows["qb"] = [{"hash": "known", "state": "uploading", "progress": 1,
+                            "uploaded": 100, "downloaded": 1000, "upspeed": 1200}]
+        with patch.object(self.ns["time"], "time", return_value=1000):
+            self.plugin._sample_transfers()
+        self.data["task.1.metrics"] = {"sampled_at": 1000, "seeding": 17, "upspeed": 300000}
+        self.rows["qb"][0]["uploaded"] = 600
         lock = threading.Lock()
         self.plugin._task_locks["1"] = lock
         lock.acquire()
         try:
-            self.plugin._sample_transfers()
+            with patch.object(self.ns["time"], "time", return_value=1030):
+                self.plugin._sample_transfers()
         finally:
             lock.release()
         self.assertTrue(self.data["metrics"]["partial"])
         self.assertTrue(self.data["metrics"]["gap"])
+        self.assertEqual(self.data["metrics"]["uploaded"], 500)
+        self.assertEqual(self.data["task.2.metrics"]["seeding"], 1)
+        self.assertEqual(self.data["task.1.metrics"]["sampled_at"], 1030)
+        for key in ("upspeed", "dlspeed", "downloading", "queued", "seeding", "paused"):
+            self.assertIsNone(self.data["metrics"][key])
+            self.assertIsNone(self.data["task.1.metrics"][key])
+
+    def test_unavailable_downloader_reports_unknown_current_counts(self):
+        self.add_task(1)
+        self.plugin._read_downloads = lambda **kwargs: {}
+        with patch.object(self.ns["time"], "time", return_value=1030):
+            self.plugin._sample_transfers()
+        for metrics in (self.data["metrics"], self.data["task.1.metrics"]):
+            self.assertTrue(metrics["gap"])
+            self.assertEqual(metrics["sampled_at"], 1030)
+            for key in ("upspeed", "dlspeed", "downloading", "queued", "seeding", "paused"):
+                self.assertIsNone(metrics[key])
+
+    def test_first_transfer_sample_preserves_known_current_counts(self):
+        self.add_task(1, downloader="qb")
+        self.data["task.1.torrents"] = {"new": {"deleted": False}}
+        self.rows["qb"] = [{"hash": "new", "state": "uploading", "progress": 1,
+                            "uploaded": 100, "downloaded": 1000, "upspeed": 1200}]
+        self.plugin._sample_transfers()
+        for metrics in (self.data["metrics"], self.data["task.1.metrics"]):
+            self.assertTrue(metrics["partial"])
+            self.assertFalse(metrics["gap"])
+            self.assertEqual(metrics["seeding"], 1)
+            self.assertEqual(metrics["upspeed"], 1200)
+            self.assertEqual(metrics["downloading"], 0)
+            self.assertEqual(metrics["queued"], 0)
+
+    def test_empty_downloader_snapshot_preserves_known_zero_counts(self):
+        self.add_task(1)
+        self.plugin._sample_transfers()
+        for metrics in (self.data["metrics"], self.data["task.1.metrics"]):
+            self.assertFalse(metrics["partial"])
+            self.assertFalse(metrics["gap"])
+            for key in ("upspeed", "dlspeed", "downloading", "queued", "seeding", "paused"):
+                self.assertEqual(metrics[key], 0)
 
     def test_partial_active_station_prevents_budget_growth(self):
         client, session, rows = self.budget_client()
