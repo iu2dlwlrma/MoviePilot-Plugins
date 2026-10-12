@@ -125,6 +125,7 @@ class BrushFlowTests(unittest.TestCase):
         client.queue_top.assert_not_called()
 
     def test_qb_queue_priority_uses_site_tiers_and_records(self):
+        self.plugin._build_site_ratio_status = lambda *args: {"available": True, "reached": False}
         self.add_task(1, downloader="qb")
         task = self.add_task(2, downloader="qb")
         task.novice = True
@@ -140,6 +141,7 @@ class BrushFlowTests(unittest.TestCase):
                          [["normal"], ["novice"]])
 
     def priority_client(self):
+        self.plugin._build_site_ratio_status = lambda *args: {"available": True, "reached": False}
         self.add_task(1)
         self.add_task(2).novice = True
         self.plugin._rotation_mode = "parallel"
@@ -540,7 +542,7 @@ class BrushFlowTests(unittest.TestCase):
         tasks[3].novice = True
         tasks[3].novice_until = "2000-01-01T00:00:00+00:00"
         self.plugin._build_site_ratio_status = lambda task, *args, **kwargs: {
-            "available": True, "reached": task.id != "2",
+            "available": True, "reached": task.id not in {"2", "3"},
         }
         self.queue(*tasks)
         self.plugin._dispatch_brush()
@@ -899,6 +901,39 @@ class BrushFlowRatioRotationTests(unittest.TestCase):
     setUp = BrushFlowTests.setUp
     add_task = BrushFlowTests.add_task
     queue = BrushFlowTests.queue
+
+    def test_verified_low_ratio_preempts_unknown_novice_even_during_retry(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1).novice = True
+        low = self.add_task(2)
+        p._build_site_ratio_status = lambda task, *args: {
+            "available": task.site_id == 2, "reached": False, "deficit_fraction": .885}
+        for retry_at in (None, 700):
+            self.data["site_rotation"] = {"site_id": 1, "phase": "ratio", "started_at": 10,
+                                          "retry_at": retry_at, "health_checked": True}
+            self.assertEqual(p._select_rotation_site({}, 100), 2)
+            self.assertIsNone(self.data["site_rotation"].get("retry_at"))
+        self.assertLess(p._priority_tier(low, {"available": True, "reached": False}),
+                        p._priority_tier(p._task_configs["1"], {"available": False}))
+
+    def test_stale_novice_does_not_beat_verified_low_ratio(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1).novice = True
+        self.add_task(2)
+        p._build_site_ratio_status = lambda task, *args: {
+            "available": True, "stale": task.site_id == 1, "reached": False}
+        self.assertEqual(p._select_rotation_site({}, 100), 2)
+
+    def test_verified_novice_still_precedes_other_unmet_sites(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1).novice = True
+        self.add_task(2)
+        p._build_site_ratio_status = lambda task, *args: {
+            "available": True, "reached": False, "deficit_fraction": .9 if task.site_id == 2 else .2}
+        self.assertEqual(p._select_rotation_site({}, 100), 1)
 
     def test_unmet_priority_then_configured_round_robin_preserves_records(self):
         p = self.plugin
