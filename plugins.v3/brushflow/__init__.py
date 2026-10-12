@@ -256,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.2"
+    plugin_version = "7.2.3"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -1265,9 +1265,9 @@ class BrushFlow(_PluginBase):
             "seeding_size": self.__calculate_seeding_torrents_size(torrents),
             "site_ratio": site_ratio,
             "priority": self._priority_tier(task, site_ratio),
-            "priority_reason": "新手考核" if self._novice_active(task) else (
-                "账号数据待刷新" if not site_ratio.get("available") or site_ratio.get("stale")
-                else "分享率未达标" if not site_ratio.get("reached") else "普通轮转"),
+            "priority_reason": "账号数据待刷新" if not site_ratio.get("available") or site_ratio.get("stale") else (
+                ("新手考核" if self._novice_active(task) else "分享率未达标")
+                if not site_ratio.get("reached") else "普通轮转"),
             "ratio_deficit_bytes": site_ratio.get("deficit_bytes"),
             "metrics": self._get_task_data(task_id, "metrics") or {},
             "novice": self._novice_active(task),
@@ -1373,11 +1373,11 @@ class BrushFlow(_PluginBase):
             return False
 
     def _priority_tier(self, task: BrushTaskConfig, status: dict) -> int:
-        """考核优先，其次未达目标分享率，其余站点轮转。"""
-        if self._novice_active(task):
-            return 0
-        if status.get("available") and not status.get("stale") and task.site_ratio_target and not status.get("reached"):
-            return 1
+        """有效未达标站优先；缺失或陈旧数据不参与风险排序。"""
+        if not status.get("available") or status.get("stale"):
+            return 3
+        if task.site_ratio_target and not status.get("reached"):
+            return 0 if self._novice_active(task) else 1
         return 2
 
     def _sample_transfers(self) -> None:
@@ -1578,12 +1578,14 @@ class BrushFlow(_PluginBase):
         ratios = {task.id: self._build_site_ratio_status(task, site_data) for task in eligible}
         unmet = [task for task in eligible if not (ratios[task.id].get("available")
                  and not ratios[task.id].get("stale") and ratios[task.id].get("reached"))]
+        verified_unmet = [task for task in unmet if ratios[task.id].get("available") and not ratios[task.id].get("stale")]
+        unmet = verified_unmet or unmet
         phase = "ratio" if unmet else "round_robin"
         if phase == "round_robin" and state.get("phase") == "ratio":
             visited = []
         current = next((task for task in eligible if task.site_id == state.get("site_id")), None)
         deadline = BrushTaskConfig._parse_number(state.get("deadline_at")) or 0
-        if current and (state.get("retry_at") or (phase == "ratio" and current.site_id in {task.site_id for task in unmet}
+        if current and ((state.get("retry_at") and (not verified_unmet or current in verified_unmet)) or (phase == "ratio" and current.site_id in {task.site_id for task in unmet}
                 and state.get("phase") == "ratio") or
                 (phase == "round_robin" and state.get("phase") != "ratio" and deadline > now)):
             return current.site_id
