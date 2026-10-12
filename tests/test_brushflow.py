@@ -1538,6 +1538,69 @@ class BrushFlowRuntimeTests(unittest.TestCase):
             self.assertEqual(metrics["downloading"], 0)
             self.assertEqual(metrics["queued"], 0)
 
+    def test_shared_hash_metrics_count_once_and_sample_every_reference(self):
+        for state, count_field, progress in (("uploading", "seeding", 1),
+                                             ("downloading", "downloading", 0.5),
+                                             ("queuedDL", "queued", 0.5),
+                                             ("stoppedDL", "paused", 0.5)):
+            with self.subTest(state=state):
+                self.setUp()
+                for tid in (1, 2):
+                    self.add_task(tid, downloader="qb")
+                    self.data[f"task.{tid}.torrents"] = {"shared": {"deleted": False}}
+                row = {"hash": "shared", "state": state, "progress": progress,
+                       "uploaded": 100, "downloaded": 1000, "upspeed": 1200,
+                       "dlspeed": 300 if state == "downloading" else 0}
+                self.rows["qb"] = [row]
+                for at, uploaded, downloaded in ((1000, 100, 1000), (1030, 700, 1900)):
+                    row.update(uploaded=uploaded, downloaded=downloaded)
+                    with patch.object(self.ns["time"], "time", return_value=at):
+                        self.plugin._sample_transfers()
+                metrics = self.data["metrics"]
+                self.assertEqual(metrics["uploaded"], 600)
+                self.assertEqual(metrics["downloaded"], 900)
+                self.assertEqual(metrics["upspeed"], 1200)
+                self.assertEqual(metrics["dlspeed"], row["dlspeed"])
+                for field in ("downloading", "queued", "seeding", "paused"):
+                    self.assertEqual(metrics[field], int(field == count_field))
+                self.assertFalse(metrics["gap"])
+                self.assertFalse(metrics["partial"])
+                for tid in (1, 2):
+                    sample = self.data[f"task.{tid}.torrents"]["shared"]["transfer_sample"]
+                    self.assertEqual((sample["at"], sample["uploaded"], sample["downloaded"]),
+                                     (1030, 700, 1900))
+
+    def test_deleted_reference_does_not_hide_current_shared_hash_counts(self):
+        for tid in (1, 2):
+            self.add_task(tid, downloader="qb")
+            self.data[f"task.{tid}.torrents"] = {"shared": {"deleted": tid == 1, "deleted_time": 1000}}
+        self.rows["qb"] = [{"hash": "shared", "state": "uploading", "progress": 1,
+                            "uploaded": 100, "downloaded": 1000, "upspeed": 1200}]
+        with patch.object(self.ns["time"], "time", return_value=1030):
+            self.plugin._sample_transfers()
+        self.assertEqual(self.data["task.1.metrics"]["seeding"], 0)
+        self.assertEqual(self.data["task.2.metrics"]["seeding"], 1)
+        self.assertEqual(self.data["metrics"]["seeding"], 1)
+        self.assertEqual(self.data["metrics"]["upspeed"], 1200)
+
+    def test_same_hash_in_different_downloaders_keeps_each_physical_torrent(self):
+        self.add_task(1, downloader="qb")
+        self.add_task(2, downloader="tb")
+        for tid in (1, 2):
+            self.data[f"task.{tid}.torrents"] = {"shared": {"deleted": False}}
+        self.rows["qb"] = [{"hash": "shared", "state": "uploading", "progress": 1,
+                            "uploaded": 100, "downloaded": 1000, "upspeed": 1200}]
+        self.rows["tb"] = [SimpleNamespace(hashString="shared", status="seeding", percent_done=1,
+                                           uploaded_ever=100, downloaded_ever=1000, rate_upload=1200)]
+        for at, uploaded in ((1000, 100), (1030, 700)):
+            self.rows["qb"][0]["uploaded"] = uploaded
+            self.rows["tb"][0].uploaded_ever = uploaded
+            with patch.object(self.ns["time"], "time", return_value=at):
+                self.plugin._sample_transfers()
+        self.assertEqual(self.data["metrics"]["seeding"], 2)
+        self.assertEqual(self.data["metrics"]["upspeed"], 2400)
+        self.assertEqual(self.data["metrics"]["uploaded"], 1200)
+
     def test_empty_downloader_snapshot_preserves_known_zero_counts(self):
         self.add_task(1)
         self.plugin._sample_transfers()

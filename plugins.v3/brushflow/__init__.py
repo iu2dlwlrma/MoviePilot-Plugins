@@ -256,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.7"
+    plugin_version = "7.2.8"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -1402,6 +1402,7 @@ class BrushFlow(_PluginBase):
         now = time.time()
         all_metrics = []
         seen = set()
+        current_seen = set()
         current_fields = ("upspeed", "dlspeed", "downloading", "queued", "seeding", "paused")
         for task in self._task_configs.values():
             metrics = {"sampled_at": now, "seconds": 0, "uploaded": 0, "downloaded": 0,
@@ -1433,18 +1434,20 @@ class BrushFlow(_PluginBase):
                         if row is not None and not record.get("deleted"):
                             info = self.__get_torrent_info(row)
                             update_transfer_sample(record, info, now)
-                            metrics["upspeed"] += info.get("upspeed", 0)
-                            metrics["dlspeed"] += info.get("dlspeed", 0)
-                            if info["state"] in {"stopped", "stoppeddl", "pauseddl", "pausedup", "stoppedup"}:
-                                metrics["paused"] += 1
-                            elif info["completed"]:
-                                metrics["seeding"] += 1
-                            elif info["is_downloading"]:
-                                metrics["downloading"] += 1
-                            elif info["state"] in {"download pending", "queueddl"}:
-                                metrics["queued"] += 1
-                            else:
-                                metrics["paused"] += 1
+                            if (task.downloader, torrent_hash) not in current_seen:
+                                current_seen.add((task.downloader, torrent_hash))
+                                metrics["upspeed"] += info.get("upspeed", 0)
+                                metrics["dlspeed"] += info.get("dlspeed", 0)
+                                if info["state"] in {"stopped", "stoppeddl", "pauseddl", "pausedup", "stoppedup"}:
+                                    metrics["paused"] += 1
+                                elif info["completed"]:
+                                    metrics["seeding"] += 1
+                                elif info["is_downloading"]:
+                                    metrics["downloading"] += 1
+                                elif info["state"] in {"download pending", "queueddl"}:
+                                    metrics["queued"] += 1
+                                else:
+                                    metrics["paused"] += 1
                         window = transfer_window(record, now)
                         if record.get("deleted") and now - (record.get("deleted_time") or 0) > 1800:
                             continue
