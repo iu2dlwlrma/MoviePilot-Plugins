@@ -71,7 +71,8 @@ class BrushFlowTests(unittest.TestCase):
         self.site_test = Mock(return_value=(True, ""))
         self.ns["SiteChain"] = lambda: SimpleNamespace(test=self.site_test)
         self.candidates = {}
-        self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=lambda domain: self.candidates.get(domain, []))
+        self.ns["TorrentsChain"] = lambda: SimpleNamespace(
+            browse=lambda domain, page=0: self.candidates.get(domain, []) if page == 0 else [])
         p._validate_task_reference = lambda *args, **kwargs: True
         p._evaluate_site_ratio_control = lambda *args, **kwargs: (True, None, {"enabled": False})
         p._BrushFlow__get_subscribe_titles = lambda: set()
@@ -380,6 +381,184 @@ class BrushFlowTests(unittest.TestCase):
         self.assertEqual(self.added, ["6"] * 3)
         self.assertNotIn("6", self.plugin._pending_brush)
 
+    def test_queue_above_sixteen_allows_additions_but_fifty_completed_blocks(self):
+        task = self.add_task(1, downloader="qb")
+        self.data["download_budget.qb"] = {"applied": 8, "ceiling": 8}
+        self.rows["qb"] = [{"hash": f"queued-{i}", "progress": 0, "state": "queuedDL", "tags": "site-1"}
+                            for i in range(17)]
+        self.queue(task)
+        self.plugin._dispatch_brush()
+        self.assertEqual(self.added, ["1"] * 3)
+        self.rows["qb"] += [{"hash": f"complete-{i}", "progress": 1, "state": "stalledUP", "tags": "site-1"}
+                             for i in range(50)]
+        self.added.clear()
+        self.queue(task)
+        self.plugin._dispatch_brush()
+        self.assertEqual(self.added, [])
+        report = self.plugin._get_task_data(task.id, "runs")[0]
+        self.assertEqual(report["result"], "precondition_blocked")
+        self.assertTrue(any("50" in reason for reason in report["reason_counts"]))
+
+    def test_paged_candidates_are_deduplicated_before_subscription_and_selection_filters(self):
+        task = self.add_task(1)
+        task.except_subscribe = True
+        first, second, rejected = self.candidates["1"]
+        rejected.allowed = False
+        subscribed = SimpleNamespace(title="subscribed", description="", size=100, pubdate="0", allowed=True)
+        duplicate = copy.copy(first)
+        first.page_url = duplicate.page_url = "detail-one"
+        duplicate.title = "same-resource"
+        browse = Mock(side_effect=[[first], [duplicate, second, subscribed, rejected], []])
+        self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=browse)
+        subscriptions = Mock(side_effect=lambda torrents, titles: [t for t in torrents if t.title != "subscribed"])
+        self.plugin._BrushFlow__filter_torrents_contains_subscribe = subscriptions
+        self.queue(task)
+        self.plugin._dispatch_brush()
+        self.assertEqual([call.kwargs for call in browse.call_args_list],
+                         [{"domain": "1"}, {"domain": "1", "page": 1}, {"domain": "1", "page": 2}])
+        self.assertEqual(sum(len(call.args[0]) for call in subscriptions.call_args_list), 4)
+        report = self.plugin._get_task_data(task.id, "runs")[0]
+        self.assertEqual(report["source_count"], 4)
+        self.assertEqual(report["subscription_excluded"], 1)
+        self.assertEqual(report["candidate_count"], 3)
+        self.assertEqual(report["added_titles"], [first.title, second.title])
+        self.assertEqual(report["reason_counts"]["筛选不匹配"], 1)
+
+    def test_paged_same_title_candidates_keep_eligible_second_page_resource(self):
+        for page_urls in ((None, None), ("detail-one", "detail-two")):
+            with self.subTest(page_urls=page_urls):
+                self.setUp()
+                task = self.add_task(1)
+                common = {"title": "same-title", "description": "", "site_name": "one", "size": 100,
+                          "downloadvolumefactor": 0, "uploadvolumefactor": 1, "hit_and_run": False,
+                          "seeders": 10, "freedate": None, "pubdate": datetime.now().astimezone().isoformat()}
+                first = SimpleNamespace(**common, peers=0, page_url=page_urls[0])
+                second = SimpleNamespace(**common, peers=5, page_url=page_urls[1])
+                browse = Mock(side_effect=[[first], [second], []])
+                self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=browse)
+                self.plugin._BrushFlow__evaluate_conditions_for_brush = self.cls._BrushFlow__evaluate_conditions_for_brush.__get__(self.plugin)
+                download = Mock(side_effect=self.plugin._BrushFlow__download)
+                self.plugin._BrushFlow__download = download
+                self.queue(task)
+                self.plugin._dispatch_brush()
+                report = self.plugin._get_task_data(task.id, "runs")[0]
+                self.assertEqual(report["source_count"], 2)
+                self.assertEqual(report["added_count"], 1)
+                download.assert_called_once_with(second)
+
+    def test_three_pages_are_read_only_after_the_previous_candidates_are_consumed(self):
+        task = self.add_task(1)
+        pages = [[SimpleNamespace(title=f"p{page}-{item}", page_url=f"detail-{page}-{item}",
+                                 description="", size=100, pubdate="0", allowed=True)
+                  for item in range(2)] for page in range(3)]
+
+        def browse(domain, page=0):
+            self.assertEqual(len(self.added), page * 2)
+            return pages[page] if page < len(pages) else []
+
+        source = Mock(side_effect=browse)
+        self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=source)
+        self.queue(task)
+        self.plugin._dispatch_brush()
+        report = self.plugin._get_task_data(task.id, "runs")[0]
+        self.assertEqual(source.call_count, 4)
+        self.assertEqual(report["source_count"], 6)
+        self.assertEqual(report["added_count"], 6)
+        self.assertTrue(report["success"])
+        self.site_test.assert_not_called()
+        self.assertFalse(hasattr(self.plugin._task_context, "source_pages"))
+
+    def test_repeated_pages_stop_without_deduplicating_titles(self):
+        for identity in ("page_url", "enclosure", None):
+            with self.subTest(identity=identity):
+                self.setUp()
+                task = self.add_task(1)
+                first = self.candidates["1"][0]
+                repeated = copy.copy(first)
+                if identity:
+                    setattr(first, identity, "same-resource")
+                    setattr(repeated, identity, "same-resource")
+                    repeated.title = "renamed-resource"
+                source = Mock(side_effect=[[first], [repeated]])
+                self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=source)
+                self.queue(task)
+                self.plugin._dispatch_brush()
+                self.assertEqual(source.call_count, 2)
+                self.assertEqual(self.added, ["1"])
+                report = self.plugin._get_task_data(task.id, "runs")[0]
+                self.assertEqual(report["source_count"], 1)
+                self.assertFalse(report["reason_counts"].get("后续页面读取失败，本轮使用已取得资源"))
+
+    def test_capacity_or_completed_retention_stops_before_fetching_another_page(self):
+        for constraint in ("global_space", "site_space", "completed"):
+            with self.subTest(constraint=constraint):
+                self.setUp()
+                task = self.add_task(1, downloader="qb")
+                first = self.candidates["1"][0]
+                if constraint == "global_space":
+                    self.plugin._global_disksize = first.size / 1024 ** 3
+                elif constraint == "site_space":
+                    task.disksize = first.size / 1024 ** 3
+                else:
+                    self.plugin._site_completed_count = lambda site: 50 if self.added else 49
+                source = Mock(return_value=[first])
+                self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=source)
+                self.queue(task)
+                self.plugin._dispatch_brush()
+                source.assert_called_once_with(domain="1")
+                self.assertEqual(self.added, ["1"])
+                report = self.plugin._get_task_data(task.id, "runs")[0]
+                self.assertEqual(report["result"], "precondition_blocked")
+
+    def test_first_page_exception_uses_source_failure_retry_without_private_text(self):
+        task = self.add_task(1)
+        self.plugin._rotation_mode = "sequential"
+        self.data["site_rotation"] = {"site_id": 1, "health_checked": True, "phase": "ratio"}
+        source = Mock(side_effect=RuntimeError("private endpoint"))
+        self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=source)
+        self.queue(task)
+        with patch.object(self.ns["time"], "time", return_value=100):
+            self.plugin._dispatch_brush()
+        report = self.plugin._get_task_data(task.id, "runs")[0]
+        self.assertFalse(report["success"])
+        self.assertEqual(report["result"], "source_unavailable")
+        self.assertEqual(self.data["site_rotation"]["retry_at"], 700)
+        self.assertNotIn("private", str(report))
+        self.assertNotIn("private", str(self.ns["logger"].mock_calls))
+
+    def test_second_page_failure_or_empty_result_keeps_first_page(self):
+        for second in (None, RuntimeError("private endpoint")):
+            with self.subTest(second=type(second).__name__):
+                self.setUp()
+                task = self.add_task(1)
+                first = self.candidates["1"][0]
+                browse = Mock(side_effect=[[first], second])
+                self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=browse)
+                self.queue(task)
+                self.plugin._dispatch_brush()
+                report = self.plugin._get_task_data(task.id, "runs")[0]
+                self.assertEqual(browse.call_count, 2)
+                self.assertTrue(report["success"])
+                self.assertEqual(report["source_count"], 1)
+                self.assertEqual(report["added_titles"], [first.title])
+                self.assertEqual(report["result"], "completed")
+                self.assertIsNone(report["error"])
+                self.site_test.assert_not_called()
+                self.assertFalse(self.data.get("site_rotation", {}).get("retry_at"))
+                self.assertNotIn("private endpoint", str(self.ns["logger"].mock_calls))
+
+    def test_rss_candidates_do_not_request_another_page(self):
+        task = self.add_task(1)
+        task.rss_support = True
+        rss = Mock(return_value=self.candidates["1"])
+        browse = Mock()
+        self.ns["TorrentsChain"] = lambda: SimpleNamespace(rss=rss, browse=browse)
+        self.queue(task)
+        self.plugin._dispatch_brush()
+        rss.assert_called_once_with(domain="1")
+        browse.assert_not_called()
+        self.assertEqual(self.added, ["1"] * 3)
+
     def test_unfinished_states_and_seeding_do_not_depend_on_status_spelling(self):
         for state in ["download pending", "download_pending", "stopped", "checking", "downloading"]:
             with self.subTest(state=state):
@@ -645,9 +824,9 @@ class BrushFlowTests(unittest.TestCase):
             p._select_rotation_site({})
             clock.return_value += 86399
 
-            def browse(domain):
+            def browse(domain, page=0):
                 clock.return_value += 2
-                return self.candidates[domain]
+                return self.candidates[domain] if page == 0 else []
 
             self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=browse)
             self.queue(task)
@@ -1623,6 +1802,53 @@ class BrushFlowRuntimeTests(unittest.TestCase):
             self.plugin._adjust_download_budget(client, rows, "tb")
         client.set_session.assert_not_called()
         self.assertEqual(session.download_queue_size, 4)
+
+    def test_full_download_bandwidth_and_low_upload_grow_budget_to_user_ceiling(self):
+        client, session, rows = self.budget_client()
+        session.download_queue_size = 4
+        self.data["download_budget.tb"] = {"ceiling": 8, "applied": 4, "changed_at": 100}
+        for at, expected in ((1000, 5), (1299, 5), (1300, 6), (1600, 7), (1900, 8), (2200, 8)):
+            self.data["task.1.metrics"] = {
+                "sampled_at": at, "seconds": 600, "uploaded": 200000 * 600, "downloaded": 10000000 * 600,
+                "downloading": 4, "queued": 6, "gap": False, "partial": False,
+            }
+            with patch.object(self.ns["time"], "time", return_value=at):
+                self.plugin._adjust_download_budget(client, rows, "tb")
+            self.assertEqual(session.download_queue_size, expected)
+            self.assertEqual(self.data["download_budget.tb"]["ceiling"], 8)
+        client.stop_torrent.assert_not_called()
+        client.start_torrent.assert_not_called()
+        self.assertTrue(all(set(call.kwargs) == {"download_queue_size"} for call in client.set_session.call_args_list))
+
+    def test_budget_keeps_upload_pressure_and_complete_sample_guards(self):
+        for scenario, expected in (("upload_full", 3), ("no_upload_limit", 4), ("short_window", 4),
+                                   ("gap", 4), ("partial", 4), ("stale", 4), ("global_partial", 4)):
+            with self.subTest(scenario=scenario):
+                self.setUp()
+                client, session, rows = self.budget_client()
+                session.download_queue_size = 4
+                self.data["download_budget.tb"] = {"ceiling": 8, "applied": 4, "changed_at": 100}
+                metrics = {"sampled_at": 1000, "seconds": 600,
+                           "uploaded": 200000 * 600, "downloaded": 10000000 * 600,
+                           "downloading": 4, "queued": 6, "gap": False, "partial": False}
+                if scenario == "upload_full":
+                    metrics["uploaded"] = 2250000 * 600
+                elif scenario == "no_upload_limit":
+                    session.speed_limit_up_enabled = False
+                elif scenario == "short_window":
+                    metrics["seconds"] = 299
+                elif scenario == "stale":
+                    metrics["sampled_at"] = 900
+                elif scenario == "global_partial":
+                    self.data["metrics"] = {"partial": True}
+                else:
+                    metrics[scenario] = True
+                self.data["task.1.metrics"] = metrics
+                with patch.object(self.ns["time"], "time", return_value=1000):
+                    self.plugin._adjust_download_budget(client, rows, "tb")
+                self.assertEqual(session.download_queue_size, expected)
+                client.stop_torrent.assert_not_called()
+                client.start_torrent.assert_not_called()
 
     def test_locked_station_does_not_reuse_old_metrics_for_budget_growth(self):
         client, session, rows = self.budget_client()
