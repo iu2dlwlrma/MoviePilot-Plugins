@@ -256,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.10"
+    plugin_version = "7.2.11"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -1936,7 +1936,7 @@ class BrushFlow(_PluginBase):
             if complete and up_limit and upload >= up_limit * 1000 * .9:
                 budget = max(min(2, ceiling), limit - 1)
                 reason = "上传已接近预算，减少新增下载竞争"
-            elif complete and demand > limit and (up_limit or not down_limit or download < down_limit * 1000 * .85):
+            elif complete and demand > limit and (not down_limit or download < down_limit * 1000 * .85):
                 budget = min(ceiling, limit + 1)
                 reason = "有排队需求且带宽有余量，增加一个名额"
             state["changed_at"] = now
