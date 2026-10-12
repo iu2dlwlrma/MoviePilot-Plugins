@@ -256,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.5"
+    plugin_version = "7.2.6"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -1398,19 +1398,23 @@ class BrushFlow(_PluginBase):
         now = time.time()
         all_metrics = []
         seen = set()
+        current_fields = ("upspeed", "dlspeed", "downloading", "queued", "seeding", "paused")
         for task in self._task_configs.values():
+            metrics = {"sampled_at": now, "seconds": 0, "uploaded": 0, "downloaded": 0,
+                       "upspeed": 0, "dlspeed": 0, "downloading": 0, "queued": 0,
+                       "seeding": 0, "paused": 0, "gap": False, "partial": False}
             task_lock = self._task_locks.setdefault(task.id, threading.Lock())
             if not task_lock.acquire(blocking=False):
-                all_metrics.append({"seconds": 0, "uploaded": None, "downloaded": None,
-                                    "gap": True, "partial": True})
+                metrics.update({key: None for key in current_fields})
+                metrics.update(uploaded=None, downloaded=None, gap=True, partial=True, reason="等待下一次采样")
+                self._save_task_data(task.id, "metrics", metrics)
+                all_metrics.append(metrics)
                 continue
             try:
                 records = self._get_task_data(task.id, "torrents") or {}
-                metrics = {"sampled_at": now, "seconds": 0, "uploaded": 0, "downloaded": 0,
-                           "upspeed": 0, "dlspeed": 0, "downloading": 0, "queued": 0,
-                           "seeding": 0, "paused": 0, "gap": False, "partial": False}
                 if task.downloader not in snapshot:
-                    metrics.update(uploaded=None, downloaded=None, gap=True, reason="下载器不可用")
+                    metrics.update({key: None for key in current_fields})
+                    metrics.update(uploaded=None, downloaded=None, gap=True, partial=True, reason="下载器不可用")
                     self._save_task_data(task.id, "metrics", metrics)
                     all_metrics.append(metrics)
                     continue
@@ -1463,7 +1467,9 @@ class BrushFlow(_PluginBase):
                 task_lock.release()
         if all_metrics:
             aggregate = {key: sum(item.get(key) or 0 for item in all_metrics)
-                         for key in ("uploaded", "downloaded", "upspeed", "dlspeed", "downloading", "queued", "seeding", "paused")}
+                         for key in ("uploaded", "downloaded")}
+            aggregate.update({key: None if any(item.get(key) is None for item in all_metrics)
+                              else sum(item[key] for item in all_metrics) for key in current_fields})
             aggregate.update(sampled_at=now, seconds=max(item["seconds"] for item in all_metrics),
                              gap=any(item["gap"] for item in all_metrics),
                              partial=any(item.get("partial") or item["uploaded"] is None for item in all_metrics))
@@ -2360,7 +2366,7 @@ class BrushFlow(_PluginBase):
             if deadline and deadline <= datetime.now().astimezone():
                 return False, "促销剩余时间不足"
             metrics = self._get_task_data(task.id, "metrics") or {}
-            per_torrent_speed = (metrics.get("downloaded") or 0) / max(metrics.get("seconds", 0), 1) / max(metrics.get("downloading", 0), 1)
+            per_torrent_speed = (metrics.get("downloaded") or 0) / max(metrics.get("seconds", 0), 1) / max(metrics.get("downloading") or 0, 1)
             if deadline and metrics.get("seconds", 0) >= 300 and not metrics.get("gap") \
                     and per_torrent_speed > 0 and torrent.size / per_torrent_speed * 1.5 > (deadline - datetime.now().astimezone()).total_seconds():
                 return False, "按近期下载速度预计无法在促销保护时间前完成"
