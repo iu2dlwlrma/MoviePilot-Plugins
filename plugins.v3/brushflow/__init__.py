@@ -256,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.3"
+    plugin_version = "7.2.4"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -1271,7 +1271,8 @@ class BrushFlow(_PluginBase):
             "ratio_deficit_bytes": site_ratio.get("deficit_bytes"),
             "metrics": self._get_task_data(task_id, "metrics") or {},
             "novice": self._novice_active(task),
-            "is_focus": self._is_focus_site(task.site_id),
+            "is_focus": ((self.get_data("site_rotation") or {}).get("site_id") == task.site_id
+                         if getattr(self, "_rotation_mode", "parallel") == "sequential" else self._is_focus_site(task.site_id)),
         }
 
     @staticmethod
@@ -1288,6 +1289,24 @@ class BrushFlow(_PluginBase):
             if domain and domain not in result:
                 result[domain] = row
         return result
+
+    @staticmethod
+    def _site_ratio_values(user_data: Any) -> Optional[Tuple[Optional[float], float, float, bool, bool]]:
+        if not user_data or getattr(user_data, "err_msg", None):
+            return None
+        ratio = BrushTaskConfig._parse_number(getattr(user_data, "ratio", None))
+        upload = BrushTaskConfig._parse_number(getattr(user_data, "upload", None)) or 0
+        download = BrushTaskConfig._parse_number(getattr(user_data, "download", None)) or 0
+        unlimited = float(upload) > 0 and float(download) == 0
+        estimated = (ratio is None or ratio <= 0) and download > 0
+        if estimated:
+            ratio = upload / download
+        # 解析器的全零默认值不能当作真实低分享率。
+        if (ratio is None or ratio == 0) and float(upload) <= 0 and float(download) <= 0:
+            return None
+        if ratio is None and not unlimited:
+            return None
+        return ratio, upload, download, unlimited, estimated
 
     def _build_site_ratio_status(
         self,
@@ -1317,22 +1336,10 @@ class BrushFlow(_PluginBase):
             site_user_data_by_domain = self._latest_site_user_data_by_domain()
         domain = StringUtils.get_url_domain(getattr(site, "domain", None))
         user_data = site_user_data_by_domain.get(domain)
-        if not user_data:
+        values = self._site_ratio_values(user_data)
+        if values is None:
             return status
-        if getattr(user_data, "err_msg", None):
-            return status
-        ratio = BrushTaskConfig._parse_number(getattr(user_data, "ratio", None))
-        upload = BrushTaskConfig._parse_number(getattr(user_data, "upload", None)) or 0
-        download = BrushTaskConfig._parse_number(getattr(user_data, "download", None)) or 0
-        unlimited = float(upload) > 0 and float(download) == 0
-        if (ratio is None or ratio <= 0) and download > 0:
-            ratio = upload / download
-            status["estimated"] = True
-        # 站点响应不完整时解析器会保留三个字段的零值，不能把它当成真实低分享率。
-        if (ratio is None or ratio == 0) and float(upload) <= 0 and float(download) <= 0:
-            return status
-        if ratio is None and not unlimited:
-            return status
+        ratio, upload, download, unlimited, estimated = values
         updated_day = getattr(user_data, "updated_day", None)
         updated_time = getattr(user_data, "updated_time", None)
         status.update(
@@ -1340,6 +1347,7 @@ class BrushFlow(_PluginBase):
                 "current": None if unlimited else float(ratio),
                 "available": True,
                 "unlimited": unlimited,
+                "estimated": estimated,
                 "reached": unlimited or bool(task.site_ratio_target and float(ratio) >= float(task.site_ratio_target)),
                 "deficit_bytes": max(float(task.site_ratio_target or 0) * download - upload, 0),
                 "download_headroom": max(upload / float(task.site_ratio_target or 1) - download, 0),
@@ -1561,7 +1569,8 @@ class BrushFlow(_PluginBase):
         tasks = [task for task in self._task_configs.values() if task.enabled]
         site_ids = {task.site_id for task in tasks}
         state = self.get_data("site_rotation") or {}
-        cooldowns = {sid: until for sid, until in state.get("retry_cooldowns", {}).items() if until > now}
+        cooldowns = {str(sid): until for sid, until in state.get("retry_cooldowns", {}).items()
+                     if str(sid) in {str(site_id) for site_id in site_ids}}
         if not tasks:
             if state:
                 self.save_data("site_rotation", {})
@@ -1569,13 +1578,22 @@ class BrushFlow(_PluginBase):
         visited = [sid for sid in state.get("visited_site_ids", []) if sid in site_ids]
         for task in tasks:
             refresh = self.get_data(f"ratio_refresh.{task.site_id}") or {}
-            if refresh.get("failures", 0) >= 5 and refresh.get("next_attempt", 0) > now:
+            if refresh.get("failures", 0) >= 6 and refresh.get("next_attempt", 0) > now:
                 cooldowns[str(task.site_id)] = refresh["next_attempt"]
-        eligible = [task for task in tasks if str(task.site_id) not in cooldowns]
+        eligible = [task for task in tasks if cooldowns.get(str(task.site_id), 0) <= now]
         if not eligible:
             self.save_data("site_rotation", {"visited_site_ids": visited, "retry_cooldowns": cooldowns})
             return None
         ratios = {task.id: self._build_site_ratio_status(task, site_data) for task in eligible}
+        current = next((task for task in eligible if task.site_id == state.get("site_id")), None)
+        deadline = BrushTaskConfig._parse_number(state.get("deadline_at")) or 0
+        current_unmet = current and any(not (ratios[task.id].get("available") and not ratios[task.id].get("stale")
+                                            and ratios[task.id].get("reached"))
+                                       for task in eligible if task.site_id == current.site_id)
+        if current and (state.get("retry_at") or (state.get("phase") == "ratio" and current_unmet)
+                        or (state.get("phase") != "ratio" and deadline > now)):
+            # 已跳过的站点到期后可重试，但不能抢回仍在驻留的其他站。
+            eligible = [task for task in eligible if task.site_id == current.site_id or str(task.site_id) not in cooldowns]
         unmet = [task for task in eligible if not (ratios[task.id].get("available")
                  and not ratios[task.id].get("stale") and ratios[task.id].get("reached"))]
         verified_unmet = [task for task in unmet if ratios[task.id].get("available") and not ratios[task.id].get("stale")]
@@ -1583,8 +1601,6 @@ class BrushFlow(_PluginBase):
         phase = "ratio" if unmet else "round_robin"
         if phase == "round_robin" and state.get("phase") == "ratio":
             visited = []
-        current = next((task for task in eligible if task.site_id == state.get("site_id")), None)
-        deadline = BrushTaskConfig._parse_number(state.get("deadline_at")) or 0
         if current and ((state.get("retry_at") and (not verified_unmet or current in verified_unmet)) or (phase == "ratio" and current.site_id in {task.site_id for task in unmet}
                 and state.get("phase") == "ratio") or
                 (phase == "round_robin" and state.get("phase") != "ratio" and deadline > now)):
@@ -1597,6 +1613,7 @@ class BrushFlow(_PluginBase):
             self._priority_tier(task, ratios[task.id]), -(ratios[task.id].get("deficit_fraction") or 0),
             tasks.index(task),
         )) if unmet else remaining[0]
+        cooldowns.pop(str(selected.site_id), None)
         self.save_data("site_rotation", {
             "site_id": selected.site_id,
             "started_at": now,
@@ -1632,12 +1649,12 @@ class BrushFlow(_PluginBase):
                 site = SiteOper().get(site_id)
                 indexer = SitesHelper().get_indexer(site.domain) if site else None
                 data = SiteChain().refresh_userdata(site=indexer) if indexer else None
-                success = bool(data and getattr(data, "userid", None) and not getattr(data, "err_msg", None))
+                success = bool(data and getattr(data, "userid", None) and self._site_ratio_values(data) is not None)
             except Exception:
                 logger.warning("当前刷流站账号数据刷新失败，等待重试")
             failures = 0 if success else refresh.get("failures", 0) + 1
             self.save_data(key, {"success": success, "failures": failures, "checked_at": time.time(),
-                                "next_attempt": time.time() + (1800 if success else 3600 if failures >= 5 else 600)})
+                                "next_attempt": time.time() + (1800 if success else 3600 if failures >= 6 else 600)})
 
         try:
             ThreadHelper().submit(refresh_account)

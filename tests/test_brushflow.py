@@ -935,6 +935,67 @@ class BrushFlowRatioRotationTests(unittest.TestCase):
             "available": True, "reached": False, "deficit_fraction": .9 if task.site_id == 2 else .2}
         self.assertEqual(p._select_rotation_site({}, 100), 1)
 
+    def test_failed_site_does_not_reclaim_unknown_focus_after_cooldown(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        for site_id in (1, 2, 3):
+            self.add_task(site_id)
+        available = {1}
+        reached = set()
+        p._build_site_ratio_status = lambda task, *args: {
+            "available": task.site_id in available, "reached": task.site_id in reached,
+            "deficit_fraction": .9 if task.site_id == 1 else .5}
+        p._select_rotation_site({}, 100)
+        self.site_test.return_value = (False, "")
+        for now in range(100, 3101, 600):
+            p._check_rotation_site(now)
+        self.assertEqual(p._select_rotation_site({}, 3101), 2)
+        self.site_test.return_value = (True, "")
+        self.assertTrue(p._check_rotation_site(3101))
+        self.assertEqual(p._select_rotation_site({}, 3700), 2)
+        self.assertEqual(p._select_rotation_site({}, 4300), 2)
+        available.add(3)
+        self.assertEqual(p._select_rotation_site({}, 4301), 3)
+        reached.add(3)
+        self.assertEqual(p._select_rotation_site({}, 4302), 1)
+        self.assertNotIn("1", self.data["site_rotation"]["retry_cooldowns"])
+
+    def test_failed_site_does_not_interrupt_healthy_round_robin_dwell(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1)
+        self.add_task(2)
+        p._build_site_ratio_status = lambda task, *args: {
+            "available": True, "reached": task.site_id == 2, "deficit_fraction": .9}
+        self.data["site_rotation"] = {"site_id": 2, "phase": "round_robin", "started_at": 100,
+                                      "deadline_at": 5000, "retry_cooldowns": {"1": 700}}
+        self.assertEqual(p._select_rotation_site({}, 701), 2)
+        self.assertEqual(p._select_rotation_site({}, 5000), 1)
+
+    def test_failed_account_focus_yields_despite_retained_failure_markers(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1)
+        self.add_task(2)
+        p._build_site_ratio_status = lambda task, *args: {
+            "available": task.site_id == 1, "reached": False}
+        self.data["site_rotation"] = {"site_id": 2, "phase": "ratio", "started_at": 100,
+                                      "retry_cooldowns": {"1": 700}}
+        self.data["ratio_refresh.2"] = {"success": False, "failures": 6, "next_attempt": 5000}
+        self.assertEqual(p._select_rotation_site({}, 1000), 1)
+
+    def test_retrying_selected_site_remains_focus_in_status_only(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1)
+        self.add_task(2)
+        self.data["site_rotation"] = {"site_id": 1, "phase": "ratio", "retry_at": 700}
+        p._get_site_name = lambda site_id: str(site_id)
+        p._get_statistic_info = lambda task_id: {}
+        self.assertFalse(p._is_focus_site(1))
+        self.assertTrue(p._task_summary("1")["is_focus"])
+        self.assertFalse(p._task_summary("2")["is_focus"])
+
     def test_unmet_priority_then_configured_round_robin_preserves_records(self):
         p = self.plugin
         p._rotation_mode = "sequential"
@@ -1001,7 +1062,7 @@ class BrushFlowRatioRotationTests(unittest.TestCase):
             status = self.cls._build_site_ratio_status(p, task, {})
             self.assertFalse(status["available"])
             self.assertFalse(status["reached"])
-        fetch.return_value = SimpleNamespace(userid=1, err_msg=None)
+        fetch.return_value = SimpleNamespace(userid=1, err_msg=None, ratio=1, upload=100, download=100)
         with patch.object(self.ns["time"], "time", return_value=700):
             p._refresh_focus_ratio()
             jobs.pop()()
@@ -1014,8 +1075,47 @@ class BrushFlowRatioRotationTests(unittest.TestCase):
         self.add_task(1).novice = True
         self.add_task(2)
         p._select_rotation_site({}, 100)
-        self.data["ratio_refresh.1"] = {"success": False, "failures": 5, "next_attempt": 4000}
+        self.data["ratio_refresh.1"] = {"success": False, "failures": 6, "next_attempt": 4000}
         self.assertEqual(p._select_rotation_site({}, 1000), 2)
+
+    def test_incomplete_account_data_retries_five_times_then_skips(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1)
+        self.add_task(2)
+        self.data["site_rotation"] = {"site_id": 1, "phase": "ratio", "health_checked": True}
+        self.ns["ThreadHelper"] = lambda: SimpleNamespace(submit=lambda job: job())
+        self.ns["SitesHelper"] = lambda: SimpleNamespace(get_indexer=lambda domain: {"id": 1})
+        fetch = Mock(return_value=SimpleNamespace(userid=1, err_msg=None, ratio=0, upload=0, download=0))
+        self.ns["SiteChain"] = lambda: SimpleNamespace(refresh_userdata=fetch)
+        for attempt in range(6):
+            now = 100 + attempt * 600
+            with patch.object(self.ns["time"], "time", return_value=now):
+                p._refresh_focus_ratio()
+                p._refresh_focus_ratio()
+            refresh = self.data["ratio_refresh.1"]
+            self.assertFalse(refresh["success"])
+            self.assertEqual(fetch.call_count, attempt + 1)
+            self.assertEqual(refresh["failures"], attempt + 1)
+            self.assertEqual(refresh["next_attempt"], now + (3600 if attempt == 5 else 600))
+            self.assertEqual(p._select_rotation_site({}, now), 2 if attempt == 5 else 1)
+
+    def test_account_refresh_accepts_same_valid_values_as_ratio_status(self):
+        for values in ({"ratio": 2}, {"ratio": 0, "upload": 0, "download": 100},
+                       {"ratio": None, "upload": 100, "download": 0}):
+            with self.subTest(values=values):
+                self.setUp()
+                p = self.plugin
+                p._rotation_mode = "sequential"
+                self.add_task(1)
+                self.data["site_rotation"] = {"site_id": 1, "phase": "ratio", "health_checked": True}
+                self.ns["ThreadHelper"] = lambda: SimpleNamespace(submit=lambda job: job())
+                self.ns["SitesHelper"] = lambda: SimpleNamespace(get_indexer=lambda domain: {"id": 1})
+                self.ns["SiteChain"] = lambda: SimpleNamespace(refresh_userdata=lambda **kwargs:
+                                                               SimpleNamespace(userid=1, err_msg=None, **values))
+                with patch.object(self.ns["time"], "time", return_value=100):
+                    p._refresh_focus_ratio()
+                self.assertTrue(self.data["ratio_refresh.1"]["success"])
 
     def test_empty_source_distinguishes_connection_failure_from_empty_results(self):
         for healthy in (True, False, None):

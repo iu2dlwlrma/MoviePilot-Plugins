@@ -12,8 +12,9 @@ const _hoisted_3 = {
 };
 const _hoisted_4 = { key: 0 };
 const _hoisted_5 = { key: 1 };
-const _hoisted_6 = { class: "brushflow-dashboard__tasks" };
-const _hoisted_7 = {
+const _hoisted_6 = { key: 2 };
+const _hoisted_7 = { class: "brushflow-dashboard__tasks" };
+const _hoisted_8 = {
   key: 0,
   class: "brushflow-dashboard__empty"
 };
@@ -96,16 +97,18 @@ return (_ctx, _cache) => {
     (sequentialMode.value)
       ? (_openBlock(), _createElementBlock("div", _hoisted_3, [
           _createElementVNode("strong", null, "当前重点站：" + _toDisplayString(status.value.site_rotation?.site_name || '等待选择站点'), 1),
-          (status.value.site_rotation?.phase === 'ratio')
-            ? (_openBlock(), _createElementBlock("span", _hoisted_4, "达标后切换"))
-            : (status.value.site_rotation?.deadline_at)
-              ? (_openBlock(), _createElementBlock("span", _hoisted_5, "预计切换 " + _toDisplayString(_unref(formatDateTime)(status.value.site_rotation.deadline_at)) + " · " + _toDisplayString(Number(status.value.site_rotation.remaining_seconds) > 0 ? '剩余约 ' : '') + _toDisplayString(_unref(formatRemainingTime)(status.value.site_rotation.remaining_seconds)), 1))
-              : _createCommentVNode("", true),
+          (status.value.site_rotation?.retry_at)
+            ? (_openBlock(), _createElementBlock("span", _hoisted_4, "站点连接失败 · 已重试 " + _toDisplayString(status.value.site_rotation.retry_count || 0) + "/5 · 下次 " + _toDisplayString(_unref(formatDateTime)(status.value.site_rotation.retry_at * 1000)), 1))
+            : (status.value.site_rotation?.phase === 'ratio')
+              ? (_openBlock(), _createElementBlock("span", _hoisted_5, "达标后切换"))
+              : (status.value.site_rotation?.deadline_at)
+                ? (_openBlock(), _createElementBlock("span", _hoisted_6, "预计切换 " + _toDisplayString(_unref(formatDateTime)(status.value.site_rotation.deadline_at)) + " · " + _toDisplayString(Number(status.value.site_rotation.remaining_seconds) > 0 ? '剩余约 ' : '') + _toDisplayString(_unref(formatRemainingTime)(status.value.site_rotation.remaining_seconds)), 1))
+                : _createCommentVNode("", true),
           _cache[4] || (_cache[4] = _createElementVNode("span", null, "每次仅当前站新增；全部站点达标后按配置顺序定时轮转。旧种继续下载、做种和按规则清理。", -1))
         ]))
       : _createCommentVNode("", true),
     _createVNode(_component_VDivider),
-    _createElementVNode("div", _hoisted_6, [
+    _createElementVNode("div", _hoisted_7, [
       (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(runningTasks.value, (task) => {
         return (_openBlock(), _createElementBlock("div", {
           key: task.id
@@ -123,7 +126,7 @@ return (_ctx, _cache) => {
         ]))
       }), 128)),
       (!runningTasks.value.length)
-        ? (_openBlock(), _createElementBlock("div", _hoisted_7, [
+        ? (_openBlock(), _createElementBlock("div", _hoisted_8, [
             _createVNode(_component_VIcon, { icon: "mdi-sync-off" }),
             _cache[5] || (_cache[5] = _createTextVNode(" 暂无启用的刷流任务 ", -1))
           ]))
@@ -142,6 +145,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const Dashboard = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-302da393"]]);
+const Dashboard = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-16e5be4a"]]);
 
 export { Dashboard as default };

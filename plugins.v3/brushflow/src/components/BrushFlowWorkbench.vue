@@ -89,8 +89,11 @@ const sortedTasks = computed(() => [...tasks.value].sort((left, right) => {
 const siteRotation = computed(() => status.value.site_rotation || {})
 const sequentialMode = computed(() => (status.value.rotation_mode || siteRotation.value.mode) === 'sequential')
 const ratioPhase = computed(() => siteRotation.value.phase === 'ratio')
+const rotationRetrying = computed(() => sequentialMode.value && Boolean(siteRotation.value.retry_at))
 const selectedTask = computed(() => tasks.value.find(item => item.id === selectedTaskId.value) || null)
-const selectedState = computed(() => taskStateMeta(selectedTask.value?.state, sequentialMode.value && selectedTask.value?.is_focus === false))
+const selectedState = computed(() => isRetryingTask(selectedTask.value)
+  ? { text: '等待站点重试', color: 'warning', icon: 'mdi-refresh' }
+  : taskStateMeta(selectedTask.value?.state, sequentialMode.value && selectedTask.value?.is_focus === false))
 const rawTaskConfig = computed(() => taskDetail.value?.task?.config || taskDetail.value?.task || {})
 const taskConfig = computed(() => taskDetail.value?.effective_config || effectiveTask(rawTaskConfig.value, status.value.global_defaults))
 const priorityText = computed(() => taskPriorityText(selectedTask.value))
@@ -399,7 +402,11 @@ function taskPriorityText(task) {
 }
 
 function hasTaskError(task) {
-  return task.state === 'error' || Boolean(task.last_error) || task.last_run?.success === false || Boolean(task.metrics?.gap)
+  return isRetryingTask(task) || task.state === 'error' || Boolean(task.last_error) || task.last_run?.success === false || Boolean(task.metrics?.gap)
+}
+
+function isRetryingTask(task) {
+  return rotationRetrying.value && task?.enabled && task.site_id === siteRotation.value.site_id
 }
 
 function comparableRatio(task) {
@@ -437,6 +444,7 @@ function sampledTime(value) {
 
 function taskStatusText(task) {
   if (!task.enabled) return '已停止选种与检查'
+  if (isRetryingTask(task)) return `站点连接失败，等待重试（${siteRotation.value.retry_count || 0}/5）`
   if (task.last_error || task.last_run?.success === false) return '运行异常，查看诊断'
   return task.metrics?.reason || taskStateMeta(task.state, sequentialMode.value && task.is_focus === false).text
 }
@@ -542,12 +550,16 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
     <VAlert v-if="statusLoaded && !status.enabled" type="warning" variant="tonal">
       插件当前未启用，任务配置与历史仍可查看，启用后才会注册刷新和检查服务。
     </VAlert>
-    <VAlert v-if="statusLoaded && sequentialMode" type="info" variant="tonal">
+    <VAlert v-if="statusLoaded && sequentialMode" :type="rotationRetrying ? 'warning' : 'info'" variant="tonal">
       <div class="d-flex flex-wrap align-center ga-2 mb-2">
         <strong>当前重点站：{{ siteRotation.site_name || '等待选择站点' }}</strong>
-        <VChip v-if="ratioPhase" size="small" variant="tonal">达标后切换</VChip>
+        <template v-if="rotationRetrying">
+          <VChip size="small" variant="tonal">站点连接失败 · 已重试 {{ siteRotation.retry_count || 0 }}/5</VChip>
+          <span class="text-body-2">下次重试 {{ formatDateTime(siteRotation.retry_at * 1000) }}；五次仍失败后跳过</span>
+        </template>
+        <VChip v-else-if="ratioPhase" size="small" variant="tonal">达标后切换</VChip>
         <VChip v-else-if="siteRotation.deadline_at" size="small" variant="tonal">预计切换 {{ formatDateTime(siteRotation.deadline_at) }}</VChip>
-        <span v-if="!ratioPhase && siteRotation.deadline_at && siteRotation.remaining_seconds != null" class="text-body-2">{{ Number(siteRotation.remaining_seconds) > 0 ? '剩余约 ' : '' }}{{ formatRemainingTime(siteRotation.remaining_seconds) }}</span>
+        <span v-if="!rotationRetrying && !ratioPhase && siteRotation.deadline_at && siteRotation.remaining_seconds != null" class="text-body-2">{{ Number(siteRotation.remaining_seconds) > 0 ? '剩余约 ' : '' }}{{ formatRemainingTime(siteRotation.remaining_seconds) }}</span>
       </div>
       每次仅当前站新增。未达标站按优先级刷至达标，全部达标后按配置顺序定时轮转；旧种继续下载、做种并按删除规则清理。
     </VAlert>
