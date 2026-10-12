@@ -256,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.6"
+    plugin_version = "7.2.7"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -556,9 +556,13 @@ class BrushFlow(_PluginBase):
             try:
                 service = DownloaderHelper().get_service(name=name)
                 tr = getattr(service.instance, "trc", None) if service and service.instance else None
-                if tr and tr.get_session().download_queue_size == state.get("applied"):
+                if not tr:
+                    raise RuntimeError("下载器不可用")
+                if tr.get_session().download_queue_size == state.get("applied"):
                     tr.set_session(download_queue_size=state["ceiling"])
                 self.save_data(key, {})
+                if (self.get_data("download_slots") or {}).get("downloader") == name:
+                    self.save_data("download_slots", {})
             except Exception:
                 logger.warning(f"下载器 {name} 并发设置恢复失败，保留恢复记录")
 
@@ -629,7 +633,7 @@ class BrushFlow(_PluginBase):
         if rotation_mode != getattr(self, "_rotation_mode", "parallel"):
             self.save_data("site_rotation", {})
         self._rotation_mode = rotation_mode
-        if not self._enabled or rotation_mode != "parallel":
+        if not self._enabled:
             self._restore_download_budgets()
         for field in GLOBAL_LIMIT_FIELDS:
             setattr(self, f"_{field}", getattr(payload, field))
@@ -1210,7 +1214,7 @@ class BrushFlow(_PluginBase):
             **{field: getattr(self, f"_{field}", None) for field in GLOBAL_DYNAMIC_DELETE_FIELDS},
             "summary": aggregate,
             "metrics": self.get_data("metrics") or {},
-            "download_slots": (self.get_data("download_slots") or {}) if getattr(self, "_rotation_mode", "parallel") == "parallel" else {},
+            "download_slots": self.get_data("download_slots") or {},
             "tasks": task_rows,
             "options": {"sites": site_options, "downloaders": downloader_options},
         }
@@ -1854,7 +1858,8 @@ class BrushFlow(_PluginBase):
                 for task in tasks:
                     if task.downloader != name or not self._is_focus_site(task.site_id):
                         continue
-                    records = self._get_task_data(task.id, "torrents") or {}
+                    records = {h for h, record in (self._get_task_data(task.id, "torrents") or {}).items()
+                               if not record.get("deleted")}
                     tier = self._priority_tier(task, self._build_site_ratio_status(task, site_data))
                     ratio = self._build_site_ratio_status(task, site_data)
                     rank = (tier, -(ratio.get("deficit_fraction") or 0) if tier == 1 else 0)
@@ -1877,20 +1882,23 @@ class BrushFlow(_PluginBase):
 
     def _adjust_download_budget(self, tr, rows, name: str) -> None:
         """专用刷流下载器在用户上限内小步调整并发，共用下载器不改全局设置。"""
-        if getattr(self, "_stopping", False) or not self.get_state() or getattr(self, "_rotation_mode", "parallel") != "parallel":
+        if getattr(self, "_stopping", False) or not self.get_state():
             return
         session = tr.get_session()
         limit = getattr(session, "download_queue_size", None)
         if session.download_queue_enabled is not True or not isinstance(limit, int) or limit < 1:
             return
         tasks = [task for task in self._task_configs.values() if task.downloader == name]
-        records = {h for task in tasks for h in (self._get_task_data(task.id, "torrents") or {})}
+        records = {h for task in tasks for h, record in (self._get_task_data(task.id, "torrents") or {}).items()
+                   if not record.get("deleted")}
         tags = {task.brush_tag for task in tasks}
         if any(row.hashString not in records and not tags.intersection(row.labels or []) for row in rows):
             state = self.get_data(f"download_budget.{name}") or {}
             if limit == state.get("applied") and state.get("ceiling"):
                 tr.set_session(download_queue_size=state["ceiling"])
             self.save_data(f"download_budget.{name}", {})
+            if (self.get_data("download_slots") or {}).get("downloader") == name:
+                self.save_data("download_slots", {})
             return
         key = f"download_budget.{name}"
         state = self.get_data(key) or {}
@@ -1963,7 +1971,8 @@ class BrushFlow(_PluginBase):
         for task in self._task_configs.values():
             if not task.enabled or task.downloader != name:
                 continue
-            records = self._get_task_data(task.id, "torrents") or {}
+            records = {h for h, record in (self._get_task_data(task.id, "torrents") or {}).items()
+                       if not record.get("deleted")}
             for row in rows:
                 if row.hashString in records or task.brush_tag in (row.labels or []):
                     owner.setdefault(row.hashString, task.site_id)
@@ -2431,7 +2440,9 @@ class BrushFlow(_PluginBase):
         try:
             with self._task_scope(task.id):
                 self._run_check(task, report)
-            report["success"] = report.get("result") not in {"downloader_unavailable", "downloader_error"}
+            report["success"] = report.get("result") not in {"downloader_unavailable", "downloader_error", "delete_failed"}
+            if report.get("error"):
+                self._set_runtime(task.id, last_error=report["error"])
         except Exception as err:
             report.update({"success": False, "error": str(err)})
             self._set_runtime(task.id, last_error=str(err))
@@ -2450,6 +2461,212 @@ class BrushFlow(_PluginBase):
         report["finished_at"] = self._now_iso()
         self._append_run(task.id, report)
         self._set_runtime(task.id, state="idle", operation=None)
+
+    def _remember_delete_reason(self, torrent_hash: str, reason: str) -> None:
+        if not hasattr(self._task_context, "delete_reasons"):
+            self._task_context.delete_reasons = {}
+        self._task_context.delete_reasons[torrent_hash] = reason
+
+    def _select_task_deletions(self, task: BrushTaskConfig, torrents: List[Any], records: dict) -> List[str]:
+        torrents = self.__filter_torrents_by_tag(torrents, task.delete_except_tags)
+        if task.proxy_delete and task.delete_size_range:
+            return self.__delete_torrent_for_proxy(torrents, records)
+        return self.__delete_torrent_for_evaluate_conditions(torrents, records)
+
+    @contextmanager
+    def _shared_delete_scope(self, task: BrushTaskConfig, hashes: List[str], snapshot: dict) -> Iterator[Any]:
+        """共享 Hash 必须满足全部引用任务的规则，忙碌引用本轮保留。"""
+        if not hashes:
+            yield [], []
+            return
+        allowed = set(hashes)
+        associations = []
+        acquired = []
+        reasons = self._task_context.delete_reasons
+        try:
+            for other in self._task_configs.values():
+                if other.id == task.id or other.downloader != task.downloader:
+                    continue
+                records = self._get_task_data(other.id, "torrents") or {}
+                shared = {key for key in allowed if key in records and not records[key].get("deleted")}
+                if not shared:
+                    continue
+                lock = self._task_locks.setdefault(other.id, threading.Lock())
+                if not lock.acquire(blocking=False):
+                    allowed.difference_update(shared)
+                    continue
+                acquired.append(lock)
+                records = self._get_task_data(other.id, "torrents") or {}
+                shared = {key for key in allowed if key in records and not records[key].get("deleted")}
+                with self._task_scope(other.id):
+                    torrents = [snapshot[key] for key in records if key in snapshot and not records[key].get("deleted")]
+                    self.__update_torrent_tasks_state(torrents, records)
+                    self._task_context.delete_reasons = {}
+                    selected = set(self._select_task_deletions(other, torrents, records))
+                    associations.append((other, records, self._task_context.delete_reasons))
+                    allowed.difference_update(shared - selected)
+                    self._task_context.delete_reasons = reasons
+            yield [key for key in hashes if key in allowed], associations
+        finally:
+            self._task_context.delete_reasons = reasons
+            for lock in reversed(acquired):
+                lock.release()
+
+    def _safe_delete_hashes(self, service: Any, torrent_hashes: List[str]) -> List[str]:
+        """从下载器新快照排除与保留任务共享文件或路径不明的删除候选。"""
+        import ntpath
+        import posixpath
+
+        requested = list(dict.fromkeys(torrent_hashes))
+        if not requested:
+            return []
+
+        def value(item, key, default=None):
+            return item.get(key, default) if isinstance(item, dict) else getattr(item, key, default)
+
+        def absolute(path):
+            if not isinstance(path, str) or not path or "\0" in path:
+                return None
+            drive, tail = ntpath.splitdrive(path)
+            if drive:
+                if not tail.startswith(("/", "\\")) and not (drive.startswith(("//", "\\\\")) and not tail):
+                    return None
+                normalized = ntpath.normcase(ntpath.normpath(path)).replace("\\", "/")
+                return ("windows", *(part for part in normalized.split("/") if part))
+            if path.startswith("/"):
+                return ("posix", *(part for part in posixpath.normpath(path).split("/") if part))
+            return None
+
+        def child(root, name):
+            if not root or not isinstance(name, str) or not name or "\0" in name:
+                return None
+            if ntpath.splitdrive(name)[0] or name.startswith(("/", "\\")):
+                return None
+            if root[0] == "posix" and "\\" in name:
+                return None
+            parts = name.replace("\\", "/").split("/")
+            if any(part in ("", ".", "..") for part in parts):
+                return None
+            if root[0] == "windows":
+                parts = [part.casefold() for part in parts]
+            return (*root, *parts)
+
+        def intersects(left, right):
+            a, a_dir = left
+            b, b_dir = right
+            return a == b or (a_dir and b[:len(a)] == a) or (b_dir and a[:len(b)] == b)
+
+        try:
+            helper = DownloaderHelper()
+            downloader = service.instance
+            transmission = helper.is_downloader("transmission", service=service)
+            if transmission:
+                rows = downloader.trc.get_torrents(arguments=["hashString", "downloadDir", "files", "percentDone"])
+                session = downloader.trc.get_session()
+                temp_enabled = value(session, "incomplete_dir_enabled")
+                temp_root = absolute(value(session, "incomplete_dir"))
+            elif helper.is_downloader("qbittorrent", service=service):
+                rows = downloader.qbc.torrents_info()
+                preferences = downloader.qbc.app_preferences()
+                temp_enabled = value(preferences, "temp_path_enabled")
+                temp_root = absolute(value(preferences, "temp_path"))
+            else:
+                return []
+            if rows is None:
+                return []
+
+            scopes = {}
+            known = set()
+            for torrent in rows:
+                row = torrent.fields if transmission else torrent
+                torrent_hash = value(row, "hashString" if transmission else "hash")
+                if not isinstance(torrent_hash, str) or not torrent_hash or torrent_hash in scopes:
+                    return []
+                root = absolute(value(row, "downloadDir" if transmission else "save_path"))
+                raw_progress = value(row, "percentDone" if transmission else "progress")
+                progress = None if isinstance(raw_progress, bool) else BrushTaskConfig._parse_number(raw_progress)
+                incomplete = progress is None or progress < 1
+                content = None if transmission else absolute(value(row, "content_path"))
+                files = value(row, "files") if transmission else None
+                if not transmission and (not content or incomplete):
+                    try:
+                        files = downloader.qbc.torrents_files(torrent_hash=torrent_hash)
+                    except Exception:
+                        files = None
+                paths = []
+                complete = bool(content)
+                if content:
+                    paths.append((content, True))
+                if files:
+                    for entry in files:
+                        path = child(root, value(entry, "name"))
+                        if path is None:
+                            # 无法证明错误路径仍位于已知目录内。
+                            paths = None
+                            complete = False
+                            break
+                        paths.append((path, False))
+                        if incomplete:
+                            suffix = ".part" if transmission else ".!qB"
+                            if path[0] == "windows":
+                                suffix = suffix.casefold()
+                            paths.append(((*path[:-1], path[-1] + suffix), False))
+                    else:
+                        complete = True
+                elif not content:
+                    paths = [(root, True)] if root else None
+                elif incomplete:
+                    complete = False
+                    paths = [(root, True)] if root and content[:len(root)] == root else None
+
+                if incomplete and paths is not None:
+                    local_temp = None if transmission else absolute(value(row, "download_path"))
+                    if local_temp or temp_enabled is True:
+                        temporary = local_temp or temp_root
+                        if temporary is None:
+                            paths = None
+                            complete = False
+                        elif files:
+                            for entry in files:
+                                path = child(temporary, value(entry, "name"))
+                                if path is None:
+                                    paths = None
+                                    complete = False
+                                    break
+                                paths.append((path, False))
+                                suffix = ".part" if transmission else ".!qB"
+                                if path[0] == "windows":
+                                    suffix = suffix.casefold()
+                                paths.append(((*path[:-1], path[-1] + suffix), False))
+                        else:
+                            paths.append((temporary, True))
+                            complete = False
+                    elif temp_enabled is not False:
+                        paths = None
+                        complete = False
+                scopes[torrent_hash] = paths
+                if complete and paths:
+                    known.add(torrent_hash)
+
+            allowed = set(requested) & known
+            # 被拦截候选也会保留，继续保护与其共享文件的其他候选。
+            while allowed:
+                retained = [paths for key, paths in scopes.items() if key not in allowed]
+                blocked = {
+                    key for key in allowed
+                    if any(paths is None or any(intersects(a, b) for a in scopes[key] for b in paths)
+                           for paths in retained)
+                }
+                if not blocked:
+                    break
+                allowed.difference_update(blocked)
+            result = [key for key in requested if key in allowed]
+            if len(result) != len(requested):
+                logger.info(f"文件共享或路径信息不完整，保留 {len(requested) - len(result)} 个删除候选")
+            return result
+        except Exception:
+            logger.warning("无法确认下载器文件归属，本轮保留删除候选")
+            return []
 
     def _run_check(self, task: BrushTaskConfig, report: dict) -> None:
         """在已绑定任务上下文中执行刷流种子检查"""
@@ -2475,24 +2692,51 @@ class BrushFlow(_PluginBase):
         check_torrents = [seeding_torrents_dict[item] for item in check_hashes if item in seeding_torrents_dict]
         self.__update_torrent_tasks_state(check_torrents, torrent_tasks)
         self.__update_undeleted_torrents_missing_in_downloader(torrent_tasks, check_hashes, seeding_torrents)
-        filtered_torrents = self.__filter_torrents_by_tag(check_torrents, task.delete_except_tags)
+        self._task_context.delete_reasons = {}
         if self._global_dynamic_delete_enabled():
             need_delete_hashes = []
-        elif task.proxy_delete and task.delete_size_range:
-            need_delete_hashes = self.__delete_torrent_for_proxy(filtered_torrents, torrent_tasks)
         else:
-            need_delete_hashes = self.__delete_torrent_for_evaluate_conditions(filtered_torrents, torrent_tasks)
+            need_delete_hashes = self._select_task_deletions(task, check_torrents, torrent_tasks)
         need_delete_hashes = list(dict.fromkeys(need_delete_hashes or []))
+        deleted_hashes = []
         deleted_from_downloader = False
-        if need_delete_hashes:
-            if DownloaderHelper().is_downloader("qbittorrent", service=self.service_info):
-                self.__qb_torrents_reannounce(need_delete_hashes)
-            if downloader.delete_torrents(ids=need_delete_hashes, delete_file=True):
-                deleted_from_downloader = True
-                for torrent_hash in need_delete_hashes:
-                    if torrent_hash in torrent_tasks:
-                        torrent_tasks[torrent_hash]["deleted"] = True
-                        torrent_tasks[torrent_hash]["deleted_time"] = time.time()
+        with self._shared_delete_scope(task, need_delete_hashes, seeding_torrents_dict) as (eligible, associations):
+            need_delete_hashes = self._safe_delete_hashes(self.service_info, eligible)
+            if need_delete_hashes:
+                if DownloaderHelper().is_downloader("qbittorrent", service=self.service_info):
+                    self.__qb_torrents_reannounce(need_delete_hashes)
+                if downloader.delete_torrents(ids=need_delete_hashes, delete_file=True):
+                    deleted_from_downloader = True
+                    deleted_hashes = need_delete_hashes
+                    affected = [(task, torrent_tasks, self._task_context.delete_reasons), *associations]
+                    for owner, records, reasons in affected:
+                        removed = [key for key in deleted_hashes if key in records and not records[key].get("deleted")]
+                        if not removed:
+                            continue
+                        with self._task_scope(owner.id):
+                            for torrent_hash in removed:
+                                record = records[torrent_hash]
+                                record.update({"deleted": True, "deleted_time": time.time()})
+                                reason = reasons.get(torrent_hash, "满足删除条件")
+                                try:
+                                    self.__send_delete_message(record, reason)
+                                except Exception:
+                                    logger.warning("刷流任务删除通知发送失败")
+                                logger.info(f"刷流任务删除种子，原因：{reason}")
+                            self._save_task_data(owner.id, "torrents", records)
+                            if owner.id != task.id:
+                                self._recalculate_statistics(owner.id)
+                    if task.proxy_delete and "-" in str(task.delete_size_range):
+                        try:
+                            self.__send_message(
+                                "【刷流任务动态删除】",
+                                f"任务：{task.name}\n删除：{len(deleted_hashes)} 个种子\n当前做种："
+                                f"{self.__bytes_to_gb(self.__calculate_seeding_torrents_size(torrent_tasks)):.1f} GB",
+                            )
+                        except Exception:
+                            logger.warning("刷流任务动态删除汇总通知发送失败")
+                else:
+                    report.update({"result": "delete_failed", "error": "下载器未确认删除成功"})
         self.__auto_archive_tasks(torrent_tasks)
         self._cleanup_unused_task_tag(
             task,
@@ -2502,8 +2746,8 @@ class BrushFlow(_PluginBase):
         self._recalculate_statistics(task.id)
         report.update(
             {
-                "result": "completed",
-                "deleted_count": len(need_delete_hashes),
+                "result": "delete_failed" if report.get("result") == "delete_failed" else "completed",
+                "deleted_count": len(deleted_hashes),
                 "active_count": sum(1 for item in torrent_tasks.values() if not item.get("deleted")),
             }
         )
@@ -2672,7 +2916,7 @@ class BrushFlow(_PluginBase):
         torrent_tasks: Dict[str, dict],
         dynamic: bool = False,
     ) -> List[str]:
-        """找出满足用户删除条件的种子并发送对应通知"""
+        """找出满足用户删除条件的种子，保存本轮删除原因。"""
         delete_hashes: List[str] = []
         for torrent in torrents:
             torrent_hash = self.__get_hash(torrent)
@@ -2686,8 +2930,7 @@ class BrushFlow(_PluginBase):
             delete_hashes.append(torrent_hash)
             if dynamic:
                 reason = f"触发动态删除阈值，{reason}"
-            self.__send_delete_message(torrent_task, reason)
-            logger.info(f"刷流任务删除种子：{torrent_task.get('title')}，原因：{reason}")
+            self._remember_delete_reason(torrent_hash, reason)
         return delete_hashes
 
     def __delete_torrent_for_evaluate_proxy_pre_conditions(
@@ -2718,7 +2961,7 @@ class BrushFlow(_PluginBase):
             if timed_out and not reason:
                 reason = f"下载耗时达到 {task.download_time} 小时"
             delete_hashes.append(torrent_hash)
-            self.__send_delete_message(torrent_task, reason)
+            self._remember_delete_reason(torrent_hash, reason)
         return delete_hashes
 
     @staticmethod
@@ -3054,7 +3297,11 @@ class BrushFlow(_PluginBase):
                     service = services.get(downloader_name)
                     if not service or not service.instance:
                         continue
-                    torrent_hashes = list(dict.fromkeys(entry["torrent_hash"] for entry in entries))
+                    torrent_hashes = self._safe_delete_hashes(
+                        service, [entry["torrent_hash"] for entry in entries],
+                    )
+                    if not torrent_hashes:
+                        continue
                     if downloader_helper.is_downloader("qbittorrent", service=service):
                         try:
                             if getattr(service.instance, "qbc", None):
@@ -3063,7 +3310,9 @@ class BrushFlow(_PluginBase):
                             logger.warning(f"全局动态删种重新汇报下载器 [{downloader_name}] 失败：{str(err)}")
                     try:
                         if service.instance.delete_torrents(ids=torrent_hashes, delete_file=True):
-                            deleted_entries.extend(entries)
+                            deleted_entries.extend(
+                                entry for entry in entries if entry["torrent_hash"] in torrent_hashes
+                            )
                     except Exception as err:
                         logger.error(
                             f"全局动态删种调用下载器 [{downloader_name}] 删除失败：{str(err)}"
@@ -3179,13 +3428,7 @@ class BrushFlow(_PluginBase):
                     break
                 delete_hashes.append(torrent_hash)
                 total_size -= torrent_info.get("total_size", 0)
-                torrent_task = torrent_tasks.get(torrent_hash, {})
-                self.__send_delete_message(torrent_task, "触发动态删除阈值，系统按做种时间清理")
-        if len(limits) > 1 and delete_hashes:
-            self.__send_message(
-                "【刷流任务动态删除】",
-                f"任务：{task.name}\n删除：{len(delete_hashes)} 个种子\n当前做种：{self.__bytes_to_gb(total_size):.1f} GB",
-            )
+                self._remember_delete_reason(torrent_hash, "触发动态删除阈值，系统按做种时间清理")
         return delete_hashes
 
     @staticmethod

@@ -1256,6 +1256,27 @@ class BrushFlowRuntimeTests(unittest.TestCase):
                 self.assertEqual(self.data["download_budget.tb"]["ceiling"], ceiling)
                 self.assertEqual(session.download_queue_size, min(ceiling, 4))
 
+    def test_sequential_budget_respects_ceiling_without_stopping_or_starting_torrents(self):
+        self.add_task(2)
+        for ceiling in (1, 3, 8):
+            with self.subTest(ceiling=ceiling):
+                self.data.clear()
+                client, session, rows = self.budget_client(ceiling)
+                rows[0].labels = ["site-2"]
+                original_states = [(row.hashString, row.status) for row in rows]
+                client.get_torrents.return_value = rows
+                self.plugin._rotation_mode = "sequential"
+                self.data["site_rotation"] = {"site_id": 1, "health_checked": True}
+                self.plugin._prioritize_download_queue({})
+                self.assertEqual(session.download_queue_size, min(ceiling, 4))
+                self.assertLessEqual(session.download_queue_size, ceiling)
+                self.assertEqual(self.data["download_budget.tb"]["ceiling"], ceiling)
+                self.assertEqual(self.data["download_slots"]["budget"], min(ceiling, 4))
+                self.assertEqual(self.data["download_slots"]["limit"], ceiling)
+                client.stop_torrent.assert_not_called()
+                client.start_torrent.assert_not_called()
+                self.assertEqual([(row.hashString, row.status) for row in rows], original_states)
+
     def test_foreign_torrent_restores_user_ceiling_and_releases_budget(self):
         client, session, rows = self.budget_client()
         self.plugin._adjust_download_budget(client, rows, "tb")
@@ -1264,23 +1285,90 @@ class BrushFlowRuntimeTests(unittest.TestCase):
         self.plugin._adjust_download_budget(client, rows, "tb")
         self.assertEqual(session.download_queue_size, 8)
         self.assertFalse(self.data["download_budget.tb"])
+        self.assertFalse(self.data["download_slots"])
         client.set_session.reset_mock()
         self.plugin._adjust_download_budget(client, rows, "tb")
         client.set_session.assert_not_called()
 
-    def test_manual_queue_limit_replaces_old_ceiling_and_is_not_restored_over(self):
+    def test_deleted_hash_without_labels_does_not_claim_download_budget(self):
+        client, session, rows = self.budget_client()
+        self.data["task.1.torrents"] = {"manual-readd": {"deleted": True}}
+        rows.append(SimpleNamespace(hashString="manual-readd", labels=[], status="download pending"))
+        self.plugin._adjust_download_budget(client, rows, "tb")
+        client.set_session.assert_not_called()
+        self.assertEqual(session.download_queue_size, 8)
+        self.assertFalse(self.data.get("download_budget.tb"))
+
+    def test_deleted_hash_returning_as_foreign_releases_download_budget(self):
         client, session, rows = self.budget_client()
         self.plugin._adjust_download_budget(client, rows, "tb")
-        session.download_queue_size = 3
+        self.assertEqual(session.download_queue_size, 4)
+        self.data["task.1.torrents"] = {"manual-readd": {"deleted": True}}
+        rows.append(SimpleNamespace(hashString="manual-readd", labels=[], status="download pending"))
         self.plugin._adjust_download_budget(client, rows, "tb")
-        self.assertEqual(self.data["download_budget.tb"]["ceiling"], 3)
-        self.assertEqual(session.download_queue_size, 3)
-        session.download_queue_size = 6
-        client.set_session.reset_mock()
-        self.plugin._restore_download_budgets()
-        client.set_session.assert_not_called()
-        self.assertEqual(session.download_queue_size, 6)
+        self.assertEqual(session.download_queue_size, 8)
         self.assertFalse(self.data["download_budget.tb"])
+        self.assertFalse(self.data["download_slots"])
+
+    def test_deleted_hash_is_prioritized_only_when_currently_tagged(self):
+        for downloader in ("tb", "qb"):
+            for tagged in (False, True):
+                with self.subTest(downloader=downloader, tagged=tagged):
+                    self.setUp()
+                    self.add_task(1, downloader=downloader)
+                    self.data["task.1.torrents"] = {"manual-readd": {"deleted": True}}
+                    client = Mock()
+                    if downloader == "tb":
+                        self.services[downloader].instance.trc = client
+                        client.get_torrents.return_value = [
+                            SimpleNamespace(hashString="unrelated", queue_position=0, labels=[], status="download pending"),
+                            SimpleNamespace(hashString="manual-readd", queue_position=1,
+                                            labels=["site-1"] if tagged else [], status="download pending")]
+                        client.get_session.return_value = SimpleNamespace(download_queue_enabled=True, download_queue_size=8)
+                        move = client.queue_top
+                    else:
+                        self.services[downloader].instance.qbc = client
+                        client.torrents_info.return_value = [
+                            {"hash": "unrelated", "priority": 0, "tags": "", "state": "queuedDL"},
+                            {"hash": "manual-readd", "priority": 1, "tags": "site-1" if tagged else "", "state": "queuedDL"}]
+                        move = client.torrents_top_priority
+                    self.plugin._prioritize_download_queue({})
+                    if tagged:
+                        self.assertEqual(move.call_count, 1)
+                    else:
+                        move.assert_not_called()
+                    client.stop_torrent.assert_not_called()
+                    client.start_torrent.assert_not_called()
+
+    def test_deleted_hash_history_does_not_override_explicit_current_site(self):
+        client, session, _ = self.budget_client()
+        self.add_task(2)
+        self.data["task.1.torrents"] = {"shared": {"deleted": True}}
+        row = SimpleNamespace(hashString="shared", queue_position=0, labels=["site-2"], status="downloading")
+        allocate = Mock(return_value=["shared"])
+        with patch.dict(self.ns, {"allocate_downloads": allocate}):
+            self.plugin._rebalance_transmission_downloads(client, [row], {"shared": (1, 0)}, "tb")
+        self.assertEqual(allocate.call_args.args[0][0]["site_id"], 2)
+        client.stop_torrent.assert_not_called()
+        client.start_torrent.assert_not_called()
+
+    def test_manual_queue_limit_replaces_old_ceiling_and_is_not_restored_over(self):
+        for mode in ("parallel", "sequential"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                client, session, rows = self.budget_client()
+                self.plugin._rotation_mode = mode
+                self.plugin._adjust_download_budget(client, rows, "tb")
+                session.download_queue_size = 3
+                self.plugin._adjust_download_budget(client, rows, "tb")
+                self.assertEqual(self.data["download_budget.tb"]["ceiling"], 3)
+                self.assertEqual(session.download_queue_size, 3)
+                session.download_queue_size = 6
+                client.set_session.reset_mock()
+                self.plugin._restore_download_budgets()
+                client.set_session.assert_not_called()
+                self.assertEqual(session.download_queue_size, 6)
+                self.assertFalse(self.data["download_budget.tb"])
 
     def test_stop_restores_owned_budget(self):
         client, session, rows = self.budget_client()
@@ -1289,18 +1377,91 @@ class BrushFlowRuntimeTests(unittest.TestCase):
         self.assertEqual(session.download_queue_size, 8)
         self.assertTrue(self.plugin._stopping)
         self.assertFalse(self.data["download_budget.tb"])
+        self.assertFalse(self.data["download_slots"])
 
-    def test_disabling_or_leaving_parallel_restores_owned_budget(self):
-        for payload_values in ({"enabled": False}, {"enabled": True, "rotation_mode": "sequential"}):
-            with self.subTest(payload=payload_values):
+    def test_restore_failure_retains_budget_until_downloader_recovers(self):
+        for failure in ("service", "instance", "client", "session_read", "session_write"):
+            with self.subTest(failure=failure):
                 self.setUp()
                 client, session, rows = self.budget_client()
                 self.plugin._adjust_download_budget(client, rows, "tb")
+                self.assertEqual(session.download_queue_size, 4)
+                budget = copy.deepcopy(self.data["download_budget.tb"])
+                service = self.services["tb"]
+                instance = service.instance
+                write_session = client.set_session.side_effect
+                if failure == "service":
+                    self.services["tb"] = None
+                elif failure == "instance":
+                    service.instance = None
+                elif failure == "client":
+                    del service.instance.trc
+                elif failure == "session_read":
+                    client.get_session.side_effect = RuntimeError("unavailable")
+                else:
+                    client.set_session.side_effect = RuntimeError("unavailable")
+                self.plugin._restore_download_budgets()
+                self.assertEqual(self.data["download_budget.tb"], budget)
+                self.assertEqual(self.data["download_budget.tb"]["ceiling"], 8)
+                self.assertEqual(self.data["download_budget.tb"]["applied"], 4)
+                self.assertEqual(session.download_queue_size, 4)
+                self.services["tb"] = service
+                service.instance = instance
+                service.instance.trc = client
+                client.get_session.side_effect = None
+                client.set_session.side_effect = write_session
+                self.plugin._restore_download_budgets()
+                self.assertEqual(session.download_queue_size, 8)
+                self.assertFalse(self.data["download_budget.tb"])
+                self.assertFalse(self.data["download_slots"])
+
+    def test_disabling_restores_owned_budget_in_both_modes(self):
+        for mode in ("parallel", "sequential"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                client, session, rows = self.budget_client()
+                self.plugin._rotation_mode = mode
+                self.plugin._adjust_download_budget(client, rows, "tb")
+                self.assertEqual(session.download_queue_size, 4)
                 self.configure_settings_api()
-                response = self.plugin.update_settings(self.ns["BrushFlowSettingsPayload"](**payload_values))
+                response = self.plugin.update_settings(self.ns["BrushFlowSettingsPayload"](enabled=False))
                 self.assertTrue(response.success)
                 self.assertEqual(session.download_queue_size, 8)
                 self.assertFalse(self.data["download_budget.tb"])
+                self.assertFalse(self.data["download_slots"])
+
+    def test_switching_to_sequential_keeps_owned_budget(self):
+        client, session, rows = self.budget_client()
+        self.plugin._adjust_download_budget(client, rows, "tb")
+        budget = copy.deepcopy(self.data["download_budget.tb"])
+        client.set_session.reset_mock()
+        self.configure_settings_api()
+        response = self.plugin.update_settings(self.ns["BrushFlowSettingsPayload"](
+            enabled=True, rotation_mode="sequential"))
+        self.assertTrue(response.success)
+        self.assertEqual(self.plugin._rotation_mode, "sequential")
+        self.assertEqual(session.download_queue_size, 4)
+        self.assertEqual(self.data["download_budget.tb"], budget)
+        client.set_session.assert_not_called()
+        client.stop_torrent.assert_not_called()
+        client.start_torrent.assert_not_called()
+
+    def test_reenabling_sequential_uses_current_user_ceiling(self):
+        client, session, rows = self.budget_client()
+        self.plugin._rotation_mode = "sequential"
+        self.plugin._adjust_download_budget(client, rows, "tb")
+        self.configure_settings_api()
+        payload = self.ns["BrushFlowSettingsPayload"]
+        self.assertTrue(self.plugin.update_settings(payload(enabled=False)).success)
+        self.assertEqual(session.download_queue_size, 8)
+        session.download_queue_size = 3
+        self.assertTrue(self.plugin.update_settings(payload(enabled=True)).success)
+        self.plugin._adjust_download_budget(client, rows, "tb")
+        self.assertEqual(self.plugin._rotation_mode, "sequential")
+        self.assertEqual(self.data["download_budget.tb"]["ceiling"], 3)
+        self.assertEqual(session.download_queue_size, 3)
+        client.stop_torrent.assert_not_called()
+        client.start_torrent.assert_not_called()
 
     def test_nullable_counters_remain_unknown_through_downloader_adapter(self):
         for downloader in ("qb", "tb"):

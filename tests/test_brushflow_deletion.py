@@ -2,6 +2,7 @@ import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -39,6 +40,7 @@ class BrushFlowDeletionTests(unittest.TestCase):
         self.plugin._get_task_config = lambda task_id=None: self.task
         self.plugin._task_configs = {self.task.id: self.task}
         self.plugin._task_context = threading.local()
+        self.plugin._task_locks = {}
         self.records = {}
         self.rows = []
         self.kind = "qbittorrent"
@@ -218,6 +220,254 @@ class BrushFlowDeletionTests(unittest.TestCase):
         completed = self.torrent("managed", progress=1, completed=1000, state="stalledUP")
         self.records["managed"] = {"size": 1000}
         self.assertEqual(delete([completed], self.records), ["managed"])
+
+
+class BrushFlowFileDeletionTests(unittest.TestCase):
+    setUp = BrushFlowDeletionTests.setUp
+    torrent = BrushFlowDeletionTests.torrent
+
+    def qb_client(self, rows):
+        self.rows = rows
+        self.service.instance.qbc = SimpleNamespace(
+            torrents_info=Mock(return_value=rows),
+            app_preferences=Mock(return_value={"temp_path_enabled": False}),
+            torrents_files=Mock(return_value=[]),
+            torrents_reannounce=Mock(),
+        )
+        self.service.instance.delete_torrents = Mock(return_value=True)
+        return self.service.instance.qbc
+
+    def tr_client(self, rows, incomplete=False, directory="/incomplete"):
+        self.kind = "transmission"
+        self.service.instance.trc = SimpleNamespace(
+            get_torrents=Mock(return_value=[SimpleNamespace(fields=row) for row in rows]),
+            get_session=Mock(return_value=SimpleNamespace(
+                incomplete_dir_enabled=incomplete, incomplete_dir=directory)),
+        )
+        return self.service.instance.trc
+
+    @staticmethod
+    def tr_row(torrent_hash, root="/data", names=("one.bin",), progress=1):
+        return {"hashString": torrent_hash, "downloadDir": root, "percentDone": progress,
+                "files": [{"name": name} for name in names] if names is not None else None}
+
+    def test_shared_files_are_blocked_and_independent_files_remain_deletable(self):
+        self.tr_client([self.tr_row("shared"), self.tr_row("foreign"),
+                        self.tr_row("safe", names=("other.bin",))])
+        self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["shared", "safe"]), ["safe"])
+
+    def test_blocked_candidate_becomes_retained_for_other_candidates(self):
+        self.tr_client([self.tr_row("a", names=("x", "y")), self.tr_row("b", names=("y",)),
+                        self.tr_row("foreign", names=("x",)), self.tr_row("safe", names=("z",))])
+        self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["a", "b", "safe"]), ["safe"])
+
+    def test_whole_deletion_batch_can_share_its_own_files(self):
+        self.tr_client([self.tr_row("a"), self.tr_row("b")])
+        self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["a", "b"]), ["a", "b"])
+
+    def test_transmission_incomplete_directory_and_part_files_are_protected(self):
+        self.tr_client([self.tr_row("candidate", "/data/a", progress=.5),
+                        self.tr_row("foreign", "/incomplete", ("one.bin.part",))], incomplete=True)
+        self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["candidate"]), [])
+
+    def test_missing_file_lists_and_read_failures_do_not_authorize_deletion(self):
+        client = self.tr_client([self.tr_row("candidate", names=None)])
+        self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["candidate"]), [])
+        client.get_torrents.side_effect = RuntimeError("unavailable")
+        self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["candidate"]), [])
+
+    def test_unknown_retained_files_only_block_their_known_directory(self):
+        self.tr_client([self.tr_row("candidate", "/separate"),
+                        self.tr_row("foreign", "/data", names=None)])
+        self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["candidate"]), ["candidate"])
+        self.tr_client([self.tr_row("candidate"), self.tr_row("foreign", root=None, names=None)])
+        self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["candidate"]), [])
+
+    def test_qb_directory_boundaries_and_windows_case_are_compared_safely(self):
+        for root, child, sibling in (("/data/one", "/data/one/file", "/data/one-other"),
+                                     ("C:\\Data\\One", "c:\\data\\one\\file", "C:\\Data\\One-other")):
+            with self.subTest(root=root):
+                self.qb_client([self.torrent("shared", content_path=root, progress=1),
+                                self.torrent("foreign", content_path=child, progress=1),
+                                self.torrent("safe", content_path=sibling, progress=1)])
+                self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["shared", "safe"]), ["safe"])
+
+    def test_qb_files_and_temporary_directory_are_checked(self):
+        client = self.qb_client([self.torrent("candidate", save_path="/data", progress=.5),
+                                 self.torrent("foreign", content_path="/temp/one.bin", progress=1)])
+        client.torrents_files.return_value = [{"name": "one.bin"}]
+        client.app_preferences.return_value = {"temp_path_enabled": True, "temp_path": "/temp"}
+        self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["candidate"]), [])
+
+    def test_qb_incomplete_extension_is_protected(self):
+        for root, retained in (("/data", "/data/one.bin.!qB"), ("C:\\Data", "c:\\data\\one.bin.!qB")):
+            with self.subTest(root=root):
+                client = self.qb_client([self.torrent("candidate", save_path=root, progress=.5),
+                                         self.torrent("foreign", content_path=retained, progress=1)])
+                client.torrents_files.return_value = [{"name": "one.bin"}]
+                self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["candidate"]), [])
+
+    def test_qb_unknown_incomplete_files_protect_both_deletion_directions(self):
+        for error in (False, True):
+            for candidate_incomplete in (False, True):
+                with self.subTest(error=error, candidate_incomplete=candidate_incomplete):
+                    incomplete = "candidate" if candidate_incomplete else "foreign"
+                    complete = "foreign" if candidate_incomplete else "candidate"
+                    client = self.qb_client([
+                        self.torrent(incomplete, content_path="/data/one.bin", progress=.5),
+                        self.torrent(complete, content_path="/data/one.bin.!qB", progress=1),
+                    ])
+                    if error:
+                        client.torrents_files.side_effect = RuntimeError("unavailable")
+                    self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["candidate"]), [])
+
+    def test_qb_unknown_incomplete_files_protect_only_a_confirmed_directory(self):
+        self.qb_client([
+            self.torrent("foreign", content_path="/data/one.bin", save_path="/data", progress=.5),
+            self.torrent("candidate", content_path="/separate/one.bin", progress=1),
+        ])
+        self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["candidate"]), ["candidate"])
+
+    def test_relative_and_escaping_paths_are_not_trusted(self):
+        for root, names in (("relative", ("one.bin",)), ("/data", ("../escape",))):
+            with self.subTest(root=root, names=names):
+                self.tr_client([self.tr_row("candidate", root, names)])
+                self.assertEqual(self.plugin._safe_delete_hashes(self.service, ["candidate"]), [])
+
+    def prepare_check(self, result=True):
+        self.task.proxy_delete = False
+        self.task.seed_inactivetime = 1
+        self.qb_client([self.torrent("shared", content_path="/data/one", progress=1),
+                        self.torrent("foreign", content_path="/data/one", progress=1),
+                        self.torrent("safe", content_path="/data/two", progress=1)])
+        self.records.update({key: {"size": 1000, "download_started": True, "deleted": False}
+                             for key in ("shared", "safe")})
+        self.service.instance.delete_torrents.return_value = result
+        self.plugin._validate_task_reference = lambda task: True
+        self.plugin._current_task_data = lambda name, default: self.records if name == "torrents" else {}
+        self.plugin._resolve_pending_downloads = Mock()
+        self.plugin._BrushFlow__update_seeding_tasks_based_on_tags = Mock()
+        self.plugin._BrushFlow__auto_archive_tasks = Mock()
+        self.plugin._cleanup_unused_task_tag = Mock()
+        self.plugin._recalculate_statistics = Mock()
+        self.plugin._global_dynamic_delete_enabled = lambda: False
+
+    def test_regular_delete_counts_and_notifies_only_successful_safe_hashes(self):
+        self.prepare_check()
+        report = {}
+        self.plugin._run_check(self.task, report)
+        self.service.instance.delete_torrents.assert_called_once_with(ids=["safe"], delete_file=True)
+        self.assertEqual(report["deleted_count"], 1)
+        self.assertFalse(self.records["shared"]["deleted"])
+        self.assertTrue(self.records["safe"]["deleted"])
+        self.plugin._BrushFlow__send_delete_message.assert_called_once()
+        self.assertIs(self.plugin._BrushFlow__send_delete_message.call_args.args[0], self.records["safe"])
+
+    def test_failed_delete_rpc_does_not_count_or_notify_candidates(self):
+        self.prepare_check(result=False)
+        report = {}
+        self.plugin._run_check(self.task, report)
+        self.assertEqual(report["deleted_count"], 0)
+        self.assertEqual(report["result"], "delete_failed")
+        self.assertFalse(any(record["deleted"] for record in self.records.values()))
+        self.plugin._BrushFlow__send_delete_message.assert_not_called()
+
+    def test_dynamic_summary_failure_does_not_lose_successful_deletion(self):
+        self.prepare_check()
+        self.task.proxy_delete = True
+        self.task.delete_size_range = "0-0.0000001"
+        self.plugin._BrushFlow__send_message = Mock(side_effect=RuntimeError("unavailable"))
+        report = {}
+        self.plugin._run_check(self.task, report)
+        self.assertEqual(report["deleted_count"], 1)
+        self.assertTrue(self.records["safe"]["deleted"])
+        self.plugin._save_task_data.assert_called()
+
+    def prepare_shared_records(self, protected=False, enabled=True):
+        self.prepare_check()
+        self.qb_client([self.torrent("shared", content_path="/data/one", progress=1),
+                        self.torrent("safe", content_path="/data/two", progress=1)])
+        other = SimpleNamespace(**{**vars(self.task), "id": "2", "name": "other", "enabled": enabled})
+        records = {"shared": {"size": 1000, "download_started": True,
+                              "hit_and_run": protected, "deleted": False}}
+        self.plugin._task_configs[other.id] = other
+        self.plugin._get_task_config = lambda task_id=None: self.plugin._task_configs[
+            task_id or getattr(self.plugin._task_context, "task_id", None) or self.task.id]
+        self.plugin._get_task_data = lambda task_id, name, default=None: records if task_id == other.id else self.records
+        return other, records
+
+    def test_shared_hash_respects_other_task_hr_even_when_disabled(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                self.setUp()
+                other, records = self.prepare_shared_records(protected=True, enabled=enabled)
+                report = {}
+                self.plugin._run_check(self.task, report)
+                self.service.instance.delete_torrents.assert_called_once_with(ids=["safe"], delete_file=True)
+                self.assertEqual(report["deleted_count"], 1)
+                self.assertFalse(records["shared"]["deleted"])
+                self.assertFalse(self.records["shared"]["deleted"])
+
+    def test_shared_hash_all_qualify_saves_all_records_and_counts_physical_torrents(self):
+        other, records = self.prepare_shared_records(enabled=False)
+        report = {}
+        self.plugin._run_check(self.task, report)
+        self.service.instance.delete_torrents.assert_called_once_with(ids=["shared", "safe"], delete_file=True)
+        self.assertEqual(report["deleted_count"], 2)
+        self.assertTrue(records["shared"]["deleted"])
+        self.plugin._save_task_data.assert_any_call(other.id, "torrents", records)
+        self.assertEqual(self.plugin._BrushFlow__send_delete_message.call_count, 3)
+
+    def test_shared_hash_busy_or_tag_protected_does_not_block_independent_delete(self):
+        for busy in (False, True):
+            with self.subTest(busy=busy):
+                self.setUp()
+                other, records = self.prepare_shared_records()
+                lock = self.plugin._task_locks.setdefault(other.id, threading.Lock())
+                if busy:
+                    lock.acquire()
+                else:
+                    other.delete_except_tags = "managed"
+                try:
+                    report = {}
+                    self.plugin._run_check(self.task, report)
+                finally:
+                    if busy:
+                        lock.release()
+                self.service.instance.delete_torrents.assert_called_once_with(ids=["safe"], delete_file=True)
+                self.assertFalse(records["shared"]["deleted"])
+
+    def test_shared_hash_uses_other_tasks_dynamic_threshold(self):
+        for threshold, allowed in (("1", False), ("0.0000001", True)):
+            with self.subTest(threshold=threshold):
+                self.setUp()
+                other, records = self.prepare_shared_records()
+                other.proxy_delete = True
+                other.delete_size_range = threshold
+                report = {}
+                self.plugin._run_check(self.task, report)
+                self.assertEqual(records["shared"]["deleted"], allowed)
+                self.assertEqual(report["deleted_count"], 2 if allowed else 1)
+
+    def test_global_delete_counts_and_notifies_only_successful_safe_hashes(self):
+        for succeeded in (False, True):
+            with self.subTest(succeeded=succeeded):
+                self.setUp()
+                self.prepare_check(result=succeeded)
+                self.plugin._global_dynamic_delete_enabled = lambda: True
+                self.plugin._global_delete_size_range = "1"
+                self.plugin._all_task_locks_scope = lambda: nullcontext()
+                entries = [{"downloader_name": "qb", "torrent_hash": h, "task": self.task,
+                            "torrent_task": r, "delete_reason": "normal", "size": 1000}
+                           for h, r in self.records.items()]
+                self.plugin._collect_global_dynamic_delete_candidates = lambda: (
+                    entries, 2000, {self.task.id: self.records}, {"qb": self.service})
+                self.plugin._select_global_dynamic_deletions = lambda *args: (entries, 0, True)
+                self.assertEqual(self.plugin._run_global_dynamic_delete(), int(succeeded))
+                self.service.instance.delete_torrents.assert_called_once_with(ids=["safe"], delete_file=True)
+                self.assertFalse(self.records["shared"]["deleted"])
+                self.assertEqual(self.records["safe"]["deleted"], succeeded)
+                self.assertEqual(self.plugin._BrushFlow__send_delete_message.call_count, int(succeeded))
 
 
 if __name__ == "__main__":
