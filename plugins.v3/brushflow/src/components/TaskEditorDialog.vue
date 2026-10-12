@@ -27,16 +27,16 @@ const positive = value => value === '' || value == null || Number(value) > 0 || 
 const sections = [
   {
     value: 'base', title: '常用与调度', icon: 'mdi-calendar-clock',
-    description: '单站轮换按驻留时间切换。分享率决定优先级；下载名额在下载器上限内分配。',
+    description: '单站模式先按优先级刷至分享率达标，全部达标后按配置顺序轮转。',
     fields: [
       { key: 'downloader', label: '下载器', type: 'downloader', required: true },
       { key: 'save_path', label: '保存目录', globalHint: '留空使用下载器默认目录' },
       { key: 'brush_interval', label: '刷流刷新周期（分钟）', type: 'number', min: 1, max: 1440, required: true },
       { key: 'check_interval', label: '状态检查周期（分钟）', type: 'number', min: 1, max: 1440, required: true },
-      { key: 'rotation_hours', label: '每站驻留时间（小时）', type: 'number', min: 0, max: 168, required: true, hint: '单站轮换模式生效，默认 24 小时；切换后旧种继续按原规则下载、做种和删除。' },
+      { key: 'rotation_hours', label: '达标后每站驻留时间（小时）', type: 'number', min: 0, max: 168, required: true, hint: '单站模式下全部站点达标后生效，默认 24 小时；旧种继续下载、做种和按规则清理。' },
       { key: 'cron', label: 'CRON 表达式', globalHint: '留空使用固定刷新周期' },
       { key: 'active_time_range', label: '开启时间段', hint: '如 00:00-08:00', globalHint: '如 00:00-08:00，留空为全天' },
-      { key: 'site_ratio_target', label: '目标站点分享率', type: 'number', min: 0.01, step: 0.01, hint: '默认 2，未达标优先分配选种机会' },
+      { key: 'site_ratio_target', label: '目标站点分享率', type: 'number', min: 0.01, step: 0.01, hint: '默认 2，单站模式刷至达标后切换下一站' },
       { key: 'disksize', label: '站点空间上限（GB）', type: 'number', min: 0, hint: '0 表示不限，仍受全局空间上限约束', globalHint: '留空或 0 表示不限，仍受全局空间上限约束' },
       { key: 'notify', label: '发送通知', type: 'switch' },
     ],
@@ -236,7 +236,7 @@ async function saveTask(apply = false) {
               <div><dt>下载器</dt><dd>{{ previewTask.downloader || '未选择' }}</dd></div>
               <div><dt>刷新</dt><dd>{{ scheduleText }}</dd></div>
               <div><dt>检查</dt><dd>每 {{ previewTask.check_interval || 5 }} 分钟</dd></div>
-              <div><dt>单站驻留</dt><dd>{{ previewTask.rotation_hours ?? 24 }} 小时</dd></div>
+              <div><dt>达标后驻留</dt><dd>{{ previewTask.rotation_hours ?? 24 }} 小时</dd></div>
               <div><dt>目标分享率</dt><dd>{{ previewTask.site_ratio_target || '不限' }}</dd></div>
               <div><dt>下载人数</dt><dd>{{ previewTask.leecher || '不限' }}</dd></div>
               <div><dt>下载 / 做种</dt><dd>{{ previewTask.min_peer_seed_ratio ?? '不限' }}</dd></div>

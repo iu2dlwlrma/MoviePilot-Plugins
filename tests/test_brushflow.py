@@ -283,6 +283,7 @@ class BrushFlowTests(unittest.TestCase):
         self.assertEqual(self.plugin._select_rotation_site({}, now=3100), 2)
 
     def test_rotation_retry_recovery_and_restart_keep_schedule(self):
+        self.plugin._build_site_ratio_status = lambda *args: {"available": True, "reached": True}
         task = self.add_task(1)
         self.plugin._rotation_mode = "sequential"
         self.plugin._select_rotation_site({}, now=100)
@@ -546,6 +547,7 @@ class BrushFlowTests(unittest.TestCase):
         self.assertEqual(self.added, ["3", "2", "1", "4"] * 3)
 
     def test_daily_rotation_only_adds_focus_and_keeps_old_torrents_and_checks(self):
+        self.plugin._build_site_ratio_status = lambda *args: {"available": True, "reached": True}
         first, second = self.add_task(1), self.add_task(2)
         p = self.plugin
         p._rotation_mode = "sequential"
@@ -567,16 +569,17 @@ class BrushFlowTests(unittest.TestCase):
             self.assertEqual(p._run_check.call_args.args[0], first)
             self.assertTrue(first.enabled)
 
-    def test_daily_priority_cannot_starve_other_sites_and_round_repeats(self):
+    def test_unmet_site_stays_until_target_even_when_met_site_is_novice(self):
         normal, low, novice = (self.add_task(i) for i in range(1, 4))
         novice.novice = True
         p = self.plugin
         p._rotation_mode = "sequential"
         p._build_site_ratio_status = lambda task, *args: {"available": True, "reached": task.id != low.id}
         selected = [p._select_rotation_site({}, now=1800000000 + day * 86400) for day in range(4)]
-        self.assertEqual(selected, [novice.site_id, low.site_id, normal.site_id, novice.site_id])
+        self.assertEqual(selected, [low.site_id] * 4)
 
     def test_daily_focus_survives_reload_and_ratio_changes_until_its_deadline(self):
+        self.plugin._build_site_ratio_status = lambda *args: {"available": True, "reached": True}
         first, second = self.add_task(1), self.add_task(2)
         p = self.plugin
         p._rotation_mode = "sequential"
@@ -588,6 +591,7 @@ class BrushFlowTests(unittest.TestCase):
         reloaded._task_configs = p._task_configs
         reloaded.get_data = p.get_data
         reloaded.save_data = p.save_data
+        reloaded._build_site_ratio_status = p._build_site_ratio_status
         second.novice = True
         self.assertEqual(reloaded._select_rotation_site({}, start + 86400), first.site_id)
         self.assertEqual(self.data["site_rotation"]["deadline_at"], start + 48 * 3600)
@@ -602,12 +606,13 @@ class BrushFlowTests(unittest.TestCase):
             first.enabled = False
             self.queue(second)
             p._dispatch_brush()
-            self.assertEqual(self.added, ["2"] * 3)
+            self.assertEqual(self.added, ["1"] * 3 + ["2"] * 3)
             second.enabled = False
             p._dispatch_brush()
             self.assertEqual(self.data["site_rotation"], {})
 
     def test_same_site_tasks_share_one_daily_turn_and_expiry_blocks_further_adds(self):
+        self.plugin._build_site_ratio_status = lambda *args: {"available": True, "reached": True}
         first, same, other = self.add_task(1), self.add_task(2, site=1), self.add_task(3)
         p = self.plugin
         p._rotation_mode = "sequential"
@@ -630,6 +635,7 @@ class BrushFlowTests(unittest.TestCase):
         self.assertEqual(config(task.to_dict(), {"rotation_hours": 24}).rotation_hours, 12)
 
     def test_browse_crossing_focus_deadline_retains_pending_without_adding(self):
+        self.plugin._build_site_ratio_status = lambda *args: {"available": True, "reached": True}
         task = self.add_task(1)
         p = self.plugin
         p._rotation_mode = "sequential"
@@ -657,6 +663,7 @@ class BrushFlowTests(unittest.TestCase):
                 task = self.add_task(1, downloader=downloader_name)
                 p = self.plugin
                 p._rotation_mode = "sequential"
+                p._build_site_ratio_status = lambda *args: {"available": True, "reached": True}
                 p._BrushFlow__download = self.cls._BrushFlow__download.__get__(p)
                 self.ns["StringUtils"] = SimpleNamespace(generate_random_str=lambda size: "unique-tag")
                 downloader = self.services[downloader_name].instance
@@ -886,6 +893,111 @@ class BrushFlowTests(unittest.TestCase):
         self.assertFalse(response.success)
         self.assertEqual(self.plugin._task_configs["1"].downloader, "tb")
         self.assertEqual(self.plugin._calculate_global_seeding_size(), 100)
+
+
+class BrushFlowRatioRotationTests(unittest.TestCase):
+    setUp = BrushFlowTests.setUp
+    add_task = BrushFlowTests.add_task
+    queue = BrushFlowTests.queue
+
+    def test_unmet_priority_then_configured_round_robin_preserves_records(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        tasks = [self.add_task(i) for i in (1, 2, 3)]
+        tasks[2].novice = True
+        met = set()
+        p._build_site_ratio_status = lambda task, *args: {
+            "available": True, "reached": task.site_id in met, "deficit_fraction": task.site_id / 10}
+        self.data["task.3.torrents"] = {"retained": {"deleted": False, "uploaded": 10}}
+        self.assertEqual(p._select_rotation_site({}, 100), 3)
+        self.assertIsNone(self.data["site_rotation"]["deadline_at"])
+        self.assertEqual(p._select_rotation_site({}, 100000), 3)
+        met.add(3)
+        self.assertEqual(p._select_rotation_site({}, 100001), 2)
+        met.add(2)
+        self.assertEqual(p._select_rotation_site({}, 100002), 1)
+        met.add(1)
+        self.assertEqual(p._select_rotation_site({}, 100003), 1)
+        self.assertEqual(self.data["site_rotation"]["phase"], "round_robin")
+        self.assertEqual(p._select_rotation_site({}, 100003 + 86400), 2)
+        self.assertEqual(p._select_rotation_site({}, 100003 + 172800), 3)
+        self.assertEqual(self.data["task.3.torrents"], {"retained": {"deleted": False, "uploaded": 10}})
+        met.remove(2)
+        self.assertEqual(p._select_rotation_site({}, 100003 + 172801), 2)
+
+    def test_unknown_or_stale_account_is_not_treated_as_reached(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1)
+        self.add_task(2)
+        p._build_site_ratio_status = lambda task, *args: {
+            "available": True, "reached": True, "stale": task.site_id == 2}
+        self.assertEqual(p._select_rotation_site({}, 100), 2)
+        self.assertEqual(self.data["site_rotation"]["phase"], "ratio")
+
+    def test_same_site_different_targets_do_not_restart_focus(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1)
+        self.add_task(2, site=1)
+        p._build_site_ratio_status = lambda task, *args: {"available": True, "reached": task.id == "1"}
+        p._select_rotation_site({}, 100)
+        p._select_rotation_site({}, 200)
+        self.assertEqual(self.data["site_rotation"]["started_at"], 100)
+
+    def test_refresh_is_background_rate_limited_and_failed_data_is_unknown(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        task = self.add_task(1)
+        self.data["site_rotation"] = {"site_id": 1, "phase": "ratio", "health_checked": True}
+        jobs = []
+        self.ns["ThreadHelper"] = lambda: SimpleNamespace(submit=lambda job: jobs.append(job))
+        self.ns["SitesHelper"] = lambda: SimpleNamespace(get_indexer=lambda domain: {"id": 1})
+        fetch = Mock(return_value=SimpleNamespace(userid=1, err_msg="unavailable"))
+        self.ns["SiteChain"] = lambda: SimpleNamespace(refresh_userdata=fetch)
+        with patch.object(self.ns["time"], "time", return_value=100):
+            p._refresh_focus_ratio()
+            p._refresh_focus_ratio()
+            self.assertEqual(len(jobs), 1)
+            fetch.assert_not_called()
+            jobs.pop()()
+            self.assertFalse(self.data["ratio_refresh.1"]["success"])
+            self.assertEqual(self.data["ratio_refresh.1"]["next_attempt"], 700)
+            status = self.cls._build_site_ratio_status(p, task, {})
+            self.assertFalse(status["available"])
+            self.assertFalse(status["reached"])
+        fetch.return_value = SimpleNamespace(userid=1, err_msg=None)
+        with patch.object(self.ns["time"], "time", return_value=700):
+            p._refresh_focus_ratio()
+            jobs.pop()()
+            self.assertTrue(self.data["ratio_refresh.1"]["success"])
+            self.assertEqual(self.data["ratio_refresh.1"]["next_attempt"], 2500)
+
+    def test_repeated_account_failure_skips_to_another_unmet_site(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1).novice = True
+        self.add_task(2)
+        p._select_rotation_site({}, 100)
+        self.data["ratio_refresh.1"] = {"success": False, "failures": 5, "next_attempt": 4000}
+        self.assertEqual(p._select_rotation_site({}, 1000), 2)
+
+    def test_empty_source_distinguishes_connection_failure_from_empty_results(self):
+        for healthy in (True, False, None):
+            with self.subTest(healthy=healthy):
+                self.setUp()
+                task = self.add_task(1)
+                self.candidates["1"] = []
+                self.site_test.return_value = (healthy, "private-token-do-not-propagate")
+                if healthy is None:
+                    self.site_test.side_effect = RuntimeError("private-url-do-not-propagate")
+                self.queue(task)
+                self.plugin._dispatch_brush()
+                report = self.plugin._get_task_data(task.id, "runs")[0]
+                self.assertEqual(report["success"], bool(healthy))
+                self.assertEqual(report["result"], "no_candidates" if healthy else "source_unavailable")
+                self.assertNotIn("private", str(report))
+                self.assertTrue(report["reason_counts"])
 
 
 class BrushFlowRuntimeTests(unittest.TestCase):
