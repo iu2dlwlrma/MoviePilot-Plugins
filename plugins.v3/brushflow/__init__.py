@@ -256,7 +256,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.8"
+    plugin_version = "7.2.9"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -1752,6 +1752,7 @@ class BrushFlow(_PluginBase):
             return
         reports = {}
         self._task_context.candidates = {}
+        self._task_context.source_pages = {}
         try:
             self._sample_transfers()
             site_data = self._latest_site_user_data_by_domain()
@@ -1806,7 +1807,10 @@ class BrushFlow(_PluginBase):
                         if deadline and (previous is None or deadline < previous):
                             self._refresh_scheduler()
                             scheduled_deadlines[task.id] = deadline
-                    if result.get("success") and result["added_count"] > before and self._task_context.candidates.get(task.id):
+                    source = self._task_context.source_pages.get(task.id, {})
+                    if result.get("success") and result.get("result") == "completed" and (
+                        self._task_context.candidates.get(task.id) or source.get("done") is False
+                    ):
                         next_round.append(task)
                     else:
                         with self._runtime_lock:
@@ -1820,7 +1824,7 @@ class BrushFlow(_PluginBase):
                     report["finished_at"] = self._now_iso()
                     self._append_run(task_id, report)
             finally:
-                for key in ("downloads", "candidates", "site_user_data"):
+                for key in ("downloads", "candidates", "source_pages", "site_user_data"):
                     if hasattr(self._task_context, key):
                         delattr(self._task_context, key)
                 try:
@@ -1932,7 +1936,7 @@ class BrushFlow(_PluginBase):
             if complete and up_limit and upload >= up_limit * 1000 * .9:
                 budget = max(min(2, ceiling), limit - 1)
                 reason = "上传已接近预算，减少新增下载竞争"
-            elif complete and demand > limit and (not down_limit or download < down_limit * 1000 * .85):
+            elif complete and demand > limit and (up_limit or not down_limit or download < down_limit * 1000 * .85):
                 budget = min(ceiling, limit + 1)
                 reason = "有排队需求且带宽有余量，增加一个名额"
             state["changed_at"] = now
@@ -2135,14 +2139,49 @@ class BrushFlow(_PluginBase):
         """获取当前任务站点候选并逐项执行保留的选种规则"""
         task = self._get_task_config()
         queues = getattr(self._task_context, "candidates", {})
+        pages = getattr(self._task_context, "source_pages", None)
+        if pages is None:
+            pages = self._task_context.source_pages = {}
         if task.id not in queues:
             logger.info(f"刷流任务 [{task.name}] 开始获取站点 {site.name} 的新种子")
-            torrents = TorrentsChain().rss(domain=site.domain) if task.rss_support else TorrentsChain().browse(domain=site.domain)
+            queues[task.id] = []
+            pages[task.id] = {"page": 0, "done": False, "seen": set(), "previous": None}
+        source = pages[task.id]
+        if not queues[task.id] and not source["done"]:
+            passed, reason = self.__evaluate_size_condition_for_brush(
+                self.__calculate_seeding_torrents_size(torrent_tasks), 1,
+                global_torrents_size=global_seeding_size,
+            )
+            if not passed:
+                report["result"] = "precondition_blocked"
+                report["reason_counts"][reason] += 1
+                return
+            chain = TorrentsChain()
+            page = source["page"]
+            failed = False
+            try:
+                if task.rss_support:
+                    torrents = chain.rss(domain=site.domain)
+                    source["done"] = True
+                else:
+                    torrents = chain.browse(domain=site.domain, page=page) if page else chain.browse(domain=site.domain)
+            except Exception:
+                if page:
+                    source["done"] = True
+                    report["result"] = "completed"
+                    report["reason_counts"]["后续页面读取失败，本轮使用已取得资源"] += 1
+                    logger.warning(f"刷流任务 [{task.name}] 后续页面读取失败，保留已取得资源")
+                    return
+                torrents, failed = [], True
+            torrents = list(torrents or [])
             if not torrents:
+                source["done"] = True
+                if page:
+                    report["result"] = "completed"
+                    return
                 report["result"] = "no_candidates"
-                queues[task.id] = []
                 try:
-                    healthy = bool(SiteChain().test(site.domain)[0])
+                    healthy = not failed and bool(SiteChain().test(site.domain)[0])
                 except Exception:
                     healthy = False
                 if healthy:
@@ -2157,14 +2196,34 @@ class BrushFlow(_PluginBase):
                         state.update(health_checked=False, retry_count=0, retry_at=time.time() + 600)
                         self.save_data("site_rotation", state)
                 return
-            report["source_count"] = len(torrents)
+            if not task.rss_support:
+                if torrents == source["previous"]:
+                    source["done"] = True
+                    report["result"] = "completed"
+                    return
+                source["previous"] = list(torrents)
+                source["page"] += 1
+                unique = []
+                for torrent in torrents:
+                    key = getattr(torrent, "page_url", None) or getattr(torrent, "enclosure", None)
+                    if key and key in source["seen"]:
+                        continue
+                    if key:
+                        source["seen"].add(key)
+                    unique.append(torrent)
+                torrents = unique
+                if not torrents:
+                    source["done"] = True
+                    report["result"] = "completed"
+                    return
+            report["source_count"] += len(torrents)
             if task.except_subscribe:
                 before_count = len(torrents)
                 torrents = self.__filter_torrents_contains_subscribe(torrents, subscribe_titles)
-                report["subscription_excluded"] = before_count - len(torrents)
+                report["subscription_excluded"] += before_count - len(torrents)
                 if report["subscription_excluded"]:
                     report["reason_counts"]["命中订阅内容"] = report["subscription_excluded"]
-            report["candidate_count"] = len(torrents)
+            report["candidate_count"] += len(torrents)
             ranked_at = datetime.now().astimezone()
             torrents.sort(key=lambda item: demand_rank(
                 getattr(item, "peers", None), getattr(item, "seeders", None),
@@ -2183,7 +2242,7 @@ class BrushFlow(_PluginBase):
             if not passed:
                 report["reason_counts"][reason] += 1
                 report["result"] = "precondition_blocked"
-                break
+                return
             passed, reason = self.__evaluate_size_condition_for_brush(
                 seeding_size,
                 torrent.size,
@@ -2203,7 +2262,8 @@ class BrushFlow(_PluginBase):
                     report["reason_counts"]["等待站点轮转"] += 1
                     return
                 report["reason_counts"]["下载器添加失败"] += 1
-                break
+                report["result"] = "download_add_failed"
+                return
             self._reserve_download(task, hash_string)
             torrent_task = self._torrent_to_task_record(torrent, site, task)
             torrent_tasks[hash_string] = torrent_task
@@ -2326,9 +2386,6 @@ class BrushFlow(_PluginBase):
             return False, "任务配置不存在"
         if self._site_completed_count(task.site_id) >= 50:
             return False, "本站已完成保种达到 50 个，等待按删除规则释放名额"
-        budget = (self.get_data(f"download_budget.{task.downloader}") or {}).get("applied")
-        if isinstance(budget, int) and self._site_downloading_count(task.site_id) >= max(4, budget * 2):
-            return False, "本站已有足够待下载任务，等待释放名额后重新选种"
         return True, None
 
     def __evaluate_conditions_for_brush(
@@ -2879,9 +2936,6 @@ class BrushFlow(_PluginBase):
         ):
             return True, f"下载耗时达到 {task.download_time} 小时"
         window = transfer_window(torrent_task, time.time())
-        if not torrent_info.get("completed") and window["seconds"] >= 1200 and not window["gap"] \
-                and window["active_download_seconds"] >= 1200 and window["uploaded"] == 0 and window["downloaded"] == 0:
-            return True, "实际运行满 20 分钟仍无上传和下载进展"
         if (
             task.seed_avgspeed and window["seconds"] >= 1200 and not window["gap"]
             and window["avg_upspeed"] is not None and window["avg_upspeed"] <= float(task.seed_avgspeed) * 1024

@@ -151,19 +151,30 @@ class BrushFlowDeletionTests(unittest.TestCase):
         self.assertFalse(info["completed"])
         self.assertTrue(rules.download_has_started(info, {}))
 
-    def test_no_progress_requires_observed_running_time_and_protects_hr(self):
-        for downloading, received, protected, expected in [
-            (True, 0, False, True), (False, 0, False, False),
-            (True, 1, False, False), (True, 0, True, False),
-        ]:
-            with self.subTest(downloading=downloading, received=received, protected=protected):
+    def test_no_progress_waits_for_configured_inactivity_and_protects_hr(self):
+        self.task.download_time = None
+        self.task.seed_inactivetime = 120
+        for inactive_minutes, protected, expected in [(20, False, False), (119, False, False),
+                                                       (120, False, True), (120, True, False)]:
+            with self.subTest(inactive_minutes=inactive_minutes, protected=protected):
                 record = {"download_started": True, "hit_and_run": protected}
                 end = self.now.timestamp()
                 for seconds in range(0, 1201, 30):
-                    rules.update_transfer_sample(record, {"uploaded": 0, "transfer_downloaded": received * seconds,
-                        "is_downloading": downloading, "completed": False}, end - 1200 + seconds)
-                torrent = self.torrent(state="downloading" if downloading else "queuedDL")
-                self.assertEqual(self.evaluate(torrent, record)[0], expected)
+                    rules.update_transfer_sample(record, {"uploaded": 0, "transfer_downloaded": 0,
+                        "is_downloading": True, "completed": False}, end - 1200 + seconds)
+                torrent = self.torrent(state="downloading", last_activity=end - inactive_minutes * 60)
+                deleted, reason = self.evaluate(torrent, record)
+                self.assertEqual(deleted, expected)
+                if expected:
+                    self.assertEqual(reason, "未活动时间达到 120 分钟")
+
+    def test_disabled_download_timeout_preserves_active_long_running_and_unstarted_torrents(self):
+        self.task.download_time = None
+        self.task.seed_inactivetime = 120
+        record = {"download_started": True, "actual_download_seconds": 6 * 3600}
+        active = self.torrent(state="downloading", downloaded=100, last_activity=self.now.timestamp() - 60)
+        self.assertFalse(self.evaluate(active, record)[0])
+        self.assertFalse(self.evaluate(self.torrent(), {})[0])
 
     def test_promotion_scheduler_uses_lead_and_does_not_repeat_expired_item(self):
         self.records.update({
