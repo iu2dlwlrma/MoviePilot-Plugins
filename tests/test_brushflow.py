@@ -2077,6 +2077,71 @@ class BrushFlowRuntimeTests(unittest.TestCase):
                 self.plugin._wait_transmission_allocation(client, ["low"], [])
         self.assertEqual(client.get_torrents.call_count, 12)
 
+    def paged_selection_fixture(self, count=1, pages=6):
+        tasks = [self.add_task(tid, downloader="qb") for tid in range(1, count + 1)]
+        clock = [1000]
+        for task in tasks:
+            task.check_interval = 1
+            task.download_min_speed = 100
+            task.download_slow_minutes = 90
+            torrent_hash = f"active-{task.id}"
+            self.rows["qb"].append({"hash": torrent_hash, "name": torrent_hash, "state": "downloading",
+                                    "progress": .1, "size": 1000, "completed": 100,
+                                    "downloaded": 0, "uploaded": 0, "tags": task.brush_tag})
+            self.data[f"task.{task.id}.torrents"] = {torrent_hash: {"size": 1000, "download_started": True}}
+
+        def browse(domain, page=0):
+            clock[0] += 35
+            for torrent in self.rows["qb"]:
+                torrent["downloaded"] += 100
+            return [SimpleNamespace(title=f"p{page}", page_url=f"detail-{page}",
+                                    description="", size=100, pubdate="0", allowed=False)] if page < pages else []
+
+        self.ns["TorrentsChain"] = lambda: SimpleNamespace(browse=browse)
+        return clock, tasks
+
+    def test_paged_selection_keeps_real_samples_and_cleanup_current(self):
+        clock, tasks = self.paged_selection_fixture()
+        with patch.object(self.ns["time"], "time", side_effect=lambda: clock[0]):
+            self.plugin._queue_brush(tasks[0].id)
+            self.plugin._dispatch_brush()
+        metrics = self.data["task.1.metrics"]
+        self.assertGreaterEqual(metrics["sampled_at"], 1210)
+        self.assertGreaterEqual(metrics["downloaded"], 600)
+        self.assertFalse(metrics["gap"])
+        self.assertEqual(self.added, [])
+        checks = [run for run in self.data["task.1.runs"] if run["kind"] == "check"]
+        self.assertEqual(len(checks), 3)
+        self.assertTrue(all(run["success"] for run in checks), checks)
+
+    def test_many_slow_site_pages_do_not_turn_transfer_samples_into_gaps(self):
+        clock, tasks = self.paged_selection_fixture(count=6, pages=10)
+        with patch.object(self.ns["time"], "time", side_effect=lambda: clock[0]):
+            for task in tasks:
+                self.plugin._queue_brush(task.id)
+            self.plugin._dispatch_brush()
+        for task in tasks:
+            self.assertFalse(self.data[f"task.{task.id}.metrics"]["gap"])
+            record = self.data[f"task.{task.id}.torrents"][f"active-{task.id}"]
+            self.assertGreaterEqual(record["slow_download_sample"]["seconds"], 2250)
+
+    def test_stopping_during_a_paged_check_does_not_start_more_checks(self):
+        clock, tasks = self.paged_selection_fixture(count=6)
+        run_check = self.plugin._run_check
+
+        def stop_after_check(task, report):
+            run_check(task, report)
+            self.plugin._stopping = True
+
+        self.plugin._run_check = stop_after_check
+        with patch.object(self.ns["time"], "time", side_effect=lambda: clock[0]):
+            for task in tasks:
+                self.plugin._queue_brush(task.id)
+            self.plugin._dispatch_brush()
+        checks = [run for task in tasks for run in self.data.get(f"task.{task.id}.runs", [])
+                  if run["kind"] == "check"]
+        self.assertEqual(len(checks), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

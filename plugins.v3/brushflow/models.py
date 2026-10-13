@@ -55,6 +55,8 @@ class BrushTaskPayload(BaseModel):
     seed_ratio: Optional[float] = Field(None, gt=0)
     seed_size: Optional[float] = Field(None, gt=0)
     download_time: Optional[float] = Field(None, gt=0)
+    download_min_speed: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
+    download_slow_minutes: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
     seed_avgspeed: Optional[float] = Field(None, gt=0)
     seed_inactivetime: Optional[float] = Field(None, gt=0)
     delete_size_range: Optional[str] = None
@@ -78,6 +80,8 @@ class BrushTaskPayload(BaseModel):
         "seed_ratio",
         "seed_size",
         "download_time",
+        "download_min_speed",
+        "download_slow_minutes",
         "seed_avgspeed",
         "seed_inactivetime",
         "auto_archive_days",

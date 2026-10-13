@@ -71,6 +71,18 @@ class BrushFlowModelTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(pydantic.ValidationError):
                 self.task(**values)
 
+    def test_slow_download_settings_validate_and_can_be_disabled(self):
+        settings = self.models.BrushFlowSettingsPayload(global_defaults={
+            "download_min_speed": "100", "download_slow_minutes": "30"})
+        self.assertEqual(settings.global_defaults["download_min_speed"], 100)
+        self.assertEqual(settings.global_defaults["download_slow_minutes"], 30)
+        for field in ("download_min_speed", "download_slow_minutes"):
+            for value in (None, "", 0, "0"):
+                self.assertIsNone(getattr(self.task(**{field: value}), field))
+            for value in (-1, float("nan"), float("inf")):
+                with self.subTest(field=field, value=value), self.assertRaises(pydantic.ValidationError):
+                    self.task(**{field: value})
+
     def test_shared_defaults_validate_and_fill_missing_values(self):
         settings = self.models.BrushFlowSettingsPayload(global_defaults={"leecher": "2", "notify": False})
         self.assertEqual(set(settings.global_defaults), self.models.SHARED_TASK_FIELDS)

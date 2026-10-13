@@ -343,5 +343,179 @@ class TransferSampleTests(unittest.TestCase):
         self.assertTrue(window["gap"])
 
 
+class SlowDownloadTests(unittest.TestCase):
+    def sample(self, record, at, downloaded, uploaded=0, minimum=100 * 1024, **fields):
+        info = {"sample_downloaded": downloaded, "sample_uploaded": uploaded,
+                "transfer_downloaded": downloaded, "uploaded": uploaded,
+                "is_downloading": True, "completed": False, "state": "downloading",
+                "dlspeed": 0, "upspeed": 0, **fields}
+        rules.update_transfer_sample(record, info, at, minimum_download_speed=minimum)
+        return info
+
+    def reason(self, info, record, now, minimum=100, minutes=30):
+        return rules.slow_download_reason(info, record, now, minimum, minutes)
+
+    def test_first_sample_is_only_a_baseline_and_thirty_minutes_is_inclusive(self):
+        record = {"actual_download_seconds": 86400, "download_started": True}
+        base = 50 * 1024 ** 3
+        for at in range(0, 1801, 30):
+            info = self.sample(record, at, base + at * 10 * 1024)
+            if at < 1800:
+                self.assertIsNone(self.reason(info, record, at))
+        self.assertIsInstance(self.reason(info, record, 1800), str)
+        self.assertTrue(self.reason(info, record, 1800))
+
+    def test_downloading_without_peers_or_bytes_counts_and_180_second_intervals_are_valid(self):
+        record = {}
+        for at in range(0, 1801, 180):
+            info = self.sample(record, at, 0, peers_connected=0)
+        self.assertTrue(self.reason(info, record, 1800))
+
+    def test_pause_queue_check_and_completion_reset_the_observation(self):
+        for state, completed in (("pauseddl", False), ("download pending", False),
+                                 ("checking", False), ("seeding", True)):
+            with self.subTest(state=state):
+                record = {}
+                for at in range(0, 1801, 30):
+                    info = self.sample(record, at, at * 1024)
+                self.assertTrue(self.reason(info, record, 1800))
+                info = self.sample(record, 1830, 1800 * 1024, is_downloading=False,
+                                   state=state, completed=completed)
+                self.assertIsNone(self.reason(info, record, 1830))
+                for at in range(1860, 3661, 30):
+                    info = self.sample(record, at, 1800 * 1024 + (at - 1860) * 1024)
+                    if at < 3660:
+                        self.assertIsNone(self.reason(info, record, at))
+                self.assertTrue(self.reason(info, record, 3660))
+
+    def test_non_download_state_overrides_stale_rate_and_download_flag(self):
+        for state in ("pauseddl", "download pending", "checkingdl", "unknown"):
+            with self.subTest(state=state):
+                record = {}
+                for at in range(0, 1801, 30):
+                    info = self.sample(record, at, at * 1024)
+                self.assertTrue(self.reason(info, record, 1800))
+                info = self.sample(record, 1830, 1800 * 1024,
+                                   state=state, is_downloading=True, dlspeed=1)
+                self.assertIsNone(self.reason(info, record, 1830))
+
+    def test_unknown_reset_and_sampling_gap_require_a_fresh_complete_observation(self):
+        for failure in ("unknown_download", "unknown_upload", "download_reset", "upload_reset", "gap"):
+            with self.subTest(failure=failure):
+                record = {}
+                for at in range(0, 1771, 30):
+                    info = self.sample(record, at, 10000000 + at * 1024, uploaded=1000)
+                failed_at = 1980 if failure == "gap" else 1800
+                downloaded = None if failure == "unknown_download" else 0 if failure == "download_reset" else 12000000
+                uploaded = None if failure == "unknown_upload" else 0 if failure == "upload_reset" else 1000
+                info = self.sample(record, failed_at, downloaded, uploaded)
+                self.assertIsNone(self.reason(info, record, failed_at))
+                start = failed_at + 30
+                for at in range(start, start + 1801, 30):
+                    info = self.sample(record, at, 20000000 + (at - start) * 1024, uploaded=2000)
+                    if at < start + 1800:
+                        self.assertIsNone(self.reason(info, record, at))
+                self.assertTrue(self.reason(info, record, start + 1800))
+
+    def test_current_speed_recovery_protects_and_restarts_the_observation(self):
+        for field in ("dlspeed", "upspeed"):
+            with self.subTest(field=field):
+                record = {}
+                for at in range(0, 1801, 30):
+                    info = self.sample(record, at, at * 1024)
+                self.assertTrue(self.reason(info, record, 1800))
+                protected = {**info, field: 100 * 1024}
+                self.assertIsNone(self.reason(protected, record, 1800))
+                info = self.sample(record, 1830, 1830 * 1024, **{field: 100 * 1024})
+                self.assertIsNone(self.reason(info, record, 1830))
+                info = self.sample(record, 1860, 1860 * 1024)
+                self.assertIsNone(self.reason(info, record, 1860))
+
+    def test_average_download_or_upload_recovery_resets_even_when_current_speed_is_zero(self):
+        for field in ("download", "upload"):
+            with self.subTest(field=field):
+                record = {}
+                for at in range(0, 1771, 30):
+                    info = self.sample(record, at, at * 1024)
+                recovered_bytes = 1800 * 100 * 1024
+                info = self.sample(record, 1800,
+                                   recovered_bytes if field == "download" else 1800 * 1024,
+                                   uploaded=recovered_bytes if field == "upload" else 0)
+                self.assertIsNone(self.reason(info, record, 1800))
+                info = self.sample(record, 1830,
+                                   recovered_bytes + 30 * 1024 if field == "download" else 1830 * 1024,
+                                   uploaded=recovered_bytes if field == "upload" else 0)
+                self.assertIsNone(self.reason(info, record, 1830))
+
+    def test_tiny_uploads_do_not_exempt_a_persistently_slow_download(self):
+        record = {}
+        for at in range(0, 1801, 30):
+            info = self.sample(record, at, at * 10 * 1024, uploaded=at, upspeed=1)
+        self.assertTrue(self.reason(info, record, 1800))
+
+    def test_old_fast_download_does_not_hide_a_later_thirty_minute_slow_period(self):
+        record = {}
+        fast_bytes = 1800 * 200 * 1024
+        for at in range(0, 1801, 30):
+            info = self.sample(record, at, at * 200 * 1024)
+        self.assertIsNone(self.reason(info, record, 1800))
+        for at in range(1830, 3601, 30):
+            info = self.sample(record, at, fast_bytes + (at - 1800) * 10 * 1024)
+            if at < 3600:
+                self.assertIsNone(self.reason(info, record, at))
+        self.assertTrue(self.reason(info, record, 3600))
+
+    def test_ninety_minute_observation_does_not_expand_transfer_history(self):
+        record = {}
+        for at in range(0, 5401, 30):
+            info = self.sample(record, at, at * 1024)
+            if at < 5400:
+                self.assertIsNone(self.reason(info, record, at, minutes=90))
+        self.assertTrue(self.reason(info, record, 5400, minutes=90))
+        self.assertLessEqual(len(record.get("transfer_samples", [])), 36)
+
+    def test_json_restart_keeps_valid_observation_but_stale_data_cannot_delete(self):
+        record = {}
+        for at in range(0, 901, 30):
+            info = self.sample(record, at, at * 1024)
+        restored = json.loads(json.dumps(record))
+        for at in range(930, 1801, 30):
+            info = self.sample(restored, at, at * 1024)
+        self.assertTrue(self.reason(info, restored, 1800))
+        self.assertIsNone(self.reason(info, restored, 1981))
+        info = self.sample(restored, 1981, 1981 * 1024)
+        self.assertIsNone(self.reason(info, restored, 1981))
+
+    def test_changed_threshold_does_not_reuse_the_previous_slow_period(self):
+        record = {}
+        for at in range(0, 1801, 30):
+            info = self.sample(record, at, at * 1024)
+        self.assertTrue(self.reason(info, record, 1800))
+        self.assertIsNone(self.reason(info, record, 1800, minimum=200))
+        for at in range(1830, 3631, 30):
+            info = self.sample(record, at, at * 1024, minimum=200 * 1024)
+            if at < 3630:
+                self.assertIsNone(self.reason(info, record, at, minimum=200))
+        self.assertTrue(self.reason(info, record, 3630, minimum=200))
+
+    def test_disabling_then_enabling_starts_a_new_observation(self):
+        for disabled in (None, 0):
+            with self.subTest(disabled=disabled):
+                record = {}
+                for at in range(0, 1801, 30):
+                    info = self.sample(record, at, at * 1024)
+                self.assertTrue(self.reason(info, record, 1800))
+                self.assertIsNone(self.reason(info, record, 1800, minutes=None))
+                self.assertIsNone(self.reason(info, record, 1800, minutes=0))
+                info = self.sample(record, 1830, 1830 * 1024, minimum=disabled)
+                self.assertIsNone(self.reason(info, record, 1830, minimum=disabled))
+                self.assertIsNone(self.reason(info, record, 1830))
+                for at in range(1860, 3661, 30):
+                    info = self.sample(record, at, at * 1024)
+                    if at < 3660:
+                        self.assertIsNone(self.reason(info, record, at))
+                self.assertTrue(self.reason(info, record, 3660))
+
+
 if __name__ == "__main__":
     unittest.main()
