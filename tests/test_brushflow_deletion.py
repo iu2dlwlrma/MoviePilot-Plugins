@@ -236,6 +236,8 @@ class BrushFlowDeletionTests(unittest.TestCase):
 class BrushFlowFileDeletionTests(unittest.TestCase):
     setUp = BrushFlowDeletionTests.setUp
     torrent = BrushFlowDeletionTests.torrent
+    info = BrushFlowDeletionTests.info
+    evaluate = BrushFlowDeletionTests.evaluate
 
     def qb_client(self, rows):
         self.rows = rows
@@ -479,6 +481,84 @@ class BrushFlowFileDeletionTests(unittest.TestCase):
                 self.assertFalse(self.records["shared"]["deleted"])
                 self.assertEqual(self.records["safe"]["deleted"], succeeded)
                 self.assertEqual(self.plugin._BrushFlow__send_delete_message.call_count, int(succeeded))
+
+    def low_download_record(self):
+        return {
+            "size": 1000, "download_started": True, "deleted": False,
+            "transfer_sample": {"at": self.now.timestamp()},
+            "slow_download_sample": {
+                "at": self.now.timestamp(), "seconds": 1800,
+                "downloaded": 0, "uploaded": 0, "minimum_speed": 102400,
+            },
+        }
+
+    def enable_slow_download_rule(self):
+        self.task.download_time = None
+        self.task.seed_inactivetime = None
+        self.task.download_min_speed = 100
+        self.task.download_slow_minutes = 30
+        self.task.delete_size_range = None
+
+    def test_slow_download_is_an_independent_rule_with_existing_protections(self):
+        self.enable_slow_download_rule()
+        record = self.low_download_record()
+        torrent = self.torrent(state="downloading", progress=.1, completed=100)
+        self.assertTrue(self.evaluate(torrent, record)[0])
+        for fields, protected in (({"state": "queuedDL"}, False),
+                                  ({"state": "pausedDL"}, False),
+                                  ({"progress": 1, "completed": 1000}, False),
+                                  ({}, True)):
+            with self.subTest(fields=fields, protected=protected):
+                item = {**torrent, **fields}
+                self.assertFalse(self.evaluate(item, {**record, "hit_and_run": protected})[0])
+        self.assertEqual(self.plugin._select_task_deletions(
+            self.task, [{**torrent, "tags": "keep"}], {"hash": record}), [])
+
+    def test_local_dynamic_slow_download_cleans_below_space_threshold(self):
+        self.enable_slow_download_rule()
+        torrent = self.torrent(state="downloading", progress=.1, completed=100)
+        selected = self.plugin._BrushFlow__delete_torrent_for_evaluate_proxy_pre_conditions(
+            [torrent], {"hash": self.low_download_record()})
+        self.assertEqual(selected, ["hash"])
+
+    def test_global_dynamic_slow_download_cleans_below_space_threshold(self):
+        self.enable_slow_download_rule()
+        self.rows = [self.torrent(state="downloading", progress=.1, completed=100)]
+        self.records["hash"] = self.low_download_record()
+        candidates, size, _, _ = self.plugin._collect_global_dynamic_delete_candidates()
+        selected, _, threshold = self.plugin._select_global_dynamic_deletions(candidates, size, 0, 5000)
+        self.assertFalse(threshold)
+        self.assertEqual([entry["torrent_hash"] for entry in selected], ["hash"])
+
+    def test_slow_download_respects_shared_files_before_removing_data(self):
+        self.prepare_check()
+        self.enable_slow_download_rule()
+        client = self.qb_client([self.torrent("shared", state="downloading", save_path="/data", content_path="/data/one", progress=.1),
+                        self.torrent("foreign", content_path="/data/one", progress=1),
+                        self.torrent("safe", state="downloading", save_path="/data", content_path="/data/two", progress=.1)])
+        client.torrents_files.side_effect = lambda torrent_hash: [{"name": "two" if torrent_hash == "safe" else "one"}]
+        self.records.update({key: self.low_download_record() for key in ("shared", "safe")})
+        report = {}
+        self.plugin._run_check(self.task, report)
+        self.assertEqual(report["deleted_count"], 1)
+        self.assertFalse(self.records["shared"]["deleted"])
+        self.assertTrue(self.records["safe"]["deleted"])
+        self.service.instance.delete_torrents.assert_called_once_with(ids=["safe"], delete_file=True)
+
+    def test_slow_download_requires_all_shared_hash_references_to_qualify(self):
+        other, records = self.prepare_shared_records()
+        self.enable_slow_download_rule()
+        other.download_time = other.seed_inactivetime = None
+        other.download_min_speed = other.download_slow_minutes = None
+        client = self.qb_client([self.torrent("shared", state="downloading", save_path="/data", content_path="/data/one", progress=.1),
+                        self.torrent("safe", state="downloading", save_path="/data", content_path="/data/two", progress=.1)])
+        client.torrents_files.side_effect = lambda torrent_hash: [{"name": "two" if torrent_hash == "safe" else "one"}]
+        self.records.update({key: self.low_download_record() for key in ("shared", "safe")})
+        report = {}
+        self.plugin._run_check(self.task, report)
+        self.assertEqual(report["deleted_count"], 1)
+        self.assertFalse(self.records["shared"]["deleted"])
+        self.assertFalse(records["shared"]["deleted"])
 
 
 if __name__ == "__main__":

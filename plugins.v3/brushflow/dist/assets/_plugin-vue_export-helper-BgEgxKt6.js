@@ -32,6 +32,8 @@ const taskDefaults = {
   seed_ratio: null,
   seed_size: null,
   download_time: null,
+  download_min_speed: null,
+  download_slow_minutes: null,
   seed_avgspeed: null,
   seed_inactivetime: null,
   delete_size_range: null,
@@ -51,7 +53,7 @@ const taskDefaults = {
 const siteFields = ['id', 'name', 'enabled', 'site_id', 'novice', 'novice_until', 'timezone_offset', 'site_hr_active', 'site_skip_tips', 'tag', 'rss_support'];
 const sharedFields = Object.keys(taskDefaults).filter(key => !siteFields.includes(key) && !['use_global_defaults', 'override_fields'].includes(key));
 const retiredFields = ['site_ratio_control', 'maxdlcount', 'maxupspeed', 'maxdlspeed', 'up_speed', 'dl_speed', 'global_maxdlcount', 'global_maxupspeed', 'global_maxdlspeed'];
-const nullableNumbers = ['disksize', 'site_ratio_target', 'seed_time', 'hr_seed_time', 'seed_ratio', 'seed_size', 'download_time', 'seed_avgspeed', 'seed_inactivetime', 'auto_archive_days'];
+const nullableNumbers = ['disksize', 'site_ratio_target', 'seed_time', 'hr_seed_time', 'seed_ratio', 'seed_size', 'download_time', 'download_min_speed', 'download_slow_minutes', 'seed_avgspeed', 'seed_inactivetime', 'auto_archive_days'];
 
 function taskOverrideFields(task = {}) {
   return sharedFields.filter(key => task[key] != null && (key === 'freeleech' || typeof task[key] !== 'string' || task[key].trim() !== ''))

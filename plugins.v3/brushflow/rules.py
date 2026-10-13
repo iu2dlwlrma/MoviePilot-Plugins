@@ -165,7 +165,70 @@ def download_has_started(info: dict, record: dict) -> bool:
     return state in {"downloading", "forceddl", "forceddownload"}
 
 
-def update_transfer_sample(record: dict, info: dict, now: float) -> None:
+def _is_downloading(info: dict) -> bool:
+    state = re.sub(r"[\s_-]", "", str(info.get("state") or "").lower())
+    active_states = {
+        "downloading", "forceddl", "forceddownload", "stalleddl",
+    }
+    if state and state not in active_states:
+        return False
+    return info.get("is_downloading", state in active_states) is True and info.get("completed") is not True
+
+
+def _update_slow_download_sample(record: dict, info: dict, previous: dict,
+                                 now: float, minimum: float | None) -> None:
+    minimum = _number(minimum)
+    if not minimum:
+        record.pop("slow_download_sample", None)
+        return
+    fresh = {"at": now, "seconds": 0, "downloaded": 0, "uploaded": 0,
+             "minimum_speed": minimum}
+    watch = record.get("slow_download_sample") or {}
+    previous_at = _number(previous.get("at"))
+    downloaded = _count(info.get("sample_downloaded", info.get("transfer_downloaded")))
+    uploaded = _count(info.get("sample_uploaded", info.get("uploaded")))
+    prior_downloaded, prior_uploaded = _count(previous.get("downloaded")), _count(previous.get("uploaded"))
+    if (not _is_downloading(info) or previous.get("downloading") is not True
+        or previous_at is None or not 0 < now - previous_at <= 180
+        or watch.get("at") != previous_at or watch.get("minimum_speed") != minimum
+        or downloaded is None or uploaded is None or prior_downloaded is None or prior_uploaded is None
+        or downloaded < prior_downloaded or uploaded < prior_uploaded):
+        record["slow_download_sample"] = fresh
+        return
+    seconds = (_number(watch.get("seconds")) or 0) + now - previous_at
+    downloaded = (_number(watch.get("downloaded")) or 0) + downloaded - prior_downloaded
+    uploaded = (_number(watch.get("uploaded")) or 0) + uploaded - prior_uploaded
+    if (downloaded / seconds >= minimum or uploaded / seconds >= minimum
+        or (_number(info.get("dlspeed")) or 0) >= minimum
+        or (_number(info.get("upspeed")) or 0) >= minimum):
+        record["slow_download_sample"] = fresh
+        return
+    record["slow_download_sample"] = {**fresh, "seconds": seconds,
+                                      "downloaded": downloaded, "uploaded": uploaded}
+
+
+def slow_download_reason(info: dict, record: dict, now: float,
+                         minimum_kbps: float | None, minutes: float | None) -> str | None:
+    """只用连续有效下载阶段判低速；排队、缺口和有效上传均保留。"""
+    minimum, duration, current = _number(minimum_kbps), _number(minutes), _number(now)
+    if not minimum or not duration or current is None or not _is_downloading(info):
+        return None
+    minimum *= 1024
+    watch = record.get("slow_download_sample") or {}
+    at, seconds = _number(watch.get("at")), _number(watch.get("seconds"))
+    downloaded, uploaded = _number(watch.get("downloaded")), _number(watch.get("uploaded"))
+    if (watch.get("minimum_speed") != minimum or at is None or not 0 <= current - at <= 180
+        or seconds is None or seconds < duration * 60 or downloaded is None or uploaded is None):
+        return None
+    if (downloaded / seconds >= minimum or uploaded / seconds >= minimum
+        or (_number(info.get("dlspeed")) or 0) >= minimum
+        or (_number(info.get("upspeed")) or 0) >= minimum):
+        return None
+    return f"持续 {duration:g} 分钟平均下载 {downloaded / seconds / 1024:.1f} KB/s，低于 {minimum / 1024:g} KB/s"
+
+
+def update_transfer_sample(record: dict, info: dict, now: float,
+                           minimum_download_speed: float | None = None) -> None:
     """保存实际计数增量；排队、暂停和采样中断不累加下载用时。"""
     current = _number(now)
     if current is None:
@@ -176,10 +239,8 @@ def update_transfer_sample(record: dict, info: dict, now: float) -> None:
         return
     uploaded = _count(info.get("sample_uploaded", info.get("uploaded")))
     downloaded = _count(info.get("sample_downloaded", info.get("transfer_downloaded")))
-    state = re.sub(r"[\s_-]", "", str(info.get("state") or "").lower())
-    downloading = info.get("is_downloading", state in {
-        "downloading", "forceddl", "forceddownload", "stalleddl",
-    }) is True and info.get("completed") is not True
+    downloading = _is_downloading(info)
+    _update_slow_download_sample(record, info, previous, current, minimum_download_speed)
     active_seconds = _number(record.get("actual_download_seconds")) or 0
     snapshot = dict(previous.get("snapshot") or {
         "uploaded": 0, "downloaded": 0,

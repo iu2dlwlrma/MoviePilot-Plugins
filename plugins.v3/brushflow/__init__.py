@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
-from .rules import demand_rank, download_has_started, evaluate_peer_demand, promotion_deadline, publication_age_minutes, update_transfer_sample, transfer_window, allocate_downloads
+from .rules import demand_rank, download_has_started, evaluate_peer_demand, promotion_deadline, publication_age_minutes, update_transfer_sample, transfer_window, allocate_downloads, slow_download_reason
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import Query
@@ -80,6 +80,8 @@ TASK_CONFIG_FIELDS = (
     "seed_ratio",
     "seed_size",
     "download_time",
+    "download_min_speed",
+    "download_slow_minutes",
     "seed_avgspeed",
     "seed_inactivetime",
     "delete_size_range",
@@ -112,6 +114,8 @@ LEGACY_SITE_OVERRIDE_FIELDS = {
     "seed_ratio",
     "seed_size",
     "download_time",
+    "download_min_speed",
+    "download_slow_minutes",
     "seed_avgspeed",
     "seed_inactivetime",
     "save_path",
@@ -184,6 +188,8 @@ class BrushTaskConfig:
         self.seed_ratio = self._parse_number(config.get("seed_ratio"))
         self.seed_size = self._parse_number(config.get("seed_size"))
         self.download_time = self._parse_number(config.get("download_time"))
+        self.download_min_speed = self._parse_number(config.get("download_min_speed"))
+        self.download_slow_minutes = self._parse_number(config.get("download_slow_minutes"))
         self.seed_avgspeed = self._parse_number(config.get("seed_avgspeed"))
         self.seed_inactivetime = self._parse_number(config.get("seed_inactivetime"))
         self.delete_size_range = self._clean_text(config.get("delete_size_range"))
@@ -256,7 +262,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.12"
+    plugin_version = "7.2.13"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -1435,7 +1441,9 @@ class BrushFlow(_PluginBase):
                                 "is_downloading": False}, now)
                         if row is not None and not record.get("deleted"):
                             info = self.__get_torrent_info(row)
-                            update_transfer_sample(record, info, now)
+                            update_transfer_sample(record, info, now, minimum_download_speed=(
+                                (getattr(task, "download_min_speed", None) or 0) * 1024
+                                if getattr(task, "download_slow_minutes", None) else None))
                             if (task.downloader, torrent_hash) not in current_seen:
                                 current_seen.add((task.downloader, torrent_hash))
                                 metrics["upspeed"] += info.get("upspeed", 0)
@@ -1757,6 +1765,7 @@ class BrushFlow(_PluginBase):
         self._task_context.source_pages = {}
         try:
             self._sample_transfers()
+            last_sampled = time.time()
             site_data = self._latest_site_user_data_by_domain()
             self._select_rotation_site(site_data)
             if not self._check_rotation_site():
@@ -1780,6 +1789,7 @@ class BrushFlow(_PluginBase):
             tasks.sort(key=lambda task: (priorities[task.id], -(self._build_site_ratio_status(task, site_data).get("deficit_fraction") or 0), self._site_last_added(task.site_id),
                                          pending[task.id], task.id))
             scheduled_deadlines = {task.id: self._next_promotion_expiry(task) for task in tasks}
+            last_checked = {task.id: time.time() for task in tasks}
             self._task_context.downloads = self._read_downloads(allow_partial=True)
             while tasks and not self._stopping and self.get_state():
                 next_round = []
@@ -1817,6 +1827,21 @@ class BrushFlow(_PluginBase):
                     else:
                         with self._runtime_lock:
                             self._pending_brush.pop(task.id, None)
+                    checkpoint_at = time.time()
+                    if checkpoint_at - last_sampled >= 30 and not self._stopping and self.get_state():
+                        self._sample_transfers()
+                        last_sampled = time.time()
+                        for check_task in tasks:
+                            if self._stopping or not self.get_state():
+                                break
+                            if checkpoint_at - last_checked[check_task.id] >= check_task.check_interval * 60:
+                                self.check(check_task.id)
+                                last_checked[check_task.id] = time.time()
+                        if self._stopping or not self.get_state():
+                            break
+                        self._task_context.downloads = self._read_downloads(allow_partial=True)
+                        if not self._stopping and self.get_state():
+                            self._prioritize_download_queue(site_data)
                 tasks = next_round
         except Exception as err:
             logger.error(f"刷流分配失败，保留待执行任务：{str(err)}")
@@ -1830,7 +1855,7 @@ class BrushFlow(_PluginBase):
                     if hasattr(self._task_context, key):
                         delattr(self._task_context, key)
                 try:
-                    if any(report.get("added_count") for report in reports.values()):
+                    if not self._stopping and self.get_state() and any(report.get("added_count") for report in reports.values()):
                         self._prioritize_download_queue(self._latest_site_user_data_by_domain())
                         self._refresh_scheduler()
                 finally:
@@ -2818,13 +2843,16 @@ class BrushFlow(_PluginBase):
 
     def __update_torrent_tasks_state(self, torrents: List[Any], torrent_tasks: Dict[str, dict]) -> None:
         """保存流量和完成状态，并持续记录首次确认开始下载的时间。"""
+        task = self._get_task_config()
+        minimum = ((getattr(task, "download_min_speed", None) or 0) * 1024
+                   if getattr(task, "download_slow_minutes", None) else None)
         for torrent in torrents:
             torrent_hash = self.__get_hash(torrent)
             torrent_task = torrent_tasks.get(torrent_hash)
             if not torrent_task:
                 continue
             torrent_info = self.__get_torrent_info(torrent)
-            update_transfer_sample(torrent_task, torrent_info, time.time())
+            update_transfer_sample(torrent_task, torrent_info, time.time(), minimum_download_speed=minimum)
             if download_has_started(torrent_info, torrent_task):
                 now_timestamp = time.time()
                 started_at = BrushTaskConfig._parse_number(torrent_task.get("download_started_at"))
@@ -2939,6 +2967,9 @@ class BrushFlow(_PluginBase):
             and download_elapsed >= float(task.download_time) * 3600
         ):
             return True, f"下载耗时达到 {task.download_time} 小时"
+        slow_reason = self.__slow_download_reason(torrent_info, torrent_task)
+        if slow_reason:
+            return True, slow_reason
         window = transfer_window(torrent_task, time.time())
         if (
             task.seed_avgspeed and window["seconds"] >= 1200 and not window["gap"]
@@ -2949,6 +2980,14 @@ class BrushFlow(_PluginBase):
         if task.seed_inactivetime and torrent_info.get("iatime", 0) >= float(task.seed_inactivetime) * 60:
             return True, f"未活动时间达到 {task.seed_inactivetime} 分钟"
         return False, "尚未满足删除条件"
+
+    def __slow_download_reason(self, torrent_info: dict, torrent_task: dict) -> Optional[str]:
+        task = self._get_task_config()
+        if not task or torrent_task.get("hit_and_run"):
+            return None
+        return slow_download_reason(torrent_info, torrent_task, time.time(),
+                                    getattr(task, "download_min_speed", None),
+                                    getattr(task, "download_slow_minutes", None))
 
     def __promotion_expired(self, torrent_info: dict, torrent_task: dict) -> Tuple[bool, str]:
         """在促销结束前清理未完成任务，保留 H&R 种子。"""
@@ -2999,7 +3038,7 @@ class BrushFlow(_PluginBase):
         torrents: List[Any],
         torrent_tasks: Dict[str, dict],
     ) -> List[str]:
-        """动态删种前处理促销窗口和从开始下载计时的超时任务。"""
+        """动态删种前处理促销、超时和持续低速任务。"""
         task = self._get_task_config()
         delete_hashes: List[str] = []
         for torrent in torrents:
@@ -3017,10 +3056,13 @@ class BrushFlow(_PluginBase):
                 and not torrent_info.get("completed", False)
                 and download_elapsed >= float(task.download_time) * 3600
             )
-            if not expired and not timed_out:
+            slow_reason = self.__slow_download_reason(torrent_info, torrent_task)
+            if not expired and not timed_out and not slow_reason:
                 continue
             if timed_out and not reason:
                 reason = f"下载耗时达到 {task.download_time} 小时"
+            if not reason:
+                reason = slow_reason
             delete_hashes.append(torrent_hash)
             self._remember_delete_reason(torrent_hash, reason)
         return delete_hashes
@@ -3218,6 +3260,8 @@ class BrushFlow(_PluginBase):
                             pre_delete_reason = expired_reason
                         elif timed_out:
                             pre_delete_reason = f"下载耗时达到 {task.download_time} 小时"
+                        else:
+                            pre_delete_reason = self.__slow_download_reason(torrent_info, torrent_task) or ""
                     should_delete, conditional_reason = self.__evaluate_conditions_for_delete(
                         torrent_info,
                         torrent_task,

@@ -69,6 +69,8 @@ const sections = [
       { key: 'seed_ratio', label: '种子分享率', type: 'number', min: 0 },
       { key: 'seed_size', label: '上传量（GB）', type: 'number', min: 0 },
       { key: 'download_time', label: '下载超时（小时）', type: 'number', min: 0 },
+      { key: 'download_min_speed', label: '低速下载阈值（KB/s）', type: 'number', min: 0, hint: '与观察时间同时大于 0 时生效；0 关闭。仅清理未完成种子，平均上传达到此阈值时暂留。' },
+      { key: 'download_slow_minutes', label: '低速观察时间（分钟）', type: 'number', min: 0, hint: '平均下载速度持续低于阈值才清理；排队、暂停不计时，采样缺口重计。0 关闭。' },
       { key: 'seed_inactivetime', label: '未活动时间（分钟）', type: 'number', min: 0 },
       { key: 'seed_avgspeed', label: '平均上传速度（KB/s）', type: 'number', min: 0 },
       { key: 'delete_except_tags', label: '删除排除标签' },
@@ -98,7 +100,7 @@ function globalValueText(field) {
   const items = field.type === 'downloader' ? props.downloaders : field.items
   const selected = items?.find(item => item.value === value)
   if (selected) return selected.title
-  if (value == null || value === '') return ({ downloader: '未选择', save_path: '下载器默认目录', cron: '固定刷新周期', active_time_range: '全天', qb_category: '不指定', delete_except_tags: '无' })[field.key] || '不限'
+  if (value == null || value === '') return ({ downloader: '未选择', save_path: '下载器默认目录', cron: '固定刷新周期', active_time_range: '全天', qb_category: '不指定', delete_except_tags: '无', download_min_speed: '关闭', download_slow_minutes: '关闭' })[field.key] || '不限'
   return String(value)
 }
 

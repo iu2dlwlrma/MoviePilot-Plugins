@@ -1,5 +1,5 @@
 import { importShared } from './__federation_fn_import-JrT3xvdd.js';
-import { _ as _export_sfc, c as cloneTask, d as taskOverrideFields, e as effectiveTask, g as taskDefaults, h as editableTask, n as normalizeDefaults, i as normalizeTask, t as taskStateMeta, a as formatDateTime, b as formatRemainingTime, f as formatBytes, j as formatDuration, k as torrentProgress, u as unwrapResponse, l as normalizeSettings } from './_plugin-vue_export-helper-BvL1xitz.js';
+import { _ as _export_sfc, c as cloneTask, d as taskOverrideFields, e as effectiveTask, g as taskDefaults, h as editableTask, n as normalizeDefaults, i as normalizeTask, t as taskStateMeta, a as formatDateTime, b as formatRemainingTime, f as formatBytes, j as formatDuration, k as torrentProgress, u as unwrapResponse, l as normalizeSettings } from './_plugin-vue_export-helper-BgEgxKt6.js';
 
 const {unref:_unref$1,toDisplayString:_toDisplayString$1,createTextVNode:_createTextVNode$1,resolveComponent:_resolveComponent$1,withCtx:_withCtx$1,createVNode:_createVNode$1,renderList:_renderList$1,Fragment:_Fragment$1,openBlock:_openBlock$1,createElementBlock:_createElementBlock$1,createBlock:_createBlock$1,createCommentVNode:_createCommentVNode$1,createElementVNode:_createElementVNode$1,withModifiers:_withModifiers$1} = await importShared('vue');
 
@@ -102,6 +102,8 @@ const sections = [
       { key: 'seed_ratio', label: '种子分享率', type: 'number', min: 0 },
       { key: 'seed_size', label: '上传量（GB）', type: 'number', min: 0 },
       { key: 'download_time', label: '下载超时（小时）', type: 'number', min: 0 },
+      { key: 'download_min_speed', label: '低速下载阈值（KB/s）', type: 'number', min: 0, hint: '与观察时间同时大于 0 时生效；0 关闭。仅清理未完成种子，平均上传达到此阈值时暂留。' },
+      { key: 'download_slow_minutes', label: '低速观察时间（分钟）', type: 'number', min: 0, hint: '平均下载速度持续低于阈值才清理；排队、暂停不计时，采样缺口重计。0 关闭。' },
       { key: 'seed_inactivetime', label: '未活动时间（分钟）', type: 'number', min: 0 },
       { key: 'seed_avgspeed', label: '平均上传速度（KB/s）', type: 'number', min: 0 },
       { key: 'delete_except_tags', label: '删除排除标签' },
@@ -131,7 +133,7 @@ function globalValueText(field) {
   const items = field.type === 'downloader' ? props.downloaders : field.items;
   const selected = items?.find(item => item.value === value);
   if (selected) return selected.title
-  if (value == null || value === '') return ({ downloader: '未选择', save_path: '下载器默认目录', cron: '固定刷新周期', active_time_range: '全天', qb_category: '不指定', delete_except_tags: '无' })[field.key] || '不限'
+  if (value == null || value === '') return ({ downloader: '未选择', save_path: '下载器默认目录', cron: '固定刷新周期', active_time_range: '全天', qb_category: '不指定', delete_except_tags: '无', download_min_speed: '关闭', download_slow_minutes: '关闭' })[field.key] || '不限'
   return String(value)
 }
 
@@ -655,7 +657,7 @@ return (_ctx, _cache) => {
 }
 
 };
-const TaskEditorDialog = /*#__PURE__*/_export_sfc(_sfc_main$1, [['__scopeId',"data-v-fd2fb07e"]]);
+const TaskEditorDialog = /*#__PURE__*/_export_sfc(_sfc_main$1, [['__scopeId',"data-v-d98bc772"]]);
 
 const {resolveComponent:_resolveComponent,createVNode:_createVNode,createElementVNode:_createElementVNode,toDisplayString:_toDisplayString,createTextVNode:_createTextVNode,withCtx:_withCtx,openBlock:_openBlock,createBlock:_createBlock,createCommentVNode:_createCommentVNode,mergeProps:_mergeProps,unref:_unref,Fragment:_Fragment,createElementBlock:_createElementBlock,renderList:_renderList,withModifiers:_withModifiers,normalizeClass:_normalizeClass,normalizeStyle:_normalizeStyle} = await importShared('vue');
 
