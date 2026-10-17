@@ -213,7 +213,20 @@ class BrushTaskStatePayload(BaseModel):
     enabled: bool
 
 
-class BrushFlowSettingsPayload(BaseModel):
+class BrushFlowFocusPayload(BaseModel):
+    manual_focus_site_id: Optional[int] = Field(None, gt=0)
+
+    @field_validator("manual_focus_site_id", mode="before")
+    @classmethod
+    def normalize_manual_focus_site_id(cls, value):
+        if value is None or value in ("", 0, "0"):
+            return None
+        if isinstance(value, bool):
+            raise ValueError("请选择有效站点")
+        return value
+
+
+class BrushFlowSettingsPayload(BrushFlowFocusPayload):
     """
     刷流插件全局设置请求模型
     """

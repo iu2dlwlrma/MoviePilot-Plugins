@@ -44,6 +44,16 @@ class BrushFlowModelTests(unittest.TestCase):
             with self.subTest(hours=hours), self.assertRaises(pydantic.ValidationError):
                 self.task(rotation_hours=hours)
 
+    def test_manual_focus_site_validation(self):
+        payload = self.models.BrushFlowSettingsPayload
+        self.assertEqual(payload(manual_focus_site_id=2).manual_focus_site_id, 2)
+        for value in (None, "", 0, "0"):
+            with self.subTest(value=value):
+                self.assertIsNone(payload(manual_focus_site_id=value).manual_focus_site_id)
+        for value in (-1, 1.5, "unknown", True, float("inf")):
+            with self.subTest(value=value), self.assertRaises(pydantic.ValidationError):
+                payload(manual_focus_site_id=value)
+
     def test_downloader_required_only_for_independent_tasks(self):
         self.assertIsNone(self.task(downloader="  ").downloader)
         with self.assertRaises(pydantic.ValidationError):

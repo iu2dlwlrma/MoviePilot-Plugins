@@ -33,6 +33,7 @@ const status = ref({
   enabled: false,
   show_sidebar_nav: true,
   rotation_mode: 'parallel',
+  manual_focus_site_id: null,
   summary: {},
   tasks: [],
   options: { sites: [], downloaders: [] },
@@ -55,6 +56,7 @@ const settingsDraft = ref({
   enabled: false,
   show_sidebar_nav: true,
   rotation_mode: 'parallel',
+  manual_focus_site_id: null,
   global_disksize: null,
   global_defaults: {},
   global_proxy_delete: false,
@@ -65,6 +67,16 @@ let refreshTimer
 
 const pluginBase = computed(() => `plugin/${props.pluginId || 'BrushFlow'}`)
 const tasks = computed(() => status.value.tasks || [])
+const manualFocusSites = computed(() => {
+  const sites = new Map()
+  tasks.value.forEach(task => {
+    const siteId = Number(task.site_id)
+    if (task.enabled && Number.isSafeInteger(siteId) && siteId > 0 && !sites.has(siteId)) {
+      sites.set(siteId, { title: task.site_name || task.name || String(siteId), value: siteId })
+    }
+  })
+  return [...sites.values()]
+})
 const metrics = computed(() => status.value.metrics || {})
 const downloadSlots = computed(() => status.value.download_slots || {})
 const sortedTasks = computed(() => [...tasks.value].sort((left, right) => {
@@ -89,6 +101,11 @@ const sortedTasks = computed(() => [...tasks.value].sort((left, right) => {
 const siteRotation = computed(() => status.value.site_rotation || {})
 const sequentialMode = computed(() => (status.value.rotation_mode || siteRotation.value.mode) === 'sequential')
 const ratioPhase = computed(() => siteRotation.value.phase === 'ratio')
+const focusSwitchText = computed(() => ({
+  manual: '手动指定，清空后恢复自动',
+  novice: '考核优先',
+  ratio: '达标后切换',
+}[siteRotation.value.phase] || ''))
 const rotationRetrying = computed(() => sequentialMode.value && Boolean(siteRotation.value.retry_at))
 const selectedTask = computed(() => tasks.value.find(item => item.id === selectedTaskId.value) || null)
 const selectedState = computed(() => isRetryingTask(selectedTask.value)
@@ -157,6 +174,7 @@ async function loadStatus({ preserveSelection = true, loadDetail = true } = {}) 
       enabled: Boolean(status.value.enabled),
       show_sidebar_nav: status.value.show_sidebar_nav !== false,
       rotation_mode: status.value.rotation_mode || 'parallel',
+      manual_focus_site_id: status.value.manual_focus_site_id ?? null,
       global_disksize: status.value.global_disksize ?? null,
       global_defaults: status.value.global_defaults || {},
       global_proxy_delete: Boolean(status.value.global_proxy_delete),
@@ -241,6 +259,7 @@ async function saveGlobalDefaults(defaults, applyToExisting = false) {
       enabled: status.value.enabled,
       show_sidebar_nav: status.value.show_sidebar_nav,
       rotation_mode: status.value.rotation_mode || 'parallel',
+      manual_focus_site_id: status.value.manual_focus_site_id ?? null,
       global_disksize: status.value.global_disksize,
       global_proxy_delete: status.value.global_proxy_delete,
       global_delete_size_range: status.value.global_delete_size_range,
@@ -323,6 +342,25 @@ async function saveSettings() {
     notify('全局设置已保存')
   } catch (err) {
     notify(err?.message || '保存全局设置失败', 'error')
+  } finally {
+    saving.value = false
+  }
+}
+
+async function saveManualFocus(value) {
+  if (saving.value || !sequentialMode.value) {
+    settingsDraft.value.manual_focus_site_id = status.value.manual_focus_site_id ?? null
+    return
+  }
+  saving.value = true
+  try {
+    const payload = { manual_focus_site_id: normalizeSettings({ manual_focus_site_id: value }).manual_focus_site_id }
+    status.value = unwrapResponse(await props.api.post(`${pluginBase.value}/focus`, payload))
+    settingsDraft.value.manual_focus_site_id = status.value.manual_focus_site_id ?? null
+    notify(payload.manual_focus_site_id == null ? '已恢复自动调度' : '手动重点已保存')
+  } catch (err) {
+    settingsDraft.value.manual_focus_site_id = status.value.manual_focus_site_id ?? null
+    notify(err?.message || '保存手动重点失败', 'error')
   } finally {
     saving.value = false
   }
@@ -506,8 +544,21 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                   { title: '多站并行', value: 'parallel' },
                   { title: '单站达标后轮转', value: 'sequential' },
                 ]"
-                hint="单站按优先级刷至分享率达标；全部达标后按配置顺序轮转，默认每站 24 小时。"
+                hint="考核优先，其次未达标分享率，全部达标后轮转，默认每站 24 小时。账号数据未知时需先刷新。"
                 persistent-hint
+              />
+              <VSelect
+                v-if="settingsDraft.rotation_mode === 'sequential'"
+                v-model="settingsDraft.manual_focus_site_id"
+                label="手动重点站"
+                :items="manualFocusSites"
+                :loading="saving"
+                :disabled="saving || !sequentialMode"
+                placeholder="自动调度"
+                hint="留空自动调度；选定站点优先于自动调度，清空后恢复自动。"
+                clearable
+                persistent-hint
+                @update:model-value="saveManualFocus"
               />
               <VDivider />
               <VSwitch
@@ -557,11 +608,11 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
           <VChip size="small" variant="tonal">站点连接失败 · 已重试 {{ siteRotation.retry_count || 0 }}/5</VChip>
           <span class="text-body-2">下次重试 {{ formatDateTime(siteRotation.retry_at * 1000) }}；五次仍失败后跳过</span>
         </template>
-        <VChip v-else-if="ratioPhase" size="small" variant="tonal">达标后切换</VChip>
+        <VChip v-else-if="focusSwitchText" size="small" variant="tonal">{{ focusSwitchText }}</VChip>
         <VChip v-else-if="siteRotation.deadline_at" size="small" variant="tonal">预计切换 {{ formatDateTime(siteRotation.deadline_at) }}</VChip>
-        <span v-if="!rotationRetrying && !ratioPhase && siteRotation.deadline_at && siteRotation.remaining_seconds != null" class="text-body-2">{{ Number(siteRotation.remaining_seconds) > 0 ? '剩余约 ' : '' }}{{ formatRemainingTime(siteRotation.remaining_seconds) }}</span>
+        <span v-if="!rotationRetrying && !focusSwitchText && siteRotation.deadline_at && siteRotation.remaining_seconds != null" class="text-body-2">{{ Number(siteRotation.remaining_seconds) > 0 ? '剩余约 ' : '' }}{{ formatRemainingTime(siteRotation.remaining_seconds) }}</span>
       </div>
-      每次仅当前站新增。未达标站按优先级刷至达标，全部达标后按配置顺序定时轮转；旧种继续下载、做种并按删除规则清理。
+      每次仅当前站新增。自动调度：考核优先，其次未达标分享率，全部达标后轮转；账号数据未知时需先刷新。旧种继续下载、做种并按删除规则清理。
     </VAlert>
 
     <div v-if="loading && !tasks.length" class="brushflow-loading">
@@ -765,7 +816,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                   <dl class="brushflow-facts">
                     <div><dt>选种优先级</dt><dd>{{ priorityText }}</dd></div>
                     <div v-if="sequentialMode"><dt>达标后每站驻留</dt><dd>{{ taskConfig.rotation_hours ?? 24 }} 小时</dd></div>
-                    <div v-if="sequentialMode && selectedTask.is_focus && ratioPhase"><dt>切换条件</dt><dd>分享率达标后切换</dd></div>
+                    <div v-if="sequentialMode && selectedTask.is_focus && focusSwitchText"><dt>切换条件</dt><dd>{{ focusSwitchText }}</dd></div>
                     <div v-else-if="sequentialMode && selectedTask.is_focus && siteRotation.deadline_at"><dt>预计切换</dt><dd>{{ formatDateTime(siteRotation.deadline_at) }}</dd></div>
                     <div><dt>刷新周期</dt><dd>{{ taskConfig.cron || `每 ${taskConfig.brush_interval} 分钟` }}</dd></div>
                     <div><dt>检查周期</dt><dd>每 {{ taskConfig.check_interval }} 分钟</dd></div>
@@ -972,7 +1023,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                     <div><dt>包含规则</dt><dd>{{ taskConfig.include || '无' }}</dd></div>
                     <div><dt>排除规则</dt><dd>{{ taskConfig.exclude || '无' }}</dd></div>
                     <div><dt>保种上限</dt><dd>{{ taskConfig.disksize ? `${taskConfig.disksize} GB` : '不限' }}</dd></div>
-                    <div><dt>目标分享率</dt><dd>{{ taskConfig.site_ratio_target || '不限' }}{{ sequentialMode ? '（达标后切换）' : '' }}</dd></div>
+                    <div><dt>目标分享率</dt><dd>{{ taskConfig.site_ratio_target || '不限' }}{{ sequentialMode && ratioPhase ? '（达标后切换）' : '' }}</dd></div>
                     <div><dt>达标后每站驻留时间</dt><dd>{{ taskConfig.rotation_hours ?? 24 }} 小时{{ sequentialMode ? '' : '（单站轮换模式生效）' }}</dd></div>
                     <div><dt>新手考核</dt><dd>{{ selectedTask.novice ? '优先' : taskConfig.novice ? '已到期' : '关闭' }}</dd></div>
                     <div v-if="taskConfig.novice_until"><dt>考核截止</dt><dd>{{ formatDateTime(taskConfig.novice_until) }}</dd></div>

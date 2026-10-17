@@ -146,6 +146,8 @@ export function normalizeDefaults(defaults = {}) {
 export function normalizeSettings(settings = {}) {
   const result = { ...(settings || {}) }
   result.rotation_mode = result.rotation_mode === 'sequential' ? 'sequential' : 'parallel'
+  const manualFocusSiteId = ['number', 'string'].includes(typeof result.manual_focus_site_id) ? Number(result.manual_focus_site_id) : NaN
+  result.manual_focus_site_id = Number.isSafeInteger(manualFocusSiteId) && manualFocusSiteId > 0 ? manualFocusSiteId : null
   const limitFields = ['global_disksize']
   limitFields.forEach(key => {
     const value = Number(result[key] || 0)
