@@ -810,6 +810,7 @@ class BrushFlowTests(unittest.TestCase):
         self.assertEqual(p._select_rotation_site({}, start), first.site_id)
         reloaded = self.cls()
         reloaded._rotation_mode = "sequential"
+        reloaded._runtime_lock = threading.Lock()
         reloaded._task_configs = p._task_configs
         reloaded.get_data = p.get_data
         reloaded.save_data = p.save_data
@@ -879,7 +880,7 @@ class BrushFlowTests(unittest.TestCase):
         finally:
             p._brush_lock.release()
 
-    def test_manual_focus_account_backoff_does_not_block_healthy_fallback(self):
+    def test_manual_focus_is_not_blocked_by_account_statistics_backoff(self):
         p = self.plugin
         p._rotation_mode = "sequential"
         self.add_task(1)
@@ -890,11 +891,112 @@ class BrushFlowTests(unittest.TestCase):
                                       "health_checked": True, "retry_cooldowns": {}}
         self.data["ratio_refresh.2"] = {"success": False, "failures": 6, "next_attempt": 4000}
         with patch.object(self.ns["time"], "time", return_value=1000):
-            self.assertEqual(p._select_rotation_site({}, 1000), 1)
-            self.assertTrue(p._is_focus_site(1))
-            self.assertFalse(p._is_focus_site(2))
-        self.data["ratio_refresh.2"] = {"success": True}
-        self.assertEqual(p._select_rotation_site({}, 1001), 2)
+            self.assertEqual(p._select_rotation_site({}, 1000), 2)
+            self.assertFalse(p._is_focus_site(1))
+            self.assertTrue(p._is_focus_site(2))
+        self.assertEqual(self.data["ratio_refresh.2"], {"success": False, "failures": 6, "next_attempt": 4000})
+
+    def test_new_manual_choice_retries_once_but_same_choice_preserves_connection_retries(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1)
+        self.add_task(2)
+        self.ns["schemas"] = SimpleNamespace(Response=lambda **values: SimpleNamespace(**values))
+        p._save_config = Mock()
+        p._build_status_data = lambda: {}
+        self.data["site_rotation"] = {"site_id": 1, "phase": "round_robin", "deadline_at": 5000,
+                                      "retry_cooldowns": {"2": 4000}}
+        payload = self.ns["BrushFlowFocusPayload"](manual_focus_site_id=2)
+        self.assertTrue(p.update_focus(payload).success)
+        with patch.object(self.ns["time"], "time", return_value=100):
+            self.assertFalse(p._is_focus_site(1))
+            self.assertEqual(p._select_rotation_site({}, 100), 2)
+        self.site_test.return_value = (False, "unavailable")
+        self.assertFalse(p._check_rotation_site(100))
+        self.assertTrue(p.update_focus(payload).success)
+        self.assertEqual(p._select_rotation_site({}, 101), 2)
+        self.assertFalse(p._check_rotation_site(699))
+        self.assertEqual(self.data["site_rotation"]["retry_at"], 700)
+        for now in (700, 1300, 1900, 2500, 3100):
+            p._check_rotation_site(now)
+        self.assertEqual(p._select_rotation_site({}, 3101), 1)
+        p._get_site_name = lambda sid: str(sid)
+        with patch.object(self.ns["time"], "time", return_value=3101):
+            self.assertEqual(p._build_manual_focus_status()["state"], "cooldown")
+        self.assertEqual(self.site_test.call_count, 6)
+
+    def test_manual_focus_status_distinguishes_requested_and_actual_site(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1)
+        self.add_task(2)
+        p._get_site_name = lambda sid: str(sid)
+        self.assertIsNone(p._build_manual_focus_status())
+        p._manual_focus_site_id = 2
+        self.data["site_rotation"] = {"site_id": 1, "phase": "round_robin", "deadline_at": 5000}
+        self.assertEqual(p._build_manual_focus_status()["state"], "pending")
+        self.data["site_rotation"] = {"site_id": 2, "phase": "manual"}
+        self.assertEqual(p._build_manual_focus_status()["state"], "checking")
+        self.data["site_rotation"]["health_checked"] = True
+        self.assertEqual(p._build_manual_focus_status()["state"], "active")
+        self.data["site_rotation"].update(health_checked=False, retry_at=700, retry_count=1)
+        status = p._build_manual_focus_status()
+        self.assertEqual((status["state"], status["retry_count"], status["retry_at"]), ("retrying", 1, 700))
+
+    def test_existing_manual_focus_request_can_recheck_nullable_retry_state(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(2)
+        p._manual_focus_site_id = 2
+        self.data["manual_focus_request"] = {"site_id": 2, "pending": True}
+        self.data["site_rotation"] = {"site_id": 2, "phase": "manual", "health_checked": True, "retry_at": None}
+        self.assertEqual(p._select_rotation_site({}, 100), 2)
+        self.assertTrue(p._check_rotation_site(100))
+        self.assertFalse(self.data["manual_focus_request"]["pending"])
+        self.site_test.assert_called_once()
+
+    def test_selection_serializes_new_manual_request_without_resetting_connection_retry(self):
+        p = self.plugin
+        p._rotation_mode = "sequential"
+        self.add_task(1)
+        self.add_task(2)
+        self.ns["schemas"] = SimpleNamespace(Response=lambda **values: SimpleNamespace(**values))
+        p._save_config = Mock()
+        p._build_status_data = lambda: {}
+        started, saved = threading.Event(), threading.Event()
+        def choose():
+            started.set()
+            p.update_focus(self.ns["BrushFlowFocusPayload"](manual_focus_site_id=2))
+            saved.set()
+        worker = threading.Thread(target=choose)
+        def ratio(task, *args):
+            if not started.is_set():
+                worker.start()
+                self.assertTrue(started.wait(1))
+                self.assertFalse(saved.wait(.05))
+            return {"available": True, "reached": True}
+        p._build_site_ratio_status = ratio
+        self.assertEqual(p._select_rotation_site({}, 100), 1)
+        worker.join(1)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(saved.is_set())
+        self.assertEqual(p._select_rotation_site({}, 100), 2)
+        self.site_test.return_value = (False, "unavailable")
+        self.assertFalse(p._check_rotation_site(100))
+        self.assertEqual(p._select_rotation_site({}, 101), 2)
+        self.assertFalse(p._check_rotation_site(101))
+        self.assertEqual(self.data["site_rotation"]["retry_at"], 700)
+        self.site_test.assert_called_once()
+
+    def test_account_refresh_failure_is_visible_without_faking_a_brush_failure(self):
+        p = self.plugin
+        self.add_task(1)
+        p._get_site_name = lambda sid: str(sid)
+        p._get_statistic_info = lambda tid: {}
+        self.data["ratio_refresh.1"] = {"success": False, "failures": 7, "checked_at": 100, "next_attempt": 3700}
+        summary = p._task_summary("1")
+        self.assertEqual(summary["account_refresh"], self.data["ratio_refresh.1"])
+        self.assertIsNone(summary["last_run"])
 
     def test_disabled_manual_site_is_ignored_in_persisted_and_displayed_settings(self):
         p = self.plugin

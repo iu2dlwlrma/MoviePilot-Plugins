@@ -1,5 +1,5 @@
 import { importShared } from './__federation_fn_import-JrT3xvdd.js';
-import { _ as _export_sfc, f as formatBytes, a as formatDateTime, b as formatRemainingTime, t as taskStateMeta, u as unwrapResponse } from './_plugin-vue_export-helper-vfYzdkRw.js';
+import { _ as _export_sfc, f as formatDateTime, a as formatBytes, b as formatRemainingTime, t as taskStateMeta, u as unwrapResponse } from './_plugin-vue_export-helper-CPyOxquJ.js';
 
 const {createElementVNode:_createElementVNode,toDisplayString:_toDisplayString,unref:_unref,openBlock:_openBlock,createElementBlock:_createElementBlock,createCommentVNode:_createCommentVNode,resolveComponent:_resolveComponent,createVNode:_createVNode,renderList:_renderList,Fragment:_Fragment,createTextVNode:_createTextVNode,createBlock:_createBlock} = await importShared('vue');
 
@@ -15,8 +15,9 @@ const _hoisted_5 = { key: 1 };
 const _hoisted_6 = { key: 2 };
 const _hoisted_7 = { key: 3 };
 const _hoisted_8 = { key: 4 };
-const _hoisted_9 = { class: "brushflow-dashboard__tasks" };
-const _hoisted_10 = {
+const _hoisted_9 = { key: 5 };
+const _hoisted_10 = { class: "brushflow-dashboard__tasks" };
+const _hoisted_11 = {
   key: 0,
   class: "brushflow-dashboard__empty"
 };
@@ -40,6 +41,17 @@ const status = ref({ summary: {}, tasks: [] });
 let refreshTimer;
 
 const sequentialMode = computed(() => (status.value.rotation_mode || status.value.site_rotation?.mode) === 'sequential');
+const manualFocusNotice = computed(() => {
+  const focus = status.value.manual_focus;
+  if (!focus) return ''
+  const name = focus.site_name || String(focus.site_id);
+  if (focus.state === 'pending') return `已手动指定 ${name}，等待当前页处理完成或调度切换。`
+  if (focus.state === 'checking') return `正在检查手动重点站 ${name} 的连接。`
+  if (focus.state === 'cooldown') {
+    return `手动重点站 ${name} 暂不可用，已跳过本轮${focus.retry_at ? `；下次重试 ${formatDateTime(focus.retry_at * 1000)}` : ''}。`
+  }
+  return ''
+});
 const runningTasks = computed(() => (status.value.tasks || [])
   .filter(item => item.enabled)
   .sort((left, right) => sequentialMode.value ? Number(Boolean(right.is_focus)) - Number(Boolean(left.is_focus)) : 0)
@@ -110,11 +122,14 @@ return (_ctx, _cache) => {
                   : (status.value.site_rotation?.deadline_at)
                     ? (_openBlock(), _createElementBlock("span", _hoisted_8, "预计切换 " + _toDisplayString(_unref(formatDateTime)(status.value.site_rotation.deadline_at)) + " · " + _toDisplayString(Number(status.value.site_rotation.remaining_seconds) > 0 ? '剩余约 ' : '') + _toDisplayString(_unref(formatRemainingTime)(status.value.site_rotation.remaining_seconds)), 1))
                     : _createCommentVNode("", true),
+          (manualFocusNotice.value)
+            ? (_openBlock(), _createElementBlock("span", _hoisted_9, _toDisplayString(manualFocusNotice.value), 1))
+            : _createCommentVNode("", true),
           _cache[4] || (_cache[4] = _createElementVNode("span", null, "每次仅当前站新增；全部站点达标后按配置顺序定时轮转。旧种继续下载、做种和按规则清理。", -1))
         ]))
       : _createCommentVNode("", true),
     _createVNode(_component_VDivider),
-    _createElementVNode("div", _hoisted_9, [
+    _createElementVNode("div", _hoisted_10, [
       (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(runningTasks.value, (task) => {
         return (_openBlock(), _createElementBlock("div", {
           key: task.id
@@ -132,7 +147,7 @@ return (_ctx, _cache) => {
         ]))
       }), 128)),
       (!runningTasks.value.length)
-        ? (_openBlock(), _createElementBlock("div", _hoisted_10, [
+        ? (_openBlock(), _createElementBlock("div", _hoisted_11, [
             _createVNode(_component_VIcon, { icon: "mdi-sync-off" }),
             _cache[5] || (_cache[5] = _createTextVNode(" 暂无启用的刷流任务 ", -1))
           ]))
@@ -151,6 +166,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const Dashboard = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-9572de5c"]]);
+const Dashboard = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-b95a1c52"]]);
 
 export { Dashboard as default };

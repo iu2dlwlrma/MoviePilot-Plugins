@@ -262,7 +262,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.14"
+    plugin_version = "7.2.15"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -344,6 +344,7 @@ class BrushFlow(_PluginBase):
             self._task_locks[task.id] = threading.Lock()
             self._runtime[task.id] = {"state": "idle", "operation": None, "last_error": None}
 
+        self._request_manual_focus(self._active_manual_focus_site_id())
         normalized = self._current_config()
         if migrated or raw_config != normalized:
             self.update_config(normalized)
@@ -621,7 +622,7 @@ class BrushFlow(_PluginBase):
                 return schemas.Response(success=False, message="请选择已启用的刷流站点")
             if self._stopping or getattr(self, "_rotation_mode", "parallel") != "sequential":
                 return schemas.Response(success=False, message="请先启用单站轮换模式")
-            self._manual_focus_site_id = site_id
+            self._request_manual_focus(site_id)
             self._save_config()
         for task in list(self._task_configs.values()):
             if task.enabled and (site_id is None or task.site_id == site_id):
@@ -675,7 +676,7 @@ class BrushFlow(_PluginBase):
         if rotation_mode != getattr(self, "_rotation_mode", "parallel"):
             self.save_data("site_rotation", {})
         self._rotation_mode = rotation_mode
-        self._manual_focus_site_id = manual_focus_site_id
+        self._request_manual_focus(manual_focus_site_id)
         if not self._enabled:
             self._restore_download_budgets()
         for field in GLOBAL_LIMIT_FIELDS:
@@ -1254,6 +1255,7 @@ class BrushFlow(_PluginBase):
             "rotation_mode": getattr(self, "_rotation_mode", "parallel"),
             "manual_focus_site_id": self._active_manual_focus_site_id(),
             "site_rotation": self._build_rotation_status(),
+            "manual_focus": self._build_manual_focus_status(),
             "global_defaults": self._global_defaults,
             **{field: getattr(self, f"_{field}", None) for field in GLOBAL_LIMIT_FIELDS},
             **{field: getattr(self, f"_{field}", None) for field in GLOBAL_DYNAMIC_DELETE_FIELDS},
@@ -1278,6 +1280,7 @@ class BrushFlow(_PluginBase):
         history = self._get_task_data(task_id, "runs") or []
         runtime = dict(self._runtime.get(task_id, {}))
         site_ratio = self._build_site_ratio_status(task, site_user_data_by_domain)
+        account_refresh = self.get_data(f"ratio_refresh.{task.site_id}") or {}
         if not self.get_state():
             display_state = "disabled"
         elif not task.enabled:
@@ -1313,6 +1316,8 @@ class BrushFlow(_PluginBase):
             "statistic": statistic,
             "seeding_size": self.__calculate_seeding_torrents_size(torrents),
             "site_ratio": site_ratio,
+            "account_refresh": {key: account_refresh.get(key)
+                                for key in ("success", "failures", "checked_at", "next_attempt")},
             "priority": self._priority_tier(task, site_ratio),
             "priority_reason": "手动重点" if self._priority_tier(task, site_ratio) == -1 else (
                 "账号数据待刷新" if not site_ratio.get("available") or site_ratio.get("stale") else (
@@ -1628,8 +1633,17 @@ class BrushFlow(_PluginBase):
         return site_id if any(task.enabled and task.site_id == site_id
                               for task in self._task_configs.values()) else None
 
+    def _request_manual_focus(self, site_id: Optional[int]) -> None:
+        self._manual_focus_site_id = site_id
+        request = self.get_data("manual_focus_request") or {}
+        if request.get("site_id") != site_id or (site_id is not None and "pending" not in request):
+            self.save_data("manual_focus_request", {"site_id": site_id, "pending": site_id is not None})
+
     def _site_retry_until(self, site_id: int, state: dict) -> float:
         until = state.get("retry_cooldowns", {}).get(str(site_id), 0)
+        if site_id == self._active_manual_focus_site_id():
+            request = self.get_data("manual_focus_request") or {}
+            return 0 if request.get("site_id") == site_id and request.get("pending") else until
         refresh = self.get_data(f"ratio_refresh.{site_id}") or {}
         if refresh.get("failures", 0) >= 6:
             until = max(until, refresh.get("next_attempt", 0))
@@ -1651,6 +1665,17 @@ class BrushFlow(_PluginBase):
                                                     or deadline > time.time()) and not state.get("retry_at")
 
     def _select_rotation_site(self, site_data: dict, now: Optional[float] = None) -> Optional[int]:
+        with self._runtime_lock:
+            previous = dict(self.get_data("site_rotation") or {})
+            selected = self._select_rotation_site_locked(site_data, now)
+            changed = previous != (self.get_data("site_rotation") or {})
+        if selected is not None and changed:
+            for task in list(self._task_configs.values()):
+                if task.enabled and task.site_id == selected:
+                    self._queue_brush(task.id)
+        return selected
+
+    def _select_rotation_site_locked(self, site_data: dict, now: Optional[float] = None) -> Optional[int]:
         """未达标站按优先级逐站补分享率，全部达标后按配置顺序驻留。"""
         if getattr(self, "_rotation_mode", "parallel") != "sequential":
             return None
@@ -1660,6 +1685,15 @@ class BrushFlow(_PluginBase):
         state = self.get_data("site_rotation") or {}
         cooldowns = {str(sid): until for sid, until in state.get("retry_cooldowns", {}).items()
                      if str(sid) in {str(site_id) for site_id in site_ids}}
+        request = self.get_data("manual_focus_request") or {}
+        manual_site_id = self._active_manual_focus_site_id()
+        if manual_site_id is not None and request.get("site_id") == manual_site_id and request.get("pending"):
+            cooldowns.pop(str(manual_site_id), None)
+            state["retry_cooldowns"] = cooldowns
+            if state.get("site_id") == manual_site_id:
+                state.update(health_checked=False, retry_at=None, retry_count=0)
+            self.save_data("site_rotation", state)
+            self.save_data("manual_focus_request", {**request, "pending": False})
         if not tasks:
             if state:
                 self.save_data("site_rotation", {})
@@ -1722,9 +1756,6 @@ class BrushFlow(_PluginBase):
             "visited_site_ids": [sid for sid in visited if sid != selected.site_id] + [selected.site_id],
             "retry_cooldowns": cooldowns,
         })
-        for task in tasks:
-            if task.site_id == selected.site_id:
-                self._queue_brush(task.id)
         reason = {"manual": "手动重点", "novice": "考核优先", "ratio": "达标后切换", "round_robin": "按驻留时间轮转"}
         logger.info(f"刷流当前站点：{selected.name}，{reason[phase]}，已有种子继续托管")
         return selected.site_id
@@ -1779,7 +1810,7 @@ class BrushFlow(_PluginBase):
             return False
         if state.get("health_checked"):
             return True
-        if state.get("retry_at", 0) > now:
+        if (state.get("retry_at") or 0) > now:
             return False
         site = SiteOper().get(task.site_id)
         try:
@@ -1810,6 +1841,26 @@ class BrushFlow(_PluginBase):
             logger.warning(f"刷流站点 [{task.name}] 不可用，十分钟后重试（已重试 {retries}/5）")
         self.save_data("site_rotation", state)
         return False
+
+    def _build_manual_focus_status(self) -> Optional[Dict[str, Any]]:
+        site_id = self._active_manual_focus_site_id()
+        if site_id is None or getattr(self, "_rotation_mode", "parallel") != "sequential":
+            return None
+        state = self.get_data("site_rotation") or {}
+        request = self.get_data("manual_focus_request") or {}
+        retry_at = None
+        if request.get("site_id") == site_id and request.get("pending"):
+            phase = "pending"
+        elif state.get("site_id") == site_id and state.get("phase") == "manual":
+            retry_at = state.get("retry_at")
+            phase = "retrying" if retry_at else "active" if state.get("health_checked") else "checking"
+        else:
+            retry_at = self._site_retry_until(site_id, state)
+            phase = "cooldown" if retry_at > time.time() else "pending"
+            retry_at = retry_at if phase == "cooldown" else None
+        return {"site_id": site_id, "site_name": self._get_site_name(site_id), "state": phase,
+                "retry_at": retry_at, "retry_count": state.get("retry_count", 0)
+                if state.get("site_id") == site_id else 0}
 
     def _build_rotation_status(self) -> Dict[str, Any]:
         state = self.get_data("site_rotation") or {}

@@ -99,6 +99,18 @@ const sortedTasks = computed(() => [...tasks.value].sort((left, right) => {
     || Number(right.ratio_deficit_bytes || 0) - Number(left.ratio_deficit_bytes || 0)
 }))
 const siteRotation = computed(() => status.value.site_rotation || {})
+const manualFocus = computed(() => status.value.manual_focus || null)
+const manualFocusNotice = computed(() => {
+  const focus = manualFocus.value
+  if (!focus) return ''
+  const name = focus.site_name || String(focus.site_id)
+  if (focus.state === 'pending') return `已手动指定 ${name}，等待当前页处理完成或调度切换。`
+  if (focus.state === 'checking') return `正在检查手动重点站 ${name} 的连接。`
+  if (focus.state === 'cooldown') {
+    return `手动重点站 ${name} 暂不可用，已跳过本轮${focus.retry_at ? `；下次重试 ${formatDateTime(focus.retry_at * 1000)}` : ''}。`
+  }
+  return ''
+})
 const sequentialMode = computed(() => (status.value.rotation_mode || siteRotation.value.mode) === 'sequential')
 const ratioPhase = computed(() => siteRotation.value.phase === 'ratio')
 const focusSwitchText = computed(() => ({
@@ -131,7 +143,8 @@ const reasonEntries = computed(() => {
 })
 const maxReasonCount = computed(() => Math.max(1, ...reasonEntries.value.map(item => item.count)))
 const pipelineStages = computed(() => {
-  const run = latestBrushRun.value || {}
+  const run = latestBrushRun.value
+  if (!run) return []
   const sourceCount = Number(run.source_count || 0)
   const candidateCount = Number(run.candidate_count || 0)
   const addedCount = Number(run.added_count || 0)
@@ -163,22 +176,24 @@ function notify(text, color = 'success') {
 }
 
 // 从插件状态接口加载全局设置和任务摘要。
-async function loadStatus({ preserveSelection = true, loadDetail = true } = {}) {
+async function loadStatus({ preserveSelection = true, loadDetail = true, syncSettings = !settingsMenu.value } = {}) {
   loading.value = true
   error.value = ''
   try {
     const data = unwrapResponse(await props.api.get(`${pluginBase.value}/status`))
     status.value = data || status.value
     statusLoaded.value = true
-    settingsDraft.value = {
-      enabled: Boolean(status.value.enabled),
-      show_sidebar_nav: status.value.show_sidebar_nav !== false,
-      rotation_mode: status.value.rotation_mode || 'parallel',
-      manual_focus_site_id: status.value.manual_focus_site_id ?? null,
-      global_disksize: status.value.global_disksize ?? null,
-      global_defaults: status.value.global_defaults || {},
-      global_proxy_delete: Boolean(status.value.global_proxy_delete),
-      global_delete_size_range: status.value.global_delete_size_range ?? null,
+    if (syncSettings) {
+      settingsDraft.value = {
+        enabled: Boolean(status.value.enabled),
+        show_sidebar_nav: status.value.show_sidebar_nav !== false,
+        rotation_mode: status.value.rotation_mode || 'parallel',
+        manual_focus_site_id: status.value.manual_focus_site_id ?? null,
+        global_disksize: status.value.global_disksize ?? null,
+        global_defaults: status.value.global_defaults || {},
+        global_proxy_delete: Boolean(status.value.global_proxy_delete),
+        global_delete_size_range: status.value.global_delete_size_range ?? null,
+      }
     }
     const selectedStillExists = tasks.value.some(item => item.id === selectedTaskId.value)
     if (!preserveSelection || !selectedStillExists) selectedTaskId.value = sortedTasks.value[0]?.id || ''
@@ -357,7 +372,7 @@ async function saveManualFocus(value) {
     const payload = { manual_focus_site_id: normalizeSettings({ manual_focus_site_id: value }).manual_focus_site_id }
     status.value = unwrapResponse(await props.api.post(`${pluginBase.value}/focus`, payload))
     settingsDraft.value.manual_focus_site_id = status.value.manual_focus_site_id ?? null
-    notify(payload.manual_focus_site_id == null ? '已恢复自动调度' : '手动重点已保存')
+    notify(payload.manual_focus_site_id == null ? '已恢复自动调度' : manualFocusNotice.value || '手动重点已保存')
   } catch (err) {
     settingsDraft.value.manual_focus_site_id = status.value.manual_focus_site_id ?? null
     notify(err?.message || '保存手动重点失败', 'error')
@@ -497,7 +512,7 @@ watch(
 onMounted(async () => {
   await loadStatus({ preserveSelection: false })
   refreshTimer = window.setInterval(() => {
-    if (!editorOpen.value && !globalEditorOpen.value && !settingsMenu.value && document.visibilityState === 'visible') loadStatus()
+    if (!editorOpen.value && !globalEditorOpen.value && document.visibilityState === 'visible') loadStatus()
   }, 30000)
 })
 
@@ -601,7 +616,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
     <VAlert v-if="statusLoaded && !status.enabled" type="warning" variant="tonal">
       插件当前未启用，任务配置与历史仍可查看，启用后才会注册刷新和检查服务。
     </VAlert>
-    <VAlert v-if="statusLoaded && sequentialMode" :type="rotationRetrying ? 'warning' : 'info'" variant="tonal">
+    <VAlert v-if="statusLoaded && sequentialMode" :type="rotationRetrying || manualFocus?.state === 'cooldown' ? 'warning' : 'info'" variant="tonal">
       <div class="d-flex flex-wrap align-center ga-2 mb-2">
         <strong>当前重点站：{{ siteRotation.site_name || '等待选择站点' }}</strong>
         <template v-if="rotationRetrying">
@@ -612,6 +627,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
         <VChip v-else-if="siteRotation.deadline_at" size="small" variant="tonal">预计切换 {{ formatDateTime(siteRotation.deadline_at) }}</VChip>
         <span v-if="!rotationRetrying && !focusSwitchText && siteRotation.deadline_at && siteRotation.remaining_seconds != null" class="text-body-2">{{ Number(siteRotation.remaining_seconds) > 0 ? '剩余约 ' : '' }}{{ formatRemainingTime(siteRotation.remaining_seconds) }}</span>
       </div>
+      <div v-if="manualFocusNotice" class="text-body-2 mb-2">{{ manualFocusNotice }}</div>
       每次仅当前站新增。自动调度：考核优先，其次未达标分享率，全部达标后轮转；账号数据未知时需先刷新。旧种继续下载、做种并按删除规则清理。
     </VAlert>
 
@@ -925,6 +941,14 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
             </VWindowItem>
 
             <VWindowItem value="diagnostics">
+              <VAlert v-if="selectedTask.account_refresh?.success === false" type="warning" variant="tonal" density="compact" title="账号数据刷新失败" class="mb-4">
+                <div>此状态来自站点账号统计刷新，与下载器种子检查独立。</div>
+                <div class="text-body-2">
+                  连续失败 {{ selectedTask.account_refresh.failures ?? '未知' }} 次 ·
+                  最近刷新 {{ selectedTask.account_refresh.checked_at != null ? formatDateTime(selectedTask.account_refresh.checked_at * 1000) : '未知' }} ·
+                  下次重试 {{ selectedTask.account_refresh.next_attempt != null ? formatDateTime(selectedTask.account_refresh.next_attempt * 1000) : '未知' }}
+                </div>
+              </VAlert>
               <div class="brushflow-diagnostic-head">
                 <div>
                   <div class="text-subtitle-1 font-weight-medium">
@@ -939,7 +963,7 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
                 </VChip>
               </div>
 
-              <div class="brushflow-diagnostic-grid">
+              <div v-if="latestBrushRun" class="brushflow-diagnostic-grid">
                 <VSheet tag="section" class="brushflow-panel app-surface-static">
                   <header class="brushflow-panel__head">
                     <div>
