@@ -1,5 +1,5 @@
 import { importShared } from './__federation_fn_import-JrT3xvdd.js';
-import { _ as _export_sfc, c as cloneTask, d as taskOverrideFields, e as effectiveTask, g as taskDefaults, h as editableTask, n as normalizeDefaults, i as normalizeTask, t as taskStateMeta, a as formatDateTime, b as formatRemainingTime, f as formatBytes, j as formatDuration, k as torrentProgress, u as unwrapResponse, l as normalizeSettings } from './_plugin-vue_export-helper-BgEgxKt6.js';
+import { _ as _export_sfc, c as cloneTask, d as taskOverrideFields, e as effectiveTask, g as taskDefaults, h as editableTask, n as normalizeDefaults, i as normalizeTask, t as taskStateMeta, a as formatDateTime, b as formatRemainingTime, f as formatBytes, j as formatDuration, k as torrentProgress, u as unwrapResponse, l as normalizeSettings } from './_plugin-vue_export-helper-vfYzdkRw.js';
 
 const {unref:_unref$1,toDisplayString:_toDisplayString$1,createTextVNode:_createTextVNode$1,resolveComponent:_resolveComponent$1,withCtx:_withCtx$1,createVNode:_createVNode$1,renderList:_renderList$1,Fragment:_Fragment$1,openBlock:_openBlock$1,createElementBlock:_createElementBlock$1,createBlock:_createBlock$1,createCommentVNode:_createCommentVNode$1,createElementVNode:_createElementVNode$1,withModifiers:_withModifiers$1} = await importShared('vue');
 
@@ -790,6 +790,7 @@ const status = ref({
   enabled: false,
   show_sidebar_nav: true,
   rotation_mode: 'parallel',
+  manual_focus_site_id: null,
   summary: {},
   tasks: [],
   options: { sites: [], downloaders: [] },
@@ -812,6 +813,7 @@ const settingsDraft = ref({
   enabled: false,
   show_sidebar_nav: true,
   rotation_mode: 'parallel',
+  manual_focus_site_id: null,
   global_disksize: null,
   global_defaults: {},
   global_proxy_delete: false,
@@ -822,6 +824,16 @@ let refreshTimer;
 
 const pluginBase = computed(() => `plugin/${props.pluginId || 'BrushFlow'}`);
 const tasks = computed(() => status.value.tasks || []);
+const manualFocusSites = computed(() => {
+  const sites = new Map();
+  tasks.value.forEach(task => {
+    const siteId = Number(task.site_id);
+    if (task.enabled && Number.isSafeInteger(siteId) && siteId > 0 && !sites.has(siteId)) {
+      sites.set(siteId, { title: task.site_name || task.name || String(siteId), value: siteId });
+    }
+  });
+  return [...sites.values()]
+});
 const metrics = computed(() => status.value.metrics || {});
 const downloadSlots = computed(() => status.value.download_slots || {});
 const sortedTasks = computed(() => [...tasks.value].sort((left, right) => {
@@ -846,6 +858,11 @@ const sortedTasks = computed(() => [...tasks.value].sort((left, right) => {
 const siteRotation = computed(() => status.value.site_rotation || {});
 const sequentialMode = computed(() => (status.value.rotation_mode || siteRotation.value.mode) === 'sequential');
 const ratioPhase = computed(() => siteRotation.value.phase === 'ratio');
+const focusSwitchText = computed(() => ({
+  manual: '手动指定，清空后恢复自动',
+  novice: '考核优先',
+  ratio: '达标后切换',
+}[siteRotation.value.phase] || ''));
 const rotationRetrying = computed(() => sequentialMode.value && Boolean(siteRotation.value.retry_at));
 const selectedTask = computed(() => tasks.value.find(item => item.id === selectedTaskId.value) || null);
 const selectedState = computed(() => isRetryingTask(selectedTask.value)
@@ -914,6 +931,7 @@ async function loadStatus({ preserveSelection = true, loadDetail = true } = {}) 
       enabled: Boolean(status.value.enabled),
       show_sidebar_nav: status.value.show_sidebar_nav !== false,
       rotation_mode: status.value.rotation_mode || 'parallel',
+      manual_focus_site_id: status.value.manual_focus_site_id ?? null,
       global_disksize: status.value.global_disksize ?? null,
       global_defaults: status.value.global_defaults || {},
       global_proxy_delete: Boolean(status.value.global_proxy_delete),
@@ -998,6 +1016,7 @@ async function saveGlobalDefaults(defaults, applyToExisting = false) {
       enabled: status.value.enabled,
       show_sidebar_nav: status.value.show_sidebar_nav,
       rotation_mode: status.value.rotation_mode || 'parallel',
+      manual_focus_site_id: status.value.manual_focus_site_id ?? null,
       global_disksize: status.value.global_disksize,
       global_proxy_delete: status.value.global_proxy_delete,
       global_delete_size_range: status.value.global_delete_size_range,
@@ -1080,6 +1099,25 @@ async function saveSettings() {
     notify('全局设置已保存');
   } catch (err) {
     notify(err?.message || '保存全局设置失败', 'error');
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function saveManualFocus(value) {
+  if (saving.value || !sequentialMode.value) {
+    settingsDraft.value.manual_focus_site_id = status.value.manual_focus_site_id ?? null;
+    return
+  }
+  saving.value = true;
+  try {
+    const payload = { manual_focus_site_id: normalizeSettings({ manual_focus_site_id: value }).manual_focus_site_id };
+    status.value = unwrapResponse(await props.api.post(`${pluginBase.value}/focus`, payload));
+    settingsDraft.value.manual_focus_site_id = status.value.manual_focus_site_id ?? null;
+    notify(payload.manual_focus_site_id == null ? '已恢复自动调度' : '手动重点已保存');
+  } catch (err) {
+    settingsDraft.value.manual_focus_site_id = status.value.manual_focus_site_id ?? null;
+    notify(err?.message || '保存手动重点失败', 'error');
   } finally {
     saving.value = false;
   }
@@ -1265,7 +1303,7 @@ return (_ctx, _cache) => {
           size: "28"
         }),
         _createElementVNode("div", null, [
-          _cache[23] || (_cache[23] = _createElementVNode("h1", null, "站点刷流", -1)),
+          _cache[24] || (_cache[24] = _createElementVNode("h1", null, "站点刷流", -1)),
           _createElementVNode("p", null, "统一参数 · 考核与分享率优先 · " + _toDisplayString(sequentialMode.value ? '单站轮换' : '多站并行'), 1)
         ])
       ]),
@@ -1277,7 +1315,7 @@ return (_ctx, _cache) => {
           disabled: !statusLoaded.value || saving.value,
           onClick: openGlobalDefaults
         }, {
-          default: _withCtx(() => [...(_cache[24] || (_cache[24] = [
+          default: _withCtx(() => [...(_cache[25] || (_cache[25] = [
             _createTextVNode("统一参数", -1)
           ]))]),
           _: 1
@@ -1296,7 +1334,7 @@ return (_ctx, _cache) => {
           : _createCommentVNode("", true),
         _createVNode(_component_VMenu, {
           modelValue: settingsMenu.value,
-          "onUpdate:modelValue": _cache[6] || (_cache[6] = $event => ((settingsMenu).value = $event)),
+          "onUpdate:modelValue": _cache[7] || (_cache[7] = $event => ((settingsMenu).value = $event)),
           "close-on-content-click": false,
           location: "bottom end"
         }, {
@@ -1339,13 +1377,31 @@ return (_ctx, _cache) => {
                   { title: '多站并行', value: 'parallel' },
                   { title: '单站达标后轮转', value: 'sequential' },
                 ],
-                      hint: "单站按优先级刷至分享率达标；全部达标后按配置顺序轮转，默认每站 24 小时。",
+                      hint: "考核优先，其次未达标分享率，全部达标后轮转，默认每站 24 小时。账号数据未知时需先刷新。",
                       "persistent-hint": ""
                     }, null, 8, ["modelValue"]),
+                    (settingsDraft.value.rotation_mode === 'sequential')
+                      ? (_openBlock(), _createBlock(_component_VSelect, {
+                          key: 0,
+                          modelValue: settingsDraft.value.manual_focus_site_id,
+                          "onUpdate:modelValue": [
+                            _cache[3] || (_cache[3] = $event => ((settingsDraft.value.manual_focus_site_id) = $event)),
+                            saveManualFocus
+                          ],
+                          label: "手动重点站",
+                          items: manualFocusSites.value,
+                          loading: saving.value,
+                          disabled: saving.value || !sequentialMode.value,
+                          placeholder: "自动调度",
+                          hint: "留空自动调度；选定站点优先于自动调度，清空后恢复自动。",
+                          clearable: "",
+                          "persistent-hint": ""
+                        }, null, 8, ["modelValue", "items", "loading", "disabled"]))
+                      : _createCommentVNode("", true),
                     _createVNode(_component_VDivider),
                     _createVNode(_component_VSwitch, {
                       modelValue: settingsDraft.value.global_proxy_delete,
-                      "onUpdate:modelValue": _cache[3] || (_cache[3] = $event => ((settingsDraft.value.global_proxy_delete) = $event)),
+                      "onUpdate:modelValue": _cache[4] || (_cache[4] = $event => ((settingsDraft.value.global_proxy_delete) = $event)),
                       label: "全局动态删种",
                       color: "primary",
                       "hide-details": "",
@@ -1353,9 +1409,9 @@ return (_ctx, _cache) => {
                     }, null, 8, ["modelValue"]),
                     (settingsDraft.value.global_proxy_delete)
                       ? (_openBlock(), _createBlock(_component_VTextField, {
-                          key: 0,
+                          key: 1,
                           modelValue: settingsDraft.value.global_delete_size_range,
-                          "onUpdate:modelValue": _cache[4] || (_cache[4] = $event => ((settingsDraft.value.global_delete_size_range) = $event)),
+                          "onUpdate:modelValue": _cache[5] || (_cache[5] = $event => ((settingsDraft.value.global_delete_size_range) = $event)),
                           label: "全局动态删种阈值（GB）",
                           placeholder: "50-100",
                           clearable: "",
@@ -1365,7 +1421,7 @@ return (_ctx, _cache) => {
                     _createVNode(_component_VDivider),
                     _createVNode(_component_VTextField, {
                       modelValue: settingsDraft.value.global_disksize,
-                      "onUpdate:modelValue": _cache[5] || (_cache[5] = $event => ((settingsDraft.value.global_disksize) = $event)),
+                      "onUpdate:modelValue": _cache[6] || (_cache[6] = $event => ((settingsDraft.value.global_disksize) = $event)),
                       modelModifiers: { number: true },
                       type: "number",
                       min: "0",
@@ -1373,7 +1429,7 @@ return (_ctx, _cache) => {
                       clearable: "",
                       "hide-details": ""
                     }, null, 8, ["modelValue"]),
-                    _cache[25] || (_cache[25] = _createElementVNode("div", { class: "text-body-2 text-medium-emphasis" }, "插件在下载器上限内分配下载名额，速度上限在下载器设置。", -1))
+                    _cache[26] || (_cache[26] = _createElementVNode("div", { class: "text-body-2 text-medium-emphasis" }, "插件在下载器上限内分配下载名额，速度上限在下载器设置。", -1))
                   ]),
                   _: 1
                 }),
@@ -1386,7 +1442,7 @@ return (_ctx, _cache) => {
                       loading: saving.value,
                       onClick: saveSettings
                     }, {
-                      default: _withCtx(() => [...(_cache[26] || (_cache[26] = [
+                      default: _withCtx(() => [...(_cache[27] || (_cache[27] = [
                         _createTextVNode("保存", -1)
                       ]))]),
                       _: 1
@@ -1406,7 +1462,7 @@ return (_ctx, _cache) => {
               icon: "mdi-close",
               variant: "text",
               "aria-label": "关闭",
-              onClick: _cache[7] || (_cache[7] = $event => (emit('close')))
+              onClick: _cache[8] || (_cache[8] = $event => (emit('close')))
             }))
           : _createCommentVNode("", true)
       ])
@@ -1417,7 +1473,7 @@ return (_ctx, _cache) => {
           type: "error",
           variant: "tonal",
           closable: "",
-          "onClick:close": _cache[8] || (_cache[8] = $event => (error.value = ''))
+          "onClick:close": _cache[9] || (_cache[9] = $event => (error.value = ''))
         }, {
           default: _withCtx(() => [
             _createTextVNode(_toDisplayString(error.value), 1)
@@ -1431,7 +1487,7 @@ return (_ctx, _cache) => {
           type: "warning",
           variant: "tonal"
         }, {
-          default: _withCtx(() => [...(_cache[27] || (_cache[27] = [
+          default: _withCtx(() => [...(_cache[28] || (_cache[28] = [
             _createTextVNode(" 插件当前未启用，任务配置与历史仍可查看，启用后才会注册刷新和检查服务。 ", -1)
           ]))]),
           _: 1
@@ -1459,15 +1515,15 @@ return (_ctx, _cache) => {
                     }),
                     _createElementVNode("span", _hoisted_5, "下次重试 " + _toDisplayString(_unref(formatDateTime)(siteRotation.value.retry_at * 1000)) + "；五次仍失败后跳过", 1)
                   ], 64))
-                : (ratioPhase.value)
+                : (focusSwitchText.value)
                   ? (_openBlock(), _createBlock(_component_VChip, {
                       key: 1,
                       size: "small",
                       variant: "tonal"
                     }, {
-                      default: _withCtx(() => [...(_cache[28] || (_cache[28] = [
-                        _createTextVNode("达标后切换", -1)
-                      ]))]),
+                      default: _withCtx(() => [
+                        _createTextVNode(_toDisplayString(focusSwitchText.value), 1)
+                      ]),
                       _: 1
                     }))
                   : (siteRotation.value.deadline_at)
@@ -1482,11 +1538,11 @@ return (_ctx, _cache) => {
                         _: 1
                       }))
                     : _createCommentVNode("", true),
-              (!rotationRetrying.value && !ratioPhase.value && siteRotation.value.deadline_at && siteRotation.value.remaining_seconds != null)
+              (!rotationRetrying.value && !focusSwitchText.value && siteRotation.value.deadline_at && siteRotation.value.remaining_seconds != null)
                 ? (_openBlock(), _createElementBlock("span", _hoisted_6, _toDisplayString(Number(siteRotation.value.remaining_seconds) > 0 ? '剩余约 ' : '') + _toDisplayString(_unref(formatRemainingTime)(siteRotation.value.remaining_seconds)), 1))
                 : _createCommentVNode("", true)
             ]),
-            _cache[29] || (_cache[29] = _createTextVNode(" 每次仅当前站新增。未达标站按优先级刷至达标，全部达标后按配置顺序定时轮转；旧种继续下载、做种并按删除规则清理。 ", -1))
+            _cache[29] || (_cache[29] = _createTextVNode(" 每次仅当前站新增。自动调度：考核优先，其次未达标分享率，全部达标后轮转；账号数据未知时需先刷新。旧种继续下载、做种并按删除规则清理。 ", -1))
           ]),
           _: 1
         }, 8, ["type"]))
@@ -1583,7 +1639,7 @@ return (_ctx, _cache) => {
                   _createElementVNode("div", _hoisted_16, [
                     _createVNode(_component_VSelect, {
                       modelValue: siteSort.value,
-                      "onUpdate:modelValue": _cache[9] || (_cache[9] = $event => ((siteSort).value = $event)),
+                      "onUpdate:modelValue": _cache[10] || (_cache[10] = $event => ((siteSort).value = $event)),
                       items: [
                 { title: '调度优先', value: 'priority' },
                 { title: '上传量高优先', value: 'upload' },
@@ -1731,7 +1787,7 @@ return (_ctx, _cache) => {
                               icon: "mdi-sync",
                               variant: "text",
                               loading: selectedTask.value.operation === 'brush',
-                              onClick: _cache[10] || (_cache[10] = $event => (runOperation('brush')))
+                              onClick: _cache[11] || (_cache[11] = $event => (runOperation('brush')))
                             }), null, 16, ["loading"])
                           ]),
                           _: 1
@@ -1742,7 +1798,7 @@ return (_ctx, _cache) => {
                               icon: "mdi-progress-check",
                               variant: "text",
                               loading: selectedTask.value.operation === 'check',
-                              onClick: _cache[11] || (_cache[11] = $event => (runOperation('check')))
+                              onClick: _cache[12] || (_cache[12] = $event => (runOperation('check')))
                             }), null, 16, ["loading"])
                           ]),
                           _: 1
@@ -1775,7 +1831,7 @@ return (_ctx, _cache) => {
                     ]),
                     _createVNode(_component_VTabs, {
                       modelValue: activeTab.value,
-                      "onUpdate:modelValue": _cache[12] || (_cache[12] = $event => ((activeTab).value = $event)),
+                      "onUpdate:modelValue": _cache[13] || (_cache[13] = $event => ((activeTab).value = $event)),
                       color: "primary",
                       class: "brushflow-tabs"
                     }, {
@@ -1804,7 +1860,7 @@ return (_ctx, _cache) => {
                     _createVNode(_component_VDivider),
                     _createVNode(_component_VWindow, {
                       modelValue: activeTab.value,
-                      "onUpdate:modelValue": _cache[16] || (_cache[16] = $event => ((activeTab).value = $event)),
+                      "onUpdate:modelValue": _cache[17] || (_cache[17] = $event => ((activeTab).value = $event)),
                       touch: false,
                       class: "brushflow-window"
                     }, {
@@ -1886,11 +1942,11 @@ return (_ctx, _cache) => {
                                           _createElementVNode("dd", null, _toDisplayString(taskConfig.value.rotation_hours ?? 24) + " 小时", 1)
                                         ]))
                                       : _createCommentVNode("", true),
-                                    (sequentialMode.value && selectedTask.value.is_focus && ratioPhase.value)
-                                      ? (_openBlock(), _createElementBlock("div", _hoisted_41, [...(_cache[52] || (_cache[52] = [
-                                          _createElementVNode("dt", null, "切换条件", -1),
-                                          _createElementVNode("dd", null, "分享率达标后切换", -1)
-                                        ]))]))
+                                    (sequentialMode.value && selectedTask.value.is_focus && focusSwitchText.value)
+                                      ? (_openBlock(), _createElementBlock("div", _hoisted_41, [
+                                          _cache[52] || (_cache[52] = _createElementVNode("dt", null, "切换条件", -1)),
+                                          _createElementVNode("dd", null, _toDisplayString(focusSwitchText.value), 1)
+                                        ]))
                                       : (sequentialMode.value && selectedTask.value.is_focus && siteRotation.value.deadline_at)
                                         ? (_openBlock(), _createElementBlock("div", _hoisted_42, [
                                             _cache[53] || (_cache[53] = _createElementVNode("dt", null, "预计切换", -1)),
@@ -1984,7 +2040,7 @@ return (_ctx, _cache) => {
                                     variant: "text",
                                     color: "primary",
                                     "append-icon": "mdi-arrow-right",
-                                    onClick: _cache[13] || (_cache[13] = $event => (activeTab.value = 'diagnostics'))
+                                    onClick: _cache[14] || (_cache[14] = $event => (activeTab.value = 'diagnostics'))
                                   }, {
                                     default: _withCtx(() => [...(_cache[65] || (_cache[65] = [
                                       _createTextVNode(" 查看运行诊断 ", -1)
@@ -2336,7 +2392,7 @@ return (_ctx, _cache) => {
                                     ]),
                                     _createElementVNode("div", null, [
                                       _cache[88] || (_cache[88] = _createElementVNode("dt", null, "目标分享率", -1)),
-                                      _createElementVNode("dd", null, _toDisplayString(taskConfig.value.site_ratio_target || '不限') + _toDisplayString(sequentialMode.value ? '（达标后切换）' : ''), 1)
+                                      _createElementVNode("dd", null, _toDisplayString(taskConfig.value.site_ratio_target || '不限') + _toDisplayString(sequentialMode.value && ratioPhase.value ? '（达标后切换）' : ''), 1)
                                     ]),
                                     _createElementVNode("div", null, [
                                       _cache[89] || (_cache[89] = _createElementVNode("dt", null, "达标后每站驻留时间", -1)),
@@ -2383,7 +2439,7 @@ return (_ctx, _cache) => {
                                         color: "warning",
                                         variant: "tonal",
                                         "prepend-icon": "mdi-eraser",
-                                        onClick: _cache[14] || (_cache[14] = $event => (clearDialog.value = true))
+                                        onClick: _cache[15] || (_cache[15] = $event => (clearDialog.value = true))
                                       }, {
                                         default: _withCtx(() => [...(_cache[95] || (_cache[95] = [
                                           _createTextVNode("清除数据", -1)
@@ -2399,7 +2455,7 @@ return (_ctx, _cache) => {
                                         color: "error",
                                         variant: "tonal",
                                         "prepend-icon": "mdi-delete-outline",
-                                        onClick: _cache[15] || (_cache[15] = $event => (deleteDialog.value = true))
+                                        onClick: _cache[16] || (_cache[16] = $event => (deleteDialog.value = true))
                                       }, {
                                         default: _withCtx(() => [...(_cache[98] || (_cache[98] = [
                                           _createTextVNode("删除任务", -1)
@@ -2424,7 +2480,7 @@ return (_ctx, _cache) => {
           ])),
     _createVNode(TaskEditorDialog, {
       modelValue: editorOpen.value,
-      "onUpdate:modelValue": _cache[17] || (_cache[17] = $event => ((editorOpen).value = $event)),
+      "onUpdate:modelValue": _cache[18] || (_cache[18] = $event => ((editorOpen).value = $event)),
       task: editorTask.value,
       sites: status.value.options.sites,
       downloaders: status.value.options.downloaders,
@@ -2435,7 +2491,7 @@ return (_ctx, _cache) => {
     }, null, 8, ["modelValue", "task", "sites", "downloaders", "global-defaults", "global-dynamic-delete", "saving"]),
     _createVNode(TaskEditorDialog, {
       modelValue: globalEditorOpen.value,
-      "onUpdate:modelValue": _cache[18] || (_cache[18] = $event => ((globalEditorOpen).value = $event)),
+      "onUpdate:modelValue": _cache[19] || (_cache[19] = $event => ((globalEditorOpen).value = $event)),
       task: globalEditorTask.value,
       downloaders: status.value.options.downloaders,
       "global-dynamic-delete": Boolean(status.value.global_proxy_delete),
@@ -2445,7 +2501,7 @@ return (_ctx, _cache) => {
     }, null, 8, ["modelValue", "task", "downloaders", "global-dynamic-delete", "saving"]),
     _createVNode(_component_VDialog, {
       modelValue: deleteDialog.value,
-      "onUpdate:modelValue": _cache[20] || (_cache[20] = $event => ((deleteDialog).value = $event)),
+      "onUpdate:modelValue": _cache[21] || (_cache[21] = $event => ((deleteDialog).value = $event)),
       "max-width": "28rem"
     }, {
       default: _withCtx(() => [
@@ -2462,7 +2518,7 @@ return (_ctx, _cache) => {
                 _createVNode(_component_VSpacer),
                 _createVNode(_component_VBtn, {
                   variant: "text",
-                  onClick: _cache[19] || (_cache[19] = $event => (deleteDialog.value = false))
+                  onClick: _cache[20] || (_cache[20] = $event => (deleteDialog.value = false))
                 }, {
                   default: _withCtx(() => [...(_cache[102] || (_cache[102] = [
                     _createTextVNode("取消", -1)
@@ -2491,7 +2547,7 @@ return (_ctx, _cache) => {
     }, 8, ["modelValue"]),
     _createVNode(_component_VDialog, {
       modelValue: clearDialog.value,
-      "onUpdate:modelValue": _cache[22] || (_cache[22] = $event => ((clearDialog).value = $event)),
+      "onUpdate:modelValue": _cache[23] || (_cache[23] = $event => ((clearDialog).value = $event)),
       "max-width": "28rem"
     }, {
       default: _withCtx(() => [
@@ -2508,7 +2564,7 @@ return (_ctx, _cache) => {
                 _createVNode(_component_VSpacer),
                 _createVNode(_component_VBtn, {
                   variant: "text",
-                  onClick: _cache[21] || (_cache[21] = $event => (clearDialog.value = false))
+                  onClick: _cache[22] || (_cache[22] = $event => (clearDialog.value = false))
                 }, {
                   default: _withCtx(() => [...(_cache[105] || (_cache[105] = [
                     _createTextVNode("取消", -1)
@@ -2540,6 +2596,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const BrushFlowWorkbench = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-b6b1479b"]]);
+const BrushFlowWorkbench = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-335604ca"]]);
 
 export { BrushFlowWorkbench as B };
