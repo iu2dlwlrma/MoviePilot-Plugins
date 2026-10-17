@@ -230,4 +230,4 @@ const _export_sfc = (sfc, props) => {
   return target;
 };
 
-export { _export_sfc as _, formatDateTime as a, formatRemainingTime as b, cloneTask as c, taskOverrideFields as d, effectiveTask as e, formatBytes as f, taskDefaults as g, editableTask as h, normalizeTask as i, formatDuration as j, torrentProgress as k, normalizeSettings as l, normalizeDefaults as n, taskStateMeta as t, unwrapResponse as u };
+export { _export_sfc as _, formatBytes as a, formatRemainingTime as b, cloneTask as c, taskOverrideFields as d, effectiveTask as e, formatDateTime as f, taskDefaults as g, editableTask as h, normalizeTask as i, formatDuration as j, torrentProgress as k, normalizeSettings as l, normalizeDefaults as n, taskStateMeta as t, unwrapResponse as u };

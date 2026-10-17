@@ -13,6 +13,17 @@ const status = ref({ summary: {}, tasks: [] })
 let refreshTimer
 
 const sequentialMode = computed(() => (status.value.rotation_mode || status.value.site_rotation?.mode) === 'sequential')
+const manualFocusNotice = computed(() => {
+  const focus = status.value.manual_focus
+  if (!focus) return ''
+  const name = focus.site_name || String(focus.site_id)
+  if (focus.state === 'pending') return `已手动指定 ${name}，等待当前页处理完成或调度切换。`
+  if (focus.state === 'checking') return `正在检查手动重点站 ${name} 的连接。`
+  if (focus.state === 'cooldown') {
+    return `手动重点站 ${name} 暂不可用，已跳过本轮${focus.retry_at ? `；下次重试 ${formatDateTime(focus.retry_at * 1000)}` : ''}。`
+  }
+  return ''
+})
 const runningTasks = computed(() => (status.value.tasks || [])
   .filter(item => item.enabled)
   .sort((left, right) => sequentialMode.value ? Number(Boolean(right.is_focus)) - Number(Boolean(left.is_focus)) : 0)
@@ -61,6 +72,7 @@ onUnmounted(() => {
       <span v-else-if="status.site_rotation?.phase === 'novice'">考核优先</span>
       <span v-else-if="status.site_rotation?.phase === 'ratio'">达标后切换</span>
       <span v-else-if="status.site_rotation?.deadline_at">预计切换 {{ formatDateTime(status.site_rotation.deadline_at) }} · {{ Number(status.site_rotation.remaining_seconds) > 0 ? '剩余约 ' : '' }}{{ formatRemainingTime(status.site_rotation.remaining_seconds) }}</span>
+      <span v-if="manualFocusNotice">{{ manualFocusNotice }}</span>
       <span>每次仅当前站新增；全部站点达标后按配置顺序定时轮转。旧种继续下载、做种和按规则清理。</span>
     </div>
     <VDivider />
