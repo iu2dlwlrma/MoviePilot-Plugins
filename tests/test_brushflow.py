@@ -1582,7 +1582,7 @@ class BrushFlowRatioRotationTests(unittest.TestCase):
         self.ns["ThreadHelper"] = lambda: SimpleNamespace(submit=lambda job: job())
         self.ns["SitesHelper"] = lambda: SimpleNamespace(get_indexer=lambda domain: {"url": domain})
         self.ns["SiteOper"] = lambda: SimpleNamespace(get=lambda sid: SimpleNamespace(
-            id=sid, domain="https://example.invalid/"))
+            id=sid, domain="example.invalid", url="https://example.invalid/"))
         self.ns["SiteChain"] = lambda: SimpleNamespace(refresh_userdata=lambda **kwargs:
             SimpleNamespace(userid=1, err_msg=None, ratio=0, upload=0, download=0))
         p._read_account_page_traffic = Mock(return_value={"upload": 1024, "download": 0, "ratio": None})
@@ -1594,7 +1594,7 @@ class BrushFlowRatioRotationTests(unittest.TestCase):
         self.assertEqual(refresh["traffic"], {"upload": 1024, "download": 0, "ratio": None})
         self.ns["StringUtils"] = SimpleNamespace(get_url_domain=lambda value: value)
         status = self.cls._build_site_ratio_status(p, p._task_configs["1"], {
-            "https://example.invalid/": SimpleNamespace(userid=1, upload=0, download=0, ratio=0)})
+            "example.invalid": SimpleNamespace(userid=1, upload=0, download=0, ratio=0)})
         self.assertTrue(status["available"])
         self.assertTrue(status["unlimited"])
         self.assertTrue(status["reached"])
@@ -1631,7 +1631,8 @@ class BrushFlowRatioRotationTests(unittest.TestCase):
         self.add_task(1)
         jobs = []
         self.ns["ThreadHelper"] = lambda: SimpleNamespace(submit=lambda job: jobs.append(job))
-        self.data["ratio_refresh.1"] = {"success": False, "failures": 51, "next_attempt": 5000}
+        self.data["ratio_refresh.1"] = {"success": False, "failures": 51, "next_attempt": 5000,
+                                       "reason": "traffic_unparsed"}
         with patch.object(self.ns["time"], "time", return_value=100):
             p._refresh_site_ratio(1)
             p._refresh_site_ratio(1)
@@ -1720,6 +1721,18 @@ class BrushFlowRatioRotationTests(unittest.TestCase):
         status = self.cls._build_site_ratio_status(p, task, data, site)
         self.assertFalse(status["available"])
         self.assertFalse(status["reached"])
+
+    def test_account_page_uses_site_url_when_domain_is_only_an_identifier(self):
+        p = self.plugin
+        site = SimpleNamespace(domain="example.invalid", url="https://example.invalid/", cookie="test",
+                               ua="test-agent", proxy=False)
+        response = SimpleNamespace(status_code=200, url=site.url + "index.php", text="sample")
+        request = Mock(return_value=response)
+        self.ns["RequestUtils"] = Mock(return_value=SimpleNamespace(get_res=request))
+        expected = {"upload": 1024, "download": 0, "ratio": None}
+        self.ns["parse_account_traffic"] = Mock(return_value=expected)
+        self.assertEqual(p._read_account_page_traffic(site, {"url": site.url}, SimpleNamespace(userid=1)), expected)
+        request.assert_called_once()
 
     def test_unknown_account_bytes_do_not_become_unlimited_or_zero_ratio(self):
         for upload, download in ((100, None), (100, "invalid"), (100, -1), (100, False),
