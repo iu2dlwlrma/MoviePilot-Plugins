@@ -264,7 +264,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.16"
+    plugin_version = "7.2.17"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -1398,7 +1398,7 @@ class BrushFlow(_PluginBase):
         user_data = site_user_data_by_domain.get(domain)
         traffic = refresh.get("traffic")
         if (traffic and refresh.get("success") and refresh.get("origin")
-                and refresh["origin"] == self._account_origin(site.domain)
+                and refresh["origin"] == self._account_origin(getattr(site, "url", None) or site.domain)
                 and refresh.get("user_id") == str(getattr(user_data, "userid", None))
                 and refresh.get("account_key") == self._account_cache_key(site)):
             updated = datetime.fromtimestamp(refresh["checked_at"], ZoneInfo(settings.TZ))
@@ -1789,9 +1789,9 @@ class BrushFlow(_PluginBase):
         key = f"ratio_refresh.{site_id}"
         refresh = self.get_data(key) or {}
         now = time.time()
-        if refresh.get("next_attempt", 0) > now and not (refresh.get("success") is False and "reason" not in refresh):
+        if refresh.get("next_attempt", 0) > now and not (refresh.get("success") is False and refresh.get("traffic_schema") != 1):
             return
-        self.save_data(key, {**refresh, "next_attempt": now + 1800, "reason": refresh.get("reason")})
+        self.save_data(key, {**refresh, "next_attempt": now + 1800, "reason": refresh.get("reason"), "traffic_schema": 1})
 
         def refresh_account():
             success = False
@@ -1819,14 +1819,15 @@ class BrushFlow(_PluginBase):
                                 "next_attempt": time.time() + (1800 if success else 3600 if failures >= 6 else 600),
                                 "reason": None if success else reason,
                                 "traffic": traffic if success else None,
-                                "origin": self._account_origin(site.domain) if site and traffic and success else None,
+                                "origin": self._account_origin(getattr(site, "url", None) or site.domain) if site and traffic and success else None,
                                 "user_id": str(data.userid) if traffic and success else None,
-                                "account_key": self._account_cache_key(site) if site and traffic and success else None})
+                                "account_key": self._account_cache_key(site) if site and traffic and success else None,
+                                "traffic_schema": 1})
 
         try:
             ThreadHelper().submit(refresh_account)
         except Exception:
-            self.save_data(key, {**refresh, "next_attempt": now + 600})
+            self.save_data(key, {**refresh, "next_attempt": now + 600, "traffic_schema": 1})
 
     @staticmethod
     def _account_origin(url: str) -> Optional[str]:
@@ -1841,9 +1842,10 @@ class BrushFlow(_PluginBase):
 
     def _read_account_page_traffic(self, site: Any, indexer: dict, data: Any) -> Optional[dict]:
         """宿主流量缺失时，只补读已登录同站首页的明确统计栏。"""
-        base_url = str(indexer.get("url") or getattr(site, "domain", ""))
+        site_url = getattr(site, "url", None) or getattr(site, "domain", "")
+        base_url = str(indexer.get("url") or site_url)
         origin = self._account_origin(base_url)
-        if not origin or origin != self._account_origin(getattr(site, "domain", "")):
+        if not origin or origin != self._account_origin(site_url):
             return None
         headers = getattr(site, "headers", None) or {}
         if isinstance(headers, str):
