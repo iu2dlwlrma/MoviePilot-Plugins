@@ -1,7 +1,9 @@
 import math
 import re
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from typing import Any
+from urllib.parse import parse_qs, urljoin, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -18,6 +20,108 @@ def _number(value: Any) -> float | None:
 def _count(value: Any) -> int | None:
     number = _number(value)
     return int(number) if number is not None and number.is_integer() else None
+
+
+class _AccountTrafficParser(HTMLParser):
+    def __init__(self, user_id: str, base_url: str):
+        super().__init__()
+        self.user_id, self.base_url = user_id, base_url
+        self.stack, self.copies = [], []
+        self.logout = self.current_user = self.password = False
+
+    @staticmethod
+    def origin(url):
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            return None
+        return parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "input" and (attrs.get("type") or "").lower() == "password":
+            self.password = True
+        if tag == "a" and attrs.get("href"):
+            target = urljoin(self.base_url, attrs["href"])
+            if self.origin(target) == self.origin(self.base_url):
+                parsed = urlsplit(target)
+                self.logout |= parsed.path.rsplit("/", 1)[-1] == "logout.php"
+                self.current_user |= (parsed.path.rsplit("/", 1)[-1] == "userdetails.php"
+                                      and parse_qs(parsed.query).get("id") == [self.user_id])
+        classes = set((attrs.get("class") or "").split())
+        parent = self.stack[-1][1] if self.stack else None
+        node = {"classes": classes, "children": []} if parent is not None or "info-stat-copy" in classes else None
+        if parent is not None:
+            parent["children"].append(node)
+        if "info-stat-copy" in classes:
+            self.copies.append(node)
+        if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
+            self.stack.append((tag, node))
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag:
+                del self.stack[index:]
+                break
+
+    def handle_data(self, data):
+        if self.stack and self.stack[-1][1] is not None:
+            self.stack[-1][1]["children"].append(data)
+
+
+def parse_account_traffic(html: str, user_id: str | int, base_url: str) -> dict | None:
+    """仅从已登录账号栏的相邻标签和值读取流量，无法确认时返回未知。"""
+    def content(node):
+        return "".join(child if isinstance(child, str) else content(child) for child in node["children"]).strip()
+
+    try:
+        if not isinstance(html, str) or not re.fullmatch(r"[0-9]+", str(user_id)):
+            return None
+        parser = _AccountTrafficParser(str(user_id), base_url)
+        if parser.origin(base_url) is None:
+            return None
+        parser.feed(html)
+        parser.close()
+        if parser.password or not parser.logout or not parser.current_user:
+            return None
+        fields = {}
+        labels = {"upload": ("color_uploaded", "上传量"), "download": ("color_downloaded", "下载量"),
+                  "ratio": ("color_ratio", "分享率")}
+        for copy in parser.copies:
+            children = [child for child in copy["children"] if not isinstance(child, str) or child.strip()]
+            for index, label in enumerate(children):
+                if isinstance(label, str) or "info-stat-label" not in label["classes"]:
+                    continue
+                matches = [key for key, (color, text) in labels.items()
+                           if color in label["classes"] and content(label) == text]
+                if not matches and not any(color in label["classes"] or content(label) == text
+                                           for color, text in labels.values()):
+                    continue
+                value = children[index + 1] if index + 1 < len(children) else None
+                values = [child for child in children if isinstance(child, dict) and "info-stat-value" in child["classes"]]
+                if (len(matches) != 1 or matches[0] in fields or len(values) != 1
+                        or not isinstance(value, dict) or "info-stat-value" not in value["classes"]):
+                    return None
+                fields[matches[0]] = content(value)
+        if set(fields) != set(labels):
+            return None
+        for field in ("upload", "download"):
+            match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([KMGTPE]?)(?:I)?B", fields[field], re.IGNORECASE)
+            if not match:
+                return None
+            amount = float(match[1]) * 1024 ** (" KMGTPE".index(match[2].upper()) if match[2] else 0)
+            if not math.isfinite(amount):
+                return None
+            fields[field] = int(amount)
+        unlimited = fields["ratio"] in {"无限", "∞"}
+        ratio = _number(fields["ratio"]) if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", fields["ratio"]) else None
+        if unlimited:
+            if not fields["upload"] or fields["download"]:
+                return None
+        elif ratio is None or (fields["upload"] > 0 and fields["download"] == 0):
+            return None
+        return {**fields, "ratio": ratio, "err_msg": None}
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def publication_age_minutes(
