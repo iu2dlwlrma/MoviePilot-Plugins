@@ -21,6 +21,79 @@ def has_timezone_data():
         return False
 
 
+class AccountTrafficTests(unittest.TestCase):
+    base_url = "https://example.invalid/index.php"
+    auth = '<a href="logout.php">退出</a><a href="userdetails.php?id=123">用户</a>'
+
+    def stat(self, color, label, value):
+        return (f'<span class="info-stat-copy"><span class="info-stat-label color_{color}">{label}</span>'
+                f' \n <span class="info-stat-value">{value}</span></span>')
+
+    def page(self, upload='12.34<span class="info-stat-unit">GB</span>',
+             download='0.00<span class="info-stat-unit">KB</span>', ratio="无限"):
+        return (self.auth + self.stat("uploaded", "上传量", upload)
+                + self.stat("downloaded", "下载量", download) + self.stat("ratio", "分享率", ratio))
+
+    def parse(self, html):
+        return rules.parse_account_traffic(html, 123, self.base_url)
+
+    def test_nested_units_and_explicit_unlimited_ratio(self):
+        self.assertEqual(self.parse(self.page()), {
+            "upload": int(12.34 * 1024 ** 3), "download": 0, "ratio": None, "err_msg": None,
+        })
+        self.assertEqual(self.parse(self.page(ratio="∞"))["ratio"], None)
+
+    def test_finite_and_zero_traffic_values(self):
+        self.assertEqual(self.parse(self.page("0 B", "2 MB", "0")), {
+            "upload": 0, "download": 2 * 1024 ** 2, "ratio": 0, "err_msg": None,
+        })
+        self.assertEqual(self.parse(self.page("2 TB", "1 GB", "2048"))["upload"], 2 * 1024 ** 4)
+        self.assertEqual(self.parse(self.page("0 B", "0 B", "0"))["upload"], 0)
+        self.assertIsNone(self.parse(self.page("1 GB", "0.00 KB", "10")))
+
+    def test_unrelated_account_stats_do_not_replace_required_traffic(self):
+        html = self.page("1.5 GiB", "3 GB", "0.500") + self.stat("bonus", "魔力值", "100.00")
+        self.assertEqual(self.parse(html)["ratio"], .5)
+        self.assertEqual(self.parse(html)["upload"], int(1.5 * 1024 ** 3))
+        self.assertIsNone(self.parse(self.page().replace('GB</span></span>',
+                          'GB</span></span><span class="info-stat-value">1 GB</span>', 1)))
+
+    def test_authentication_requires_current_user_same_origin_and_no_password(self):
+        for auth in ("", '<a href="logout.php">退出</a>',
+                     self.auth.replace("123", "124"),
+                     self.auth.replace("logout.php", "https://other.invalid/logout.php"),
+                     self.auth.replace("userdetails.php", "//other.invalid/userdetails.php"),
+                     self.auth + '<input type="PASSWORD">'):
+            with self.subTest(auth=auth):
+                self.assertIsNone(self.parse(self.page().replace(self.auth, auth)))
+        authenticated = self.auth.replace('href="logout.php"', 'href="https://example.invalid/logout.php"')
+        self.assertIsNotNone(self.parse(self.page().replace(self.auth, authenticated)))
+
+    def test_rejects_missing_duplicate_and_nonadjacent_stat_fields(self):
+        ratio = self.stat("ratio", "分享率", "无限")
+        upload = self.stat("uploaded", "上传量", '12.34<span class="info-stat-unit">GB</span>')
+        pages = [self.page().replace(ratio, ""), self.page() + upload,
+                 self.page().replace("上传量</span>", "上传量</span><i>其他值</i>"),
+                 self.page().replace("上传量</span>", "上传量</span>其他值"),
+                 self.page().replace("上传量</span>", "上传量</span></span><span>"),
+                 self.page().replace("上传量</span>", "昨日上传量</span>"),
+                 self.page().replace('color_uploaded', 'color_downloaded')]
+        for html in pages:
+            with self.subTest(html=html):
+                self.assertIsNone(self.parse(html))
+
+    def test_rejects_invalid_numbers_units_and_unlimited_combinations(self):
+        for value in ("-1 GB", "nan GB", "inf GB", "1 XB", "GB", "1.2.3 GB", "1e1000 GB"):
+            with self.subTest(value=value):
+                self.assertIsNone(self.parse(self.page(value)))
+        for ratio in ("-1", "nan", "inf", "未知", "1.2.3"):
+            with self.subTest(ratio=ratio):
+                self.assertIsNone(self.parse(self.page("1 GB", "1 GB", ratio)))
+        self.assertIsNone(self.parse(self.page("0 B", "0 B", "无限")))
+        self.assertIsNone(self.parse(self.page("1 GB", "1 GB", "无限")))
+        self.assertIsNone(self.parse("challenge: 12.34 GB"))
+
+
 class PeerDemandTests(unittest.TestCase):
     def test_single_value_is_minimum_and_range_includes_both_ends(self):
         self.assertTrue(rules.evaluate_peer_demand(8, 10, "5")[0])

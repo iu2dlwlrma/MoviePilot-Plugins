@@ -995,7 +995,7 @@ class BrushFlowTests(unittest.TestCase):
         p._get_statistic_info = lambda tid: {}
         self.data["ratio_refresh.1"] = {"success": False, "failures": 7, "checked_at": 100, "next_attempt": 3700}
         summary = p._task_summary("1")
-        self.assertEqual(summary["account_refresh"], self.data["ratio_refresh.1"])
+        self.assertEqual(summary["account_refresh"], {**self.data["ratio_refresh.1"], "reason": None})
         self.assertIsNone(summary["last_run"])
 
     def test_disabled_manual_site_is_ignored_in_persisted_and_displayed_settings(self):
@@ -1575,6 +1575,151 @@ class BrushFlowRatioRotationTests(unittest.TestCase):
                 with patch.object(self.ns["time"], "time", return_value=100):
                     p._refresh_focus_ratio()
                 self.assertTrue(self.data["ratio_refresh.1"]["success"])
+
+    def test_account_refresh_recovers_authenticated_page_traffic_from_zero_host_values(self):
+        p = self.plugin
+        self.add_task(1)
+        self.ns["ThreadHelper"] = lambda: SimpleNamespace(submit=lambda job: job())
+        self.ns["SitesHelper"] = lambda: SimpleNamespace(get_indexer=lambda domain: {"url": domain})
+        self.ns["SiteOper"] = lambda: SimpleNamespace(get=lambda sid: SimpleNamespace(
+            id=sid, domain="https://example.invalid/"))
+        self.ns["SiteChain"] = lambda: SimpleNamespace(refresh_userdata=lambda **kwargs:
+            SimpleNamespace(userid=1, err_msg=None, ratio=0, upload=0, download=0))
+        p._read_account_page_traffic = Mock(return_value={"upload": 1024, "download": 0, "ratio": None})
+        with patch.object(self.ns["time"], "time", return_value=1800000000):
+            p._refresh_site_ratio(1)
+        refresh = self.data["ratio_refresh.1"]
+        self.assertTrue(refresh["success"])
+        self.assertEqual(refresh["failures"], 0)
+        self.assertEqual(refresh["traffic"], {"upload": 1024, "download": 0, "ratio": None})
+        self.ns["StringUtils"] = SimpleNamespace(get_url_domain=lambda value: value)
+        status = self.cls._build_site_ratio_status(p, p._task_configs["1"], {
+            "https://example.invalid/": SimpleNamespace(userid=1, upload=0, download=0, ratio=0)})
+        self.assertTrue(status["available"])
+        self.assertTrue(status["unlimited"])
+        self.assertTrue(status["reached"])
+
+    def test_account_refresh_reports_unparsed_traffic_without_claiming_connection_failure(self):
+        p = self.plugin
+        self.add_task(1)
+        self.ns["ThreadHelper"] = lambda: SimpleNamespace(submit=lambda job: job())
+        self.ns["SitesHelper"] = lambda: SimpleNamespace(get_indexer=lambda domain: {"url": domain})
+        self.ns["SiteChain"] = lambda: SimpleNamespace(refresh_userdata=lambda **kwargs:
+            SimpleNamespace(userid=1, err_msg=None, ratio=0, upload=0, download=0))
+        p._read_account_page_traffic = Mock(return_value=None)
+        with patch.object(self.ns["time"], "time", return_value=100):
+            p._refresh_site_ratio(1)
+        self.assertFalse(self.data["ratio_refresh.1"]["success"])
+        self.assertEqual(self.data["ratio_refresh.1"].get("reason"), "traffic_unparsed")
+        self.site_test.assert_not_called()
+
+    def test_valid_host_account_does_not_fetch_an_extra_page(self):
+        p = self.plugin
+        self.add_task(1)
+        self.ns["ThreadHelper"] = lambda: SimpleNamespace(submit=lambda job: job())
+        self.ns["SitesHelper"] = lambda: SimpleNamespace(get_indexer=lambda domain: {"url": domain})
+        self.ns["SiteChain"] = lambda: SimpleNamespace(refresh_userdata=lambda **kwargs:
+            SimpleNamespace(userid=1, err_msg=None, ratio=2, upload=200, download=100))
+        p._read_account_page_traffic = Mock()
+        with patch.object(self.ns["time"], "time", return_value=100):
+            p._refresh_site_ratio(1)
+        self.assertTrue(self.data["ratio_refresh.1"]["success"])
+        p._read_account_page_traffic.assert_not_called()
+
+    def test_unclassified_account_failure_is_rechecked_once_without_parallel_requests(self):
+        p = self.plugin
+        self.add_task(1)
+        jobs = []
+        self.ns["ThreadHelper"] = lambda: SimpleNamespace(submit=lambda job: jobs.append(job))
+        self.data["ratio_refresh.1"] = {"success": False, "failures": 51, "next_attempt": 5000}
+        with patch.object(self.ns["time"], "time", return_value=100):
+            p._refresh_site_ratio(1)
+            p._refresh_site_ratio(1)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(self.data["ratio_refresh.1"]["failures"], 51)
+
+    def test_account_page_fallback_rejects_offsite_response_and_preserves_request_settings(self):
+        p = self.plugin
+        site = SimpleNamespace(domain="https://example.invalid/", cookie="test", ua="test-agent",
+                               proxy=True, headers='{"X-Test": "test"}')
+        self.ns["settings"].PROXY = {"https": "test-proxy"}
+        request = Mock(return_value=SimpleNamespace(status_code=200, url="https://other.invalid/", text=""))
+        factory = Mock(return_value=SimpleNamespace(get_res=request))
+        self.ns["RequestUtils"] = factory
+        parse = Mock()
+        self.ns["parse_account_traffic"] = parse
+        self.assertIsNone(p._read_account_page_traffic(site, {"url": site.domain}, SimpleNamespace(userid=1)))
+        parse.assert_not_called()
+        self.assertEqual(factory.call_args.kwargs, {"cookies": "test", "ua": "test-agent",
+                         "headers": {"X-Test": "test"}, "proxies": self.ns["settings"].PROXY})
+        self.assertFalse(request.call_args.kwargs["allow_redirects"])
+        request.return_value.url = site.domain + "index.php"
+        request.return_value.text = "sample"
+        parse.return_value = {"upload": 1024, "download": 0, "ratio": None}
+        self.assertEqual(p._read_account_page_traffic(site, {"url": site.domain}, SimpleNamespace(userid=1)),
+                         parse.return_value)
+        parse.assert_called_once_with("sample", 1, site.domain + "index.php")
+
+    def test_account_page_cache_keeps_origin_and_freshness_boundaries(self):
+        p = self.plugin
+        task = self.add_task(1)
+        site = SimpleNamespace(domain="https://example.invalid/")
+        self.ns["StringUtils"] = SimpleNamespace(get_url_domain=lambda value: value)
+        checked = datetime.now().astimezone().timestamp() - 86410
+        self.data["ratio_refresh.1"] = {"success": True, "checked_at": checked,
+            "origin": "https://example.invalid", "traffic": {"upload": 1024, "download": 0, "ratio": None}}
+        self.data["ratio_refresh.1"].update(user_id="1", account_key=p._account_cache_key(site))
+        data = {site.domain: SimpleNamespace(userid=1, upload=0, download=0, ratio=0)}
+        status = self.cls._build_site_ratio_status(p, task, data, site)
+        self.assertTrue(status["available"])
+        self.assertTrue(status["stale"])
+        self.data["ratio_refresh.1"]["origin"] = "https://other.invalid"
+        self.assertFalse(self.cls._build_site_ratio_status(p, task, data, site)["available"])
+
+    def test_newer_valid_host_data_takes_precedence_over_page_cache(self):
+        p = self.plugin
+        task = self.add_task(1)
+        site = SimpleNamespace(domain="https://example.invalid/")
+        self.ns["StringUtils"] = SimpleNamespace(get_url_domain=lambda value: value)
+        self.data["ratio_refresh.1"] = {"success": True,
+            "checked_at": datetime.now().astimezone().timestamp() - 3600,
+            "origin": "https://example.invalid", "traffic": {"upload": 1024, "download": 0, "ratio": None}}
+        self.data["ratio_refresh.1"].update(user_id="1", account_key=p._account_cache_key(site))
+        updated = datetime.now().astimezone()
+        data = SimpleNamespace(userid=1, upload=200, download=100, ratio=2,
+                               updated_day=updated.strftime("%Y-%m-%d"), updated_time=updated.strftime("%H:%M:%S"))
+        status = self.cls._build_site_ratio_status(p, task, {site.domain: data}, site)
+        self.assertEqual(status["current"], 2)
+        self.assertFalse(status["unlimited"])
+
+    def test_account_page_cache_cannot_mark_a_different_account_as_unlimited(self):
+        p = self.plugin
+        task = self.add_task(1)
+        site = SimpleNamespace(domain="https://example.invalid/")
+        self.ns["StringUtils"] = SimpleNamespace(get_url_domain=lambda value: value)
+        self.data["ratio_refresh.1"] = {"success": True, "user_id": "1",
+            "checked_at": datetime.now().astimezone().timestamp(), "origin": "https://example.invalid",
+            "traffic": {"upload": 1024, "download": 0, "ratio": None}}
+        self.data["ratio_refresh.1"]["account_key"] = p._account_cache_key(site)
+        data = SimpleNamespace(userid=2, upload=0, download=0, ratio=0)
+        status = self.cls._build_site_ratio_status(p, task, {site.domain: data}, site)
+        self.assertFalse(status["available"])
+        self.assertFalse(status["reached"])
+
+    def test_account_page_cache_is_invalid_after_authentication_changes(self):
+        p = self.plugin
+        task = self.add_task(1)
+        site = SimpleNamespace(domain="https://example.invalid/", cookie="first")
+        self.ns["StringUtils"] = SimpleNamespace(get_url_domain=lambda value: value)
+        self.data["ratio_refresh.1"] = {"success": True, "user_id": "1",
+            "checked_at": datetime.now().astimezone().timestamp(), "origin": "https://example.invalid",
+            "traffic": {"upload": 1024, "download": 0, "ratio": None}, "account_key": p._account_cache_key(site)}
+        data = {site.domain: SimpleNamespace(userid=1, upload=0, download=0, ratio=0)}
+        self.assertTrue(self.cls._build_site_ratio_status(p, task, data, site)["available"])
+        site.cookie = "second"
+        status = self.cls._build_site_ratio_status(p, task, data, site)
+        self.assertFalse(status["available"])
+        self.assertFalse(status["reached"])
 
     def test_unknown_account_bytes_do_not_become_unlimited_or_zero_ratio(self):
         for upload, download in ((100, None), (100, "invalid"), (100, -1), (100, False),

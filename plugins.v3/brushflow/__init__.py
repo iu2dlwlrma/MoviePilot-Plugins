@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import math
 import re
@@ -8,11 +9,12 @@ import uuid
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
-from .rules import demand_rank, download_has_started, evaluate_peer_demand, promotion_deadline, publication_age_minutes, update_transfer_sample, transfer_window, allocate_downloads, slow_download_reason
+from .rules import demand_rank, download_has_started, evaluate_peer_demand, promotion_deadline, publication_age_minutes, update_transfer_sample, transfer_window, allocate_downloads, slow_download_reason, parse_account_traffic
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import Query
@@ -262,7 +264,7 @@ class BrushFlow(_PluginBase):
     plugin_name = "站点刷流"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush.jpg"
-    plugin_version = "7.2.15"
+    plugin_version = "7.2.16"
     plugin_author = "jxxghp,InfinityPacer,Seed680"
     author_url = "https://github.com/InfinityPacer"
     plugin_config_prefix = "brushflow_"
@@ -1317,7 +1319,7 @@ class BrushFlow(_PluginBase):
             "seeding_size": self.__calculate_seeding_torrents_size(torrents),
             "site_ratio": site_ratio,
             "account_refresh": {key: account_refresh.get(key)
-                                for key in ("success", "failures", "checked_at", "next_attempt")},
+                                for key in ("success", "failures", "checked_at", "next_attempt", "reason")},
             "priority": self._priority_tier(task, site_ratio),
             "priority_reason": "手动重点" if self._priority_tier(task, site_ratio) == -1 else (
                 "账号数据待刷新" if not site_ratio.get("available") or site_ratio.get("stale") else (
@@ -1394,6 +1396,17 @@ class BrushFlow(_PluginBase):
             site_user_data_by_domain = self._latest_site_user_data_by_domain()
         domain = StringUtils.get_url_domain(getattr(site, "domain", None))
         user_data = site_user_data_by_domain.get(domain)
+        traffic = refresh.get("traffic")
+        if (traffic and refresh.get("success") and refresh.get("origin")
+                and refresh["origin"] == self._account_origin(site.domain)
+                and refresh.get("user_id") == str(getattr(user_data, "userid", None))
+                and refresh.get("account_key") == self._account_cache_key(site)):
+            updated = datetime.fromtimestamp(refresh["checked_at"], ZoneInfo(settings.TZ))
+            host_updated = " ".join(str(value) for value in (
+                getattr(user_data, "updated_day", None), getattr(user_data, "updated_time", None)) if value)
+            if self._site_ratio_values(user_data) is None or host_updated and host_updated <= updated.strftime("%Y-%m-%d %H:%M:%S"):
+                user_data = SimpleNamespace(**traffic, updated_day=updated.strftime("%Y-%m-%d"),
+                                            updated_time=updated.strftime("%H:%M:%S"))
         values = self._site_ratio_values(user_data)
         if values is None:
             return status
@@ -1776,27 +1789,78 @@ class BrushFlow(_PluginBase):
         key = f"ratio_refresh.{site_id}"
         refresh = self.get_data(key) or {}
         now = time.time()
-        if refresh.get("next_attempt", 0) > now:
+        if refresh.get("next_attempt", 0) > now and not (refresh.get("success") is False and "reason" not in refresh):
             return
-        self.save_data(key, {**refresh, "next_attempt": now + 1800})
+        self.save_data(key, {**refresh, "next_attempt": now + 1800, "reason": refresh.get("reason")})
 
         def refresh_account():
             success = False
+            reason = "account_unavailable"
+            traffic = None
+            site = None
             try:
                 site = SiteOper().get(site_id)
                 indexer = SitesHelper().get_indexer(site.domain) if site else None
                 data = SiteChain().refresh_userdata(site=indexer) if indexer else None
-                success = bool(data and getattr(data, "userid", None) and self._site_ratio_values(data) is not None)
+                if data and getattr(data, "userid", None):
+                    values = self._site_ratio_values(data)
+                    if values is None and not getattr(data, "err_msg", None):
+                        traffic = self._read_account_page_traffic(site, indexer, data)
+                        values = self._site_ratio_values(SimpleNamespace(**traffic)) if traffic else None
+                        reason = "traffic_unparsed"
+                    success = values is not None
+                elif data:
+                    reason = "account_unrecognized"
             except Exception:
+                reason = "request_failed"
                 logger.warning("当前刷流站账号数据刷新失败，等待重试")
             failures = 0 if success else refresh.get("failures", 0) + 1
             self.save_data(key, {"success": success, "failures": failures, "checked_at": time.time(),
-                                "next_attempt": time.time() + (1800 if success else 3600 if failures >= 6 else 600)})
+                                "next_attempt": time.time() + (1800 if success else 3600 if failures >= 6 else 600),
+                                "reason": None if success else reason,
+                                "traffic": traffic if success else None,
+                                "origin": self._account_origin(site.domain) if site and traffic and success else None,
+                                "user_id": str(data.userid) if traffic and success else None,
+                                "account_key": self._account_cache_key(site) if site and traffic and success else None})
 
         try:
             ThreadHelper().submit(refresh_account)
         except Exception:
             self.save_data(key, {**refresh, "next_attempt": now + 600})
+
+    @staticmethod
+    def _account_origin(url: str) -> Optional[str]:
+        parsed = urlparse(str(url or ""))
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}" if (
+            parsed.scheme.lower() in {"http", "https"} and parsed.netloc) else None
+
+    @staticmethod
+    def _account_cache_key(site: Any) -> str:
+        identity = [getattr(site, "cookie", None), getattr(site, "headers", None)]
+        return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+    def _read_account_page_traffic(self, site: Any, indexer: dict, data: Any) -> Optional[dict]:
+        """宿主流量缺失时，只补读已登录同站首页的明确统计栏。"""
+        base_url = str(indexer.get("url") or getattr(site, "domain", ""))
+        origin = self._account_origin(base_url)
+        if not origin or origin != self._account_origin(getattr(site, "domain", "")):
+            return None
+        headers = getattr(site, "headers", None) or {}
+        if isinstance(headers, str):
+            headers = json.loads(headers)
+        cookie = getattr(site, "cookie", None)
+        if not cookie and not headers:
+            return None
+        request_url = urljoin(base_url, "index.php")
+        response = RequestUtils(cookies=cookie, ua=getattr(site, "ua", None), headers=headers,
+                                proxies=settings.PROXY if getattr(site, "proxy", False) else None).get_res(
+            url=request_url, timeout=30, allow_redirects=False,
+        )
+        if response is None or response.status_code != 200:
+            raise RuntimeError("账号统计页请求失败")
+        if self._account_origin(response.url) != origin:
+            return None
+        return parse_account_traffic(response.text, data.userid, request_url)
 
     def _check_rotation_site(self, now: Optional[float] = None) -> bool:
         """首次失败后每十分钟重试，五次仍失败则让出驻留。"""

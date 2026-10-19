@@ -120,6 +120,11 @@ const focusSwitchText = computed(() => ({
 }[siteRotation.value.phase] || ''))
 const rotationRetrying = computed(() => sequentialMode.value && Boolean(siteRotation.value.retry_at))
 const selectedTask = computed(() => tasks.value.find(item => item.id === selectedTaskId.value) || null)
+const accountRefreshTitle = computed(() => ({
+  traffic_unparsed: '账号流量数据未解析',
+  account_unrecognized: '账号登录状态未识别',
+  request_failed: '账号数据请求失败',
+}[selectedTask.value?.account_refresh?.reason] || '账号数据暂不可用'))
 const selectedState = computed(() => isRetryingTask(selectedTask.value)
   ? { text: '等待站点重试', color: 'warning', icon: 'mdi-refresh' }
   : taskStateMeta(selectedTask.value?.state, sequentialMode.value && selectedTask.value?.is_focus === false))
@@ -941,8 +946,9 @@ defineExpose({ loadStatus, refreshAll, loading, saving })
             </VWindowItem>
 
             <VWindowItem value="diagnostics">
-              <VAlert v-if="selectedTask.account_refresh?.success === false" type="warning" variant="tonal" density="compact" title="账号数据刷新失败" class="mb-4">
-                <div>此状态来自站点账号统计刷新，与下载器种子检查独立。</div>
+              <VAlert v-if="selectedTask.account_refresh?.success === false" type="warning" variant="tonal" density="compact" :title="accountRefreshTitle" class="mb-4">
+                <div>此状态来自账号统计刷新，不是站点连接检测，与下载器种子检查独立。</div>
+                <div v-if="selectedTask.account_refresh.reason === 'traffic_unparsed'">站点连接正常并不代表流量字段已取得；未解析的流量按未知处理，不能填 0 或视为达标。</div>
                 <div class="text-body-2">
                   连续失败 {{ selectedTask.account_refresh.failures ?? '未知' }} 次 ·
                   最近刷新 {{ selectedTask.account_refresh.checked_at != null ? formatDateTime(selectedTask.account_refresh.checked_at * 1000) : '未知' }} ·
