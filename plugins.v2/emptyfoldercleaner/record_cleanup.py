@@ -8,7 +8,7 @@ the observation period. Run the host mutation with its revision/lease checks:
 the in-process lock cannot replace a database transaction across processes.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 from itertools import islice
@@ -49,6 +49,8 @@ class CleanupRecord:
     storage: str = "local"
     kind: str = "download_file"
     record_id: Optional[int] = None
+    download_hash: str = ""
+    downloader: str = ""
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,7 @@ class CleanupEvidence:
     # lstat snapshot: dev, inode, mode, size, mtime_ns, ctime_ns, nlink.
     # Required only for source-present cleanup; never inferred from a pathname.
     source_signature: Tuple[int, ...] = ()
+    blocking_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -88,8 +91,8 @@ class CleanupOptions:
     allow_subscription_retry: bool = False
 
     def __post_init__(self):
-        if not _finite_number(self.stability_seconds) or self.stability_seconds < MIN_STABILITY_SECONDS:
-            raise ValueError("stability_seconds must be at least 86400")
+        if not _finite_number(self.stability_seconds) or self.stability_seconds < 0:
+            raise ValueError("stability_seconds must be nonnegative")
         if type(self.batch_size) is not int or not 1 <= self.batch_size <= MAX_BATCH_SIZE:
             raise ValueError("batch_size must be between 1 and 100")
         if type(self.pending_limit) is not int or not self.batch_size <= self.pending_limit <= MAX_PENDING:
@@ -103,6 +106,7 @@ class MutationResult:
     # Only an explicit host result confirms a committed, revision-checked change.
     status: str
     reason: str
+    counts: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -112,6 +116,7 @@ class CleanupResult:
     reason: str
     first_seen: Optional[float] = None
     eligible_at: Optional[float] = None
+    counts: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -138,11 +143,11 @@ def _exact_local_path(value) -> bool:
 def _valid_record(record: CleanupRecord) -> bool:
     if not isinstance(record, CleanupRecord):
         return False
-    if not all(isinstance(value, str) and value.strip() for value in (
-        record.key, record.revision, record.media_source, record.media_id,
-    )):
+    if not all(isinstance(value, str) and value.strip() for value in (record.key, record.revision)):
         return False
-    if record.storage != "local" or record.kind not in ("download_file", "transfer_history"):
+    if record.storage != "local" or record.kind not in (
+        "download_file", "transfer_history", "download_file_only", "related_history", "related_transfer", "source_purge", "residual_task",
+    ):
         return False
     if not _exact_local_path(record.source_path):
         return False
@@ -151,6 +156,10 @@ def _valid_record(record: CleanupRecord) -> bool:
     if not all(_exact_local_path(path) for path in record.destination_paths):
         return False
     if type(record.record_id) is not int or record.record_id <= 0:
+        return False
+    if record.kind in ("download_file_only", "related_history", "related_transfer", "source_purge", "residual_task"):
+        return True
+    if not all(isinstance(value, str) and value.strip() for value in (record.media_source, record.media_id)):
         return False
     if record.media_type in ("电视剧", "tv"):
         return (
@@ -166,6 +175,7 @@ def _fingerprint(record: CleanupRecord, evidence: CleanupEvidence = None) -> str
         record.key, record.revision, record.kind, record.record_id, record.storage,
         record.source_path, tuple(record.destination_paths), record.media_source,
         record.media_id, record.media_type, record.season, tuple(record.episodes),
+        record.download_hash, record.downloader,
     )
     if evidence is not None and evidence.source is Presence.PRESENT:
         value += (tuple(evidence.source_signature),)
@@ -173,6 +183,8 @@ def _fingerprint(record: CleanupRecord, evidence: CleanupEvidence = None) -> str
 
 
 def _decision(record: CleanupRecord, evidence: CleanupEvidence):
+    if record.kind not in ("download_file", "transfer_history"):
+        return "needs_review", "wrong_cleanup_scope"
     if not isinstance(evidence, CleanupEvidence):
         return "needs_review", "invalid_evidence"
     if evidence.record_present is False:
@@ -182,7 +194,7 @@ def _decision(record: CleanupRecord, evidence: CleanupEvidence):
     if evidence.revision != record.revision:
         return "needs_review", "record_changed"
     if evidence.downloader_task_present is True:
-        return "skipped", "downloader_task_present"
+        return "skipped", _safe_reason(evidence.blocking_reason, "downloader_task_present")
     if evidence.transfer_task_active is True:
         return "skipped", "transfer_task_active"
     if not isinstance(evidence.destinations, (tuple, list)) or len(evidence.destinations) != len(record.destination_paths):
@@ -217,6 +229,8 @@ def destination_decision(record: CleanupRecord, evidence: CleanupEvidence):
 
     宿主还必须证明源与种子独占、单文件任务，并复核文件签名；本层不删除文件。
     """
+    if record.kind not in ("download_file", "transfer_history"):
+        return "needs_review", "wrong_cleanup_scope"
     if not isinstance(evidence, CleanupEvidence):
         return "needs_review", "invalid_evidence"
     if evidence.record_present is False:
@@ -260,6 +274,34 @@ def destination_decision(record: CleanupRecord, evidence: CleanupEvidence):
             or any(type(value) is not int or value < 0 for value in signature)
             or signature[1] <= 0 or signature[6] <= 0):
         return "needs_review", "source_signature_unavailable"
+    return None
+
+
+def file_only_decision(record: CleanupRecord, evidence: CleanupEvidence):
+    """Delete only an exact absent-source row; library identity is irrelevant."""
+    if record.kind != "download_file_only":
+        return "needs_review", "wrong_cleanup_scope"
+    if not isinstance(evidence, CleanupEvidence):
+        return "needs_review", "invalid_evidence"
+    if evidence.record_present is False:
+        return "already_clean", "record_absent"
+    if evidence.record_present is not True or evidence.revision != record.revision:
+        return "needs_review", "record_changed"
+    if evidence.source is Presence.PRESENT:
+        return "skipped", "source_present"
+    if evidence.source is not Presence.MISSING:
+        return "needs_review", "presence_unknown"
+    for value, reason in ((evidence.storage_ready, "storage_unavailable"),
+                          (evidence.identity_verified, "identity_unverified"),
+                          (evidence.downloaders_complete, "downloaders_incomplete")):
+        if value is not True:
+            return "needs_review", reason
+    if evidence.downloader_task_present is True:
+        return "skipped", _safe_reason(evidence.blocking_reason, "downloader_task_present")
+    if evidence.transfer_task_active is True:
+        return "skipped", "transfer_task_active"
+    if evidence.downloader_task_present is not False or evidence.transfer_task_active is not False:
+        return "needs_review", "task_lookup_incomplete"
     return None
 
 
@@ -380,8 +422,10 @@ class RecordCleanupEngine:
             observation = {"fingerprint": fingerprint, "first_seen": now, "last_seen": now, "observations": 1}
             candidates[key] = observation
         else:
+            previous_time = observation["last_seen"]
             observation["last_seen"] = now
-            observation["observations"] += 1
+            if now > previous_time:
+                observation["observations"] += 1
         first_seen = observation["first_seen"]
         eligible_at = first_seen + options.stability_seconds
         if now < eligible_at or observation["observations"] < 2:
@@ -410,9 +454,9 @@ class RecordCleanupEngine:
         if not isinstance(outcome, MutationResult) or outcome.status not in ("applied", "already_clean"):
             candidates.pop(key, None)
             reason = _safe_reason(outcome.reason, "mutation_unconfirmed") if isinstance(outcome, MutationResult) else "mutation_unconfirmed"
-            return CleanupResult(key, "needs_review", reason)
+            return CleanupResult(key, "needs_review", reason, counts=outcome.counts if isinstance(outcome, MutationResult) else {})
         candidates.pop(key, None)
         if key not in completed and len(completed) >= options.pending_limit:
             completed.pop(next(iter(completed)))
         completed[key] = {"fingerprint": fingerprint, "applied_at": now}
-        return CleanupResult(key, outcome.status, _safe_reason(outcome.reason, "records_updated"))
+        return CleanupResult(key, outcome.status, _safe_reason(outcome.reason, "records_updated"), counts=outcome.counts)

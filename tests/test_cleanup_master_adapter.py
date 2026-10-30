@@ -23,6 +23,7 @@ def load(name):
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    setattr(package, name, module)
     return module
 
 
@@ -185,8 +186,37 @@ def downloader_service(tasks=(), *, error=False, enabled=True, kind="qbittorrent
 
 
 class DownloaderTests(unittest.TestCase):
+    def test_completed_shared_task_is_inactive_but_not_removable(self):
+        probe, service = self.purge_probe(files=[dict(name="show/a.mkv", size=5, progress=1),
+                                                 dict(name="show/b.mkv", size=5, progress=1)])
+        self.assertEqual(probe.check_activity("a" * 40, ("/data/show/a.mkv",), "qb"), (True, False))
+        self.assertFalse(probe.plan_purge("a" * 40, "/data/show/a.mkv", None, downloader="qb").complete)
+        service.instance.tasks[0]["state"] = "checkingUP"
+        self.assertEqual(probe.check_activity("a" * 40, ("/data/show/a.mkv",), "qb"), (True, True))
+        self.assertEqual(probe.activity_reason, "task_checking")
+
+    def test_same_hash_on_another_downloader_with_distinct_paths_is_preserved(self):
+        probe, own = self.purge_probe()
+        other = downloader_service([dict(hash="a" * 40, content_path="/other/copy.mkv", save_path="/other", state="uploading")])
+        other.instance.files = [dict(name="copy.mkv", size=5, progress=1)]
+        probe.helper = Helper({"qb": own, "other": other})
+        plan = probe.plan_purge("a" * 40, "/data/show/a.mkv", 5, downloader="qb")
+        self.assertTrue(plan.complete)
+        self.assertEqual([task.service for task in plan.tasks], ["qb"])
+        self.assertTrue(probe.remove_exclusive_tasks("a" * 40, "/data/show/a.mkv", 5, plan, downloader="qb"))
+        self.assertEqual(other.instance.deleted, [])
+        self.assertEqual(probe.check_scoped("a" * 40, ("/data/show/a.mkv",), "qb"), (True, False))
+    def test_preview_inventory_is_reused_but_mutation_inventory_is_fresh(self):
+        probe, service = self.purge_probe()
+        probe.begin_batch()
+        for _ in range(5):
+            self.assertEqual(probe.check_cached("a" * 40, ("/data/show/a.mkv",)), (True, True))
+        self.assertEqual(len(service.instance.calls), 1)
+        probe.plan_purge("a" * 40, "/data/show/a.mkv", 5)
+        self.assertEqual(len(service.instance.calls), 2)
+        probe.end_batch()
     def purge_probe(self, *, files=None, task_hash="a" * 40):
-        service = downloader_service([dict(hash=task_hash, content_path="/data/show", save_path="/data")])
+        service = downloader_service([dict(hash=task_hash, content_path="/data/show", save_path="/data", state="uploading", progress=1.0)])
         service.instance.files = files if files is not None else [dict(name="show/a.mkv", size=5, progress=1.0)]
         return adapter.DownloaderProbe(Helper({"qb": service})), service
 
@@ -198,6 +228,21 @@ class DownloaderTests(unittest.TestCase):
         self.assertTrue(probe.remove_exclusive_tasks("a" * 40, "/data/show/a.mkv", 5, plan))
         self.assertEqual(service.instance.deleted, [(False, ("a" * 40,))])
         self.assertEqual(service.instance.tasks, [])
+
+    def test_completed_file_does_not_authorize_active_or_unknown_task_removal(self):
+        for state in ("moving", "checkingUP", "downloading", "queuedDL", "unknown", None):
+            with self.subTest(state=state):
+                probe, service = self.purge_probe()
+                service.instance.tasks[0]["state"] = state
+                self.assertFalse(probe.plan_purge("a" * 40, "/data/show/a.mkv", 5).complete)
+                self.assertEqual(service.instance.deleted, [])
+
+    def test_missing_source_can_remove_only_exact_completed_single_file_task(self):
+        probe, service = self.purge_probe()
+        plan = probe.plan_purge("a" * 40, "/data/show/a.mkv", None)
+        self.assertTrue(plan.complete)
+        self.assertTrue(probe.remove_exclusive_tasks("a" * 40, "/data/show/a.mkv", None, plan))
+        self.assertEqual(service.instance.deleted, [(False, ("a" * 40,))])
 
     def test_purge_rejects_multi_file_shared_hash_wrong_size_incomplete_and_unknown_files(self):
         cases = ([dict(name="show/a.mkv", size=5, progress=1), dict(name="show/b.mkv", size=5, progress=1)],
@@ -224,7 +269,7 @@ class DownloaderTests(unittest.TestCase):
 
     def test_purge_checks_all_clients_and_transmission_complete_bytes(self):
         probe, qb = self.purge_probe()
-        tb = downloader_service([dict(hash="a" * 40, content_path="/data/show", save_path="/data")], kind="transmission")
+        tb = downloader_service([dict(hash="a" * 40, content_path="/data/show", save_path="/data", status="seeding")], kind="transmission")
         tb.instance.files = [SimpleNamespace(name="show/a.mkv", size=5, completed=5)]
         probe.helper = Helper({"qb": qb, "tb": tb})
         plan = probe.plan_purge("a" * 40, "/data/show/a.mkv", 5)
@@ -552,21 +597,21 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.gateway.applied, [])
         self.assertFalse(subject.webhook_hint({"Event": "playback.start"}))
 
-    def test_retry_option_is_explicit_and_defaults_to_preserving_progress(self):
+    def test_legacy_retry_option_never_reopens_subscription(self):
         subject = self.build()
         record = subject.list_candidates(limit=1).records[0]
         subject.mutate(record, subject.observe(record), kernel.CleanupOptions())
         subject.mutate(record, subject.observe(record), kernel.CleanupOptions(allow_subscription_retry=True))
-        self.assertEqual(self.gateway.retry_options, [False, True])
-        self.assertEqual(self.gateway.resolved_counts, [None, 12])
+        self.assertEqual(self.gateway.retry_options, [False, False])
+        self.assertEqual(self.gateway.resolved_counts, [None, None])
 
-    def test_incomplete_season_does_not_reopen_subscription_or_clean_record(self):
+    def test_subscription_season_lookup_is_never_needed_for_record_cleanup(self):
         subject = self.build()
         record = subject.list_candidates(limit=1).records[0]
         subject.media.season_episodes = lambda *_: ((), False)
         result = subject.mutate(record, subject.observe(record), kernel.CleanupOptions(allow_subscription_retry=True))
-        self.assertEqual(result.status, "needs_review")
-        self.assertEqual(self.gateway.applied, [])
+        self.assertEqual(result.status, "applied")
+        self.assertEqual(self.gateway.retry_options, [False])
 
     def test_retry_option_without_subscription_cleans_records_without_resolving_progress(self):
         subject = self.build()
@@ -601,13 +646,13 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.gateway.retry_options, [False])
         self.assertEqual(self.gateway.resolved_counts, [None])
 
-    def test_unknown_subscription_retry_state_cannot_skip_progress_repair(self):
+    def test_unknown_subscription_retry_state_is_irrelevant_when_never_written(self):
         subject = self.build()
         del self.gateway.candidate.subscription_retry_needed
         record = subject.list_candidates(limit=1).records[0]
         result = subject.mutate(record, subject.observe(record), kernel.CleanupOptions(allow_subscription_retry=True))
-        self.assertEqual(result.status, "needs_review")
-        self.assertEqual(self.gateway.applied, [])
+        self.assertEqual(result.status, "applied")
+        self.assertEqual(self.gateway.retry_options, [False])
 
     def destination_subject(self):
         subject = self.build()
@@ -692,13 +737,13 @@ class AdapterTests(unittest.TestCase):
         self.gateway.repair = lambda *_: {"success": True}
         self.assertEqual(subject.repair_destination(record).status, "needs_review")
 
-    def test_target_reappearing_in_season_snapshot_prevents_cleaning(self):
+    def test_legacy_subscription_snapshot_is_not_queried_or_written(self):
         subject = self.build()
         record = subject.list_candidates(limit=1).records[0]
         subject.media.season_episodes = lambda *_: ((4,), True)
         result = subject.mutate(record, subject.observe(record), kernel.CleanupOptions(allow_subscription_retry=True))
-        self.assertEqual(result.status, "needs_review")
-        self.assertEqual(self.gateway.applied, [])
+        self.assertEqual(result.status, "applied")
+        self.assertEqual(self.gateway.retry_options, [False])
 
     def test_empty_destination_is_only_eligible_with_explicit_lookup_completion(self):
         subject = self.build()
@@ -761,7 +806,7 @@ class SourcePurgeTests(unittest.TestCase):
             other_version_paths=(), other_versions_complete=True, transfer_task_active=False,
             source_exclusive=self.ownership and include_source_ownership,
             hash_exclusive=self.ownership and include_source_ownership)
-        self.service = downloader_service([dict(hash="a" * 40, content_path=str(self.source), save_path=str(self.root))])
+        self.service = downloader_service([dict(hash="a" * 40, content_path=str(self.source), save_path=str(self.root), state="uploading")])
         self.service.instance.files = [dict(name="source/a.mkv", size=5, progress=1.0)]
         self.downloaders = adapter.DownloaderProbe(Helper({"qb": self.service}))
         self.media = SimpleNamespace(check=lambda _: (P.MISSING, True))
@@ -840,7 +885,7 @@ class SourcePurgeTests(unittest.TestCase):
         self.assertFalse(self.source.exists())
 
     def test_partial_task_removal_retries_safely_without_duplicate_first_client_delete(self):
-        tb = downloader_service([dict(hash="a" * 40, content_path=str(self.source), save_path=str(self.root))], kind="transmission")
+        tb = downloader_service([dict(hash="a" * 40, content_path=str(self.source), save_path=str(self.root), status="seeding")], kind="transmission")
         tb.instance.files = [SimpleNamespace(name="source/a.mkv", size=5, completed=5)]
         tb.instance.delete_success = False
         self.downloaders.helper = Helper({"qb": self.service, "tb": tb})
@@ -905,6 +950,408 @@ class SourcePurgeTests(unittest.TestCase):
         self.subject.gateway = adapter.MoviePilotGateway()
         proof = self.proof()
         self.assertEqual(self.subject.purge_source(self.record, proof, self.options).status, "applied")
+
+
+class FileOnlyAdapterTests(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue(callable(getattr(adapter.MoviePilotCleanupAdapter, "list_file_only_candidates", None)))
+        self.current = SimpleNamespace(file_id=7, revision="file-rev", download_hash="a" * 40,
+                                       downloader="qb", source_path="/data/source/a.mkv", storage="local",
+                                       identity_verified=True, review_reason="")
+        self.applied = []
+        self.rows = [self.current]
+        def apply(current, proof):
+            self.applied.append((current, proof))
+            return kernel.MutationResult("applied", "file_record_removed")
+        self.gateway = SimpleNamespace(
+            list_file_only_candidates=lambda after_id=0, limit=100: [row for row in self.rows if row.file_id > after_id][:limit],
+            get_file_only_candidate=lambda file_id: self.current if file_id == 7 else None,
+            get_file_only_protection=lambda _: SimpleNamespace(transfer_task_active=False),
+            apply_file_only=apply,
+        )
+        self.checked_paths = []
+        self.task_queries = []
+        def check_path(path):
+            self.checked_paths.append(path)
+            return adapter.PathObservation(P.MISSING, True)
+        def check_tasks(download_hash, paths):
+            self.task_queries.append((download_hash, paths))
+            return True, False
+        # A file-only action cannot access library or subscription capabilities.
+        self.subject = adapter.MoviePilotCleanupAdapter(
+            self.gateway, SimpleNamespace(check=check_path), SimpleNamespace(check=check_tasks), object())
+
+    def item(self):
+        page = self.subject.list_file_only_candidates(limit=1)
+        self.assertTrue(page.complete)
+        return page.records[0]
+
+    def test_missing_pack_file_needs_no_media_identity_or_library_request(self):
+        item = self.item()
+        self.assertEqual(item.kind, "download_file_only")
+        evidence = self.subject.observe_file_only(item)
+        self.assertIsNone(kernel.file_only_decision(item, evidence))
+        result = self.subject.mutate_file_only(item, evidence, kernel.CleanupOptions(allow_subscription_retry=True))
+        self.assertEqual(result.status, "applied")
+        self.assertEqual(len(self.applied), 1)
+        self.assertEqual(self.applied[0][0].file_id, 7)
+        self.assertEqual(self.applied[0][1].revision, "file-rev")
+        self.assertEqual(set(self.checked_paths), {"/data/source/a.mkv"})
+        self.assertEqual(set(self.task_queries), {("a" * 40, ("/data/source/a.mkv",))})
+
+    def test_file_cursor_is_bounded_ordered_and_rotates(self):
+        self.rows = [SimpleNamespace(**{**vars(self.current), "file_id": value}) for value in (7, 9, 12)]
+        first = self.subject.list_file_only_candidates(limit=2)
+        self.assertEqual([row.record_id for row in first.records], [7, 9])
+        second = self.subject.list_file_only_candidates(cursor=first.cursor, limit=2)
+        self.assertEqual([row.record_id for row in second.records], [12])
+        self.assertEqual(second.cursor, 0)
+        self.rows.reverse()
+        bad = self.subject.list_file_only_candidates(limit=2)
+        self.assertFalse(bad.complete)
+        self.assertEqual(bad.cursor, 0)
+
+    def test_changed_revision_missing_health_or_active_task_never_mutates(self):
+        item = self.item()
+        proof = self.subject.observe_file_only(item)
+        self.current.revision = "changed"
+        self.assertEqual(self.subject.mutate_file_only(item, proof, kernel.CleanupOptions()).status, "needs_review")
+        self.current.revision = "file-rev"
+        for task_result in ((False, None), (True, True)):
+            self.subject.downloaders.check = lambda *_: task_result
+            self.assertEqual(self.subject.mutate_file_only(item, proof, kernel.CleanupOptions()).status, "needs_review")
+        self.subject.downloaders.check = lambda *_: (True, False)
+        self.subject.paths.check = lambda _: adapter.PathObservation(P.MISSING, False)
+        self.assertEqual(self.subject.mutate_file_only(item, proof, kernel.CleanupOptions()).status, "needs_review")
+        self.assertEqual(self.applied, [])
+
+    def test_source_present_or_unknown_skips_remote_queries(self):
+        item = self.item()
+        for presence in (P.PRESENT, P.UNKNOWN):
+            self.subject.paths.check = lambda _: adapter.PathObservation(presence, presence is P.PRESENT)
+            evidence = self.subject.observe_file_only(item)
+            self.assertEqual(evidence.source, presence)
+            self.assertFalse(evidence.downloaders_complete)
+        self.assertEqual(self.task_queries, [])
+
+    def test_source_reappearing_during_task_inventory_prevents_file_prune(self):
+        item = self.item()
+        proof = self.subject.observe_file_only(item)
+        def tasks(*_):
+            self.subject.paths.check = lambda _: adapter.PathObservation(P.PRESENT, True)
+            return True, False
+        self.subject.downloaders.check = tasks
+        self.assertEqual(self.subject.mutate_file_only(item, proof, kernel.CleanupOptions()).status, "needs_review")
+        self.assertEqual(self.applied, [])
+
+    def test_transfer_lease_and_cross_kind_record_are_rejected(self):
+        item = self.item()
+        self.gateway.get_file_only_protection = lambda _: SimpleNamespace(transfer_task_active=True)
+        proof = self.subject.observe_file_only(item)
+        self.assertEqual(self.subject.mutate_file_only(item, proof, kernel.CleanupOptions()).status, "needs_review")
+        self.assertEqual(self.subject.mutate_file_only(replace(item, kind="download_file"), proof,
+                                                      kernel.CleanupOptions()).status, "needs_review")
+        self.assertEqual(self.applied, [])
+
+    def test_database_failure_is_not_reported_as_a_completed_prune(self):
+        item = self.item()
+        self.gateway.apply_file_only = lambda *_: kernel.MutationResult("needs_review", "stale")
+        result = self.subject.mutate_file_only(item, self.subject.observe_file_only(item), kernel.CleanupOptions())
+        self.assertEqual(result.status, "needs_review")
+
+
+class ReconciliationBatchTests(unittest.TestCase):
+    def build(self):
+        self.assertTrue(callable(getattr(adapter.MoviePilotCleanupAdapter, "reconcile_batch", None)))
+        self.current = SimpleNamespace(file_id=7, revision="file-rev", download_hash="a" * 40,
+            downloader="qb", source_path="/data/source/a.mkv", storage="local", identity_verified=True, review_reason="")
+        self.receipt = dict(version=1, key="group", revision="group-rev", complete=True, equivalent_parents=True,
+            downloader="qb", download_hash="a" * 40,
+            files=[dict(id=7, fullpath=self.current.source_path, downloader="qb", download_hash="a" * 40, state=1)],
+            histories=[dict(id=1)], transfers=[dict(id=5, src=self.current.source_path, dest="/data/library/a.mkv")])
+        self.present = True
+        self.library_present = True
+        self.removed = []
+        self.persisted = []
+        def prune(*_):
+            self.assertTrue(self.persisted[-1]["cleanup_v2"]["receipts"])
+            self.present = False
+            self.removed.append("file")
+            return kernel.MutationResult("applied", "file_record_removed", {"download_files": 1})
+        def history(receipt, proof):
+            self.removed.append("history")
+            return kernel.MutationResult("applied", "related_history_removed", {"download_history": 1, "transfer_history": 1})
+        gateway = SimpleNamespace(
+            list_file_only_candidates=lambda after_id=0, limit=100: [self.current] if self.present and after_id < 7 else [],
+            get_file_only_candidate=lambda _: self.current if self.present else None,
+            get_file_only_protection=lambda _: SimpleNamespace(transfer_task_active=False),
+            apply_file_only=prune, prepare_receipt=lambda _: self.receipt,
+            receipt_view=lambda _: dict(valid=True, revision="live", files=[self.receipt["files"][0]] if self.present else [],
+                histories=self.receipt["histories"], transfers=self.receipt["transfers"], pending=False, done=False),
+            apply_receipt=history, source_ownership=lambda *_: True)
+        paths = SimpleNamespace(check=lambda path: adapter.PathObservation(
+            P.PRESENT if "/library/" in path and self.library_present else P.MISSING, True))
+        self.subject = adapter.MoviePilotCleanupAdapter(gateway, paths,
+            SimpleNamespace(check=lambda *_: (True, False)), object())
+        return self.subject
+
+    def run_batch(self, state, now, **kwargs):
+        from copy import deepcopy
+        def persist(snapshot):
+            self.persisted.append(deepcopy(snapshot))
+        return self.subject.reconcile_batch(state, persist=persist, now=now, dry_run=False,
+            options=kernel.CleanupOptions(stability_seconds=0), **kwargs)
+
+    def test_file_prune_keeps_durable_parent_entry_until_library_later_disappears(self):
+        self.build()
+        first = self.run_batch({}, 100)
+        second = self.run_batch(first.state, 101)
+        self.assertEqual(self.removed, ["file"])
+        self.assertEqual(second.report["counts"]["download_files"], 1)
+        self.assertTrue(second.state["cleanup_v2"]["receipts"])
+        self.library_present = False
+        third = self.run_batch(second.state, 102)
+        self.assertNotIn("history", self.removed)
+        fourth = self.run_batch(third.state, 103)
+        self.assertEqual(self.removed, ["file", "history"])
+        self.assertEqual(fourth.report["counts"]["download_history"], 1)
+        self.assertFalse(fourth.state["cleanup_v2"]["receipts"])
+
+    def test_failed_receipt_store_prevents_any_database_mutation(self):
+        self.build()
+        first = self.run_batch({}, 100)
+        def fail(_):
+            raise OSError("unavailable")
+        result = self.subject.reconcile_batch(first.state, persist=fail, now=101, dry_run=False,
+            options=kernel.CleanupOptions(stability_seconds=0))
+        self.assertEqual(result.report["status"], "failed")
+        self.assertEqual(self.removed, [])
+
+    def test_long_lived_receipts_are_independent_of_observation_pool_and_preserve_legacy(self):
+        self.build()
+        from copy import deepcopy
+        receipts = {str(index): dict(self.receipt, serial=index + 1) for index in range(2200)}
+        state = {"version": 1, "legacy": {"keep": True}, "purged_source": {"keep": {"phase": "intent"}},
+                 "cleanup_v2": {"version": 2, "receipts": receipts, "next_serial": 2201}}
+        result = self.run_batch(deepcopy(state), 10_000_000)
+        self.assertGreaterEqual(len(result.state["cleanup_v2"]["receipts"]), 2200)
+        self.assertEqual(result.state["legacy"], state["legacy"])
+        self.assertEqual(result.state["purged_source"], state["purged_source"])
+
+    def test_source_budget_is_persistent_and_report_is_bounded(self):
+        self.build()
+        self.present = False
+        self.receipt["files"] = [dict(id=index + 1, fullpath=f"/data/source/{index}.mkv") for index in range(350)]
+        self.receipt.update(serial=1, source_cursor=0)
+        state = {"cleanup_v2": {"version": 2, "receipts": {"group": self.receipt}}}
+        first = self.run_batch(state, 100)
+        self.assertEqual(first.state["cleanup_v2"]["receipts"]["group"]["source_cursor"], 100)
+        self.assertFalse(first.report["scan"]["complete"])
+        second = self.run_batch(first.state, 101)
+        self.assertEqual(second.state["cleanup_v2"]["receipts"]["group"]["source_cursor"], 200)
+        self.assertLessEqual(len(second.report["items"]), 400)
+
+    def test_actual_path_budget_yields_and_resumes_without_repeating_finished_sources(self):
+        self.build()
+        self.present = False
+        self.receipt["files"] = [dict(id=index + 1, fullpath=f"/data/source/{index}.mkv") for index in range(10)]
+        self.receipt.update(serial=1, source_cursor=0)
+        state = {"cleanup_v2": {"version": 2, "receipts": {"group": self.receipt}}}
+        import importlib
+        recon = importlib.import_module(PACKAGE + ".reconcile")
+        original = self.subject.paths.check
+        calls = []
+        def probe(path):
+            calls.append(path)
+            return original(path)
+        self.subject.paths.check = probe
+        saw_yield = False
+        with patch.object(recon, "MAX_PATH_PROBES", 70):
+            for now in range(100, 106):
+                before = len(calls)
+                result = self.run_batch(state, now)
+                self.assertLessEqual(len(calls) - before, 70)
+                self.assertEqual(len(calls) - before, result.report["budget"]["path_probes"])
+                saw_yield |= result.report["status"] == "yielded"
+                state = result.state
+                if result.report["scan"]["complete"]:
+                    break
+        self.assertTrue(saw_yield)
+        self.assertTrue(result.report["scan"]["complete"])
+
+    def test_runtime_budget_is_not_swallowed_by_observer_failure(self):
+        self.build()
+        import importlib
+        recon = importlib.import_module(PACKAGE + ".reconcile")
+        clock = [0]
+        probes = []
+        original = self.subject.paths.check
+        def slow(path):
+            probes.append(path)
+            clock[0] = 100
+            return original(path)
+        self.subject.paths.check = slow
+        with patch.object(recon.time, "monotonic", side_effect=lambda: clock[0]):
+            result = self.run_batch({}, 100)
+        self.assertEqual(result.report["status"], "yielded")
+        self.assertEqual(result.report["error"], "batch_time_limit")
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(self.removed, [])
+
+    def test_file_cursor_advances_finished_prefix_when_budget_interrupts_a_page(self):
+        self.build()
+        import importlib
+        recon = importlib.import_module(PACKAGE + ".reconcile")
+        rows = {value: SimpleNamespace(**{**vars(self.current), "file_id": value, "source_path": f"/data/source/{value}.mkv"})
+                for value in (7, 9, 12)}
+        self.subject.gateway.list_file_only_candidates = lambda after_id=0, limit=100: [row for value, row in rows.items() if value > after_id][:limit]
+        self.subject.gateway.get_file_only_candidate = lambda value: rows.get(value)
+        self.receipt["files"] = [dict(id=value, fullpath=row.source_path) for value, row in rows.items()]
+        clock, paths = [0], []
+        def probe(path):
+            paths.append(path)
+            clock[0] += 3
+            return adapter.PathObservation(P.MISSING, True)
+        self.subject.paths.check = probe
+        with patch.object(recon.time, "monotonic", side_effect=lambda: clock[0]), patch.object(recon, "MAX_BATCH_SECONDS", 5):
+            first = self.run_batch({}, 100)
+            self.assertEqual(first.report["status"], "yielded")
+            self.assertEqual(first.state["cleanup_v2"]["file_cursor"], 7)
+            self.assertEqual(first.report["processed"], 1)
+            clock[0] = 0
+            paths.clear()
+            second = self.run_batch(first.state, 101)
+            self.assertEqual(paths[0], "/data/source/9.mkv")
+            self.assertEqual(second.state["cleanup_v2"]["file_cursor"], 9)
+
+
+class ReconciliationSourceTests(unittest.TestCase):
+    def setUp(self):
+        from copy import deepcopy
+        import hashlib
+        import json
+        self.fixture = SourcePurgeTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        f = self.fixture
+        self.present = True
+        self.history_present = True
+        self.fail_child = False
+        file = dict(id=7, downloader="qb", download_hash="a" * 40, fullpath=str(f.source),
+                    savepath=str(f.root), filepath="source/a.mkv", torrentname="fixture", state=1)
+        revision = hashlib.sha256(json.dumps([file], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+        self.child = SimpleNamespace(file_id=7, downloader="qb", download_hash="a" * 40, source_path=str(f.source),
+                                     revision=revision, storage="local", identity_verified=True, review_reason="")
+        self.receipt = dict(version=1, key="group", revision="group-rev", complete=True, equivalent_parents=True,
+            downloader="qb", download_hash="a" * 40, files=[file], histories=[dict(id=1)],
+            transfers=[dict(id=5, src=str(f.source), dest=str(f.target))])
+        def prune(*_):
+            if self.fail_child:
+                return kernel.MutationResult("needs_review", "database_failed")
+            self.assertFalse(f.source.exists())
+            self.present = False
+            return kernel.MutationResult("applied", "file_record_removed", {"download_files": 1})
+        def history(*_):
+            self.history_present = False
+            return kernel.MutationResult("applied", "related_history_removed", {"download_history": 1, "transfer_history": 1})
+        gateway = SimpleNamespace(
+            list_file_only_candidates=lambda after_id=0, limit=100: [self.child] if self.present and after_id < 7 else [],
+            get_file_only_candidate=lambda _: self.child if self.present else None,
+            get_file_only_protection=lambda _: SimpleNamespace(transfer_task_active=False),
+            prepare_receipt=lambda _: deepcopy(self.receipt), apply_file_only=prune,
+            receipt_view=lambda _: dict(valid=True, revision="live", files=[file] if self.present else [],
+                histories=[dict(id=1)] if self.history_present else [],
+                transfers=self.receipt["transfers"] if self.history_present else [],
+                pending=False, mappings_safe=True, done=not self.present and not self.history_present),
+            source_ownership=lambda *_: True, apply_receipt=history)
+        self.subject = adapter.MoviePilotCleanupAdapter(gateway, f.paths, f.downloaders, object())
+        self.states = []
+
+    def run_batch(self, state, now, **kwargs):
+        from copy import deepcopy
+        def persist(value):
+            self.states.append(deepcopy(value))
+        return self.subject.reconcile_batch(state, persist=persist, now=now, dry_run=False,
+            options=kernel.CleanupOptions(stability_seconds=0, allow_subscription_retry=True), **kwargs)
+
+    def test_source_cleanup_is_independent_of_emby_and_preserves_another_copy(self):
+        keep = self.fixture.root / "another-version.mkv"
+        keep.write_bytes(b"another copy")
+        first = self.run_batch({}, 100)
+        self.assertTrue(self.fixture.source.exists())
+        second = self.run_batch(first.state, 101)
+        self.assertFalse(self.fixture.source.exists())
+        self.assertEqual(keep.read_bytes(), b"another copy")
+        self.assertEqual(second.report["counts"]["source_files"], 1)
+        self.assertEqual(second.report["counts"]["tasks"], 1)
+        self.assertEqual(second.report["counts"]["download_files"], 1)
+        self.assertFalse(self.present)
+        self.assertTrue(second.state["cleanup_v2"]["receipts"])
+
+    def test_details_retain_specific_lifecycle_blocker(self):
+        self.fixture.service.instance.tasks[0]["state"] = "checkingUP"
+        first = self.run_batch({}, 100)
+        second = self.run_batch(first.state, 101)
+        reasons = [item["reason"] for item in second.report["items"] if item["branch"] == "source_purge"]
+        self.assertEqual(reasons, ["task_checking"])
+        self.assertTrue(self.fixture.source.exists())
+        self.assertEqual(self.fixture.service.instance.deleted, [])
+
+    def test_source_delete_database_failure_recovers_from_persisted_receipt(self):
+        first = self.run_batch({}, 100)
+        self.fail_child = True
+        second = self.run_batch(first.state, 101)
+        self.assertFalse(self.fixture.source.exists())
+        self.assertTrue(self.present)
+        self.assertEqual(second.report["counts"]["source_files"], 1)
+        receipt = next(iter(second.state["cleanup_v2"]["receipts"].values()))
+        self.assertEqual(receipt["physical_intents"][str(self.fixture.source)]["phase"], "source_deleted")
+        self.fail_child = False
+        third = self.run_batch(second.state, 102)
+        fourth = self.run_batch(third.state, 103)
+        self.assertFalse(self.present)
+        self.assertEqual(len(self.fixture.service.instance.deleted), 1)
+
+    def test_interrupted_source_intent_never_authorizes_a_replacement_file(self):
+        first = self.run_batch({}, 100)
+        self.fixture.service.instance.delete_success = False
+        second = self.run_batch(first.state, 101)
+        self.fixture.source.write_bytes(b"replacement")
+        self.fixture.service.instance.files[0]["size"] = len(b"replacement")
+        self.fixture.service.instance.delete_success = True
+        third = self.run_batch(second.state, 102)
+        fourth = self.run_batch(third.state, 103)
+        self.assertEqual(self.fixture.source.read_bytes(), b"replacement")
+        self.assertIn("source_intent_revision_changed", [item["reason"] for item in fourth.report["items"]])
+
+    def test_host_adapter_build_does_not_import_or_construct_a_media_server(self):
+        modules = {name: ModuleType(name) for name in ("app", "app.application", "app.application.directory", "app.application.downloader")}
+        modules["app.application.directory"].DirectoryHelper = lambda: SimpleNamespace(get_dirs=lambda: [])
+        modules["app.application.downloader"].DownloaderHelper = lambda: Helper({"qb": downloader_service()})
+        with patch.dict(sys.modules, modules):
+            subject = adapter.build_host_adapter()
+        self.assertIsInstance(subject, adapter.MoviePilotCleanupAdapter)
+
+    def test_hardlink_or_cancellation_after_task_command_preserves_source(self):
+        link = self.fixture.root / "keep-link.mkv"
+        os.link(self.fixture.source, link)
+        first = self.run_batch({}, 100)
+        second = self.run_batch(first.state, 101)
+        self.assertTrue(self.fixture.source.exists())
+        self.assertEqual(self.fixture.service.instance.deleted, [])
+        link.unlink()
+        third = self.run_batch(second.state, 102)
+        cancelled = [False]
+        original = self.fixture.service.instance.delete_torrents
+        def remove(**kwargs):
+            result = original(**kwargs)
+            cancelled[0] = True
+            return result
+        self.fixture.service.instance.delete_torrents = remove
+        fourth = self.run_batch(third.state, 103, stop_requested=lambda: cancelled[0])
+        self.assertEqual(fourth.report["status"], "cancelled")
+        self.assertTrue(self.fixture.source.exists())
+        self.assertTrue(self.present)
 
 
 if __name__ == "__main__":

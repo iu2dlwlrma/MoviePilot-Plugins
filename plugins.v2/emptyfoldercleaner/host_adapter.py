@@ -13,7 +13,7 @@ import stat
 from typing import Callable
 from urllib.parse import urlsplit
 
-from .record_cleanup import CleanupEvidence, CleanupRecord, MutationResult, Presence
+from .record_cleanup import CleanupEvidence, CleanupRecord, MutationResult, Presence, file_only_decision
 
 
 @dataclass(frozen=True)
@@ -84,6 +84,25 @@ def _exclusive_signature(value):
 def _torrent_hash(value):
     return (isinstance(value, str) and len(value) in (40, 64)
             and all(character in "0123456789abcdefABCDEF" for character in value))
+
+
+def _task_lifecycle(service_type, row):
+    lifecycle = _get(row, "state", _get(row, "status"))
+    permitted = ({"uploading", "stalledUP", "queuedUP", "pausedUP", "stoppedUP", "forcedUP"}
+                 if service_type == "qbittorrent" else {"seeding", "seed_pending", "stopped", 0, 5, 6})
+    if lifecycle in permitted:
+        return ""
+    if lifecycle in ("moving", "allocating"):
+        return "task_moving"
+    if lifecycle in ("checkingUP", "checkingDL", "checkingResumeData", "checking", "check_pending", 1, 2):
+        return "task_checking"
+    if lifecycle in ("queuedDL", "download_pending", 3):
+        return "task_queued_download"
+    if lifecycle in ("downloading", "stalledDL", "forcedDL", "metaDL", 4):
+        return "task_downloading"
+    if lifecycle in ("pausedDL", "stoppedDL", "missingFiles", "error"):
+        return "task_download_incomplete"
+    return "task_state_unknown"
 
 
 def _mounts():
@@ -220,8 +239,131 @@ class DownloaderProbe:
         self.helper = helper
         self.max_tasks = min(max(1, max_tasks), 10000)
         self.max_services = min(max(1, max_services), 16)
+        self.stop_requested = lambda: False
+        self.last_removed = ()
+        self._batch_cache = None
+        self._preview_mode = False
 
-    def check(self, download_hash, paths):
+    def begin_batch(self):
+        self._batch_cache = {}
+
+    def end_batch(self):
+        self._batch_cache = None
+        self._preview_mode = False
+
+    def _inventory(self, client, kind, task_hash=None):
+        key = (id(client), kind, task_hash)
+        def read():
+            return (client.get_torrents(ids=None, status=None, tags=None) if kind == "tasks"
+                    else client.get_files(tid=task_hash))
+        if not self._preview_mode or self._batch_cache is None:
+            return read()
+        if key not in self._batch_cache:
+            if len(self._batch_cache) >= 64:
+                raise ValueError("preview_inventory_limit")
+            self._batch_cache[key] = read()
+        return self._batch_cache[key]
+
+    def check_cached(self, download_hash, paths):
+        previous = self._preview_mode
+        self._preview_mode = True
+        try:
+            return self.check(download_hash, paths)
+        finally:
+            self._preview_mode = previous
+
+    def check_scoped(self, download_hash, paths, downloader):
+        return self.check(download_hash, paths, downloader=downloader)
+
+    def check_scoped_cached(self, download_hash, paths, downloader):
+        previous = self._preview_mode
+        self._preview_mode = True
+        try:
+            return self.check(download_hash, paths, downloader=downloader)
+        finally:
+            self._preview_mode = previous
+
+    def check_activity(self, download_hash, paths, downloader, *, cached=False):
+        """Exact-file write activity, distinct from task presence/removal ownership."""
+        previous = self._preview_mode
+        self._preview_mode = cached
+        self.activity_reason = ""
+        try:
+            targets = tuple(_path(path) for path in paths)
+            if not targets or any(path is None for path in targets):
+                return False, None
+            configs = self.helper.get_configs(include_disabled=True)
+            if not isinstance(configs, dict) or not configs or len(configs) > self.max_services:
+                return False, None
+            total = queries = 0
+            complete = True
+            for service_name, config in configs.items():
+                if self.stop_requested():
+                    return False, None
+                service = self.helper.get_service(name=service_name)
+                if (_get(config, "enabled") is not True or service is None or _get(service, "instance") is None
+                        or _get(service, "type") not in ("qbittorrent", "transmission")):
+                    complete = False
+                    continue
+                rows, error = self._inventory(service.instance, "tasks")
+                if error is not False or not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+                    complete = False
+                    continue
+                total += len(rows)
+                if total > self.max_tasks:
+                    return False, None
+                for row in rows:
+                    if self.stop_requested():
+                        return False, None
+                    task_hash = _get(row, "hash") or _get(row, "hash_string") or _get(row, "hashString")
+                    base = _path(_get(row, "save_path") or _get(row, "download_dir") or _get(row, "downloadDir"))
+                    content = _get(row, "content_path")
+                    if not content and base is not None and isinstance(_get(row, "name"), str):
+                        content = str(base / _get(row, "name"))
+                    content = _path(content)
+                    if not isinstance(task_hash, str) or not task_hash or base is None or content is None:
+                        complete = False
+                        continue
+                    own = service_name == downloader and task_hash.lower() == str(download_hash).lower()
+                    if not own and not any(_within(path, content) or _within(content, path) for path in targets):
+                        continue
+                    queries += 1
+                    if queries > 32:
+                        return False, None
+                    files = self._inventory(service.instance, "files", task_hash)
+                    if not isinstance(files, Sequence) or isinstance(files, (str, bytes)) or not files or len(files) > 10000:
+                        complete = False
+                        continue
+                    for file in files:
+                        relative = _get(file, "name")
+                        if (not isinstance(relative, str) or not relative or relative.startswith("/") or "\x00" in relative
+                                or any(part in (".", "..") for part in relative.split("/"))):
+                            complete = False
+                            continue
+                        if base / relative not in targets:
+                            continue
+                        reason = _task_lifecycle(_get(service, "type"), row)
+                        length, completed, progress = _get(file, "size", _get(file, "length")), _get(file, "completed"), _get(file, "progress")
+                        full = (type(length) is int and length > 0 and
+                                (type(completed) is int and completed == length or type(progress) in (int, float) and progress == 1))
+                        if reason or not full:
+                            self.activity_reason = reason or "task_download_incomplete"
+                            return complete, True
+            return complete, False if complete else None
+        except Exception:
+            return False, None
+        finally:
+            self._preview_mode = previous
+
+    def plan_purge_cached(self, download_hash, source_path, size, *, downloader=None):
+        previous = self._preview_mode
+        self._preview_mode = True
+        try:
+            return self.plan_purge(download_hash, source_path, size, downloader=downloader)
+        finally:
+            self._preview_mode = previous
+
+    def check(self, download_hash, paths, *, downloader=None):
         try:
             configs = self.helper.get_configs(include_disabled=True)
             if not isinstance(configs, dict) or not configs or len(configs) > self.max_services:
@@ -230,14 +372,16 @@ class DownloaderProbe:
             if not download_hash or any(p is None for p in target_paths):
                 return False, None
             complete, present, total, file_queries = True, False, 0, 0
-            for name, config in configs.items():
-                service = self.helper.get_service(name=name)
+            for service_name, config in configs.items():
+                if self.stop_requested():
+                    return False, None
+                service = self.helper.get_service(name=service_name)
                 if (_get(config, "enabled") is not True or service is None
                         or _get(service, "type") not in ("qbittorrent", "transmission")
                         or _get(service, "instance") is None):
                     complete = False
                     continue
-                rows, error = service.instance.get_torrents(ids=None, status=None, tags=None)
+                rows, error = self._inventory(service.instance, "tasks")
                 if error is not False or not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
                     complete = False
                     continue
@@ -255,7 +399,8 @@ class DownloaderProbe:
                     task_path = _path(content)
                     if not isinstance(task_hash, str) or not task_hash or task_path is None:
                         complete = False
-                    if isinstance(task_hash, str) and task_hash.lower() == download_hash.lower():
+                    if (isinstance(task_hash, str) and task_hash.lower() == download_hash.lower()
+                            and (downloader is None or service_name == downloader)):
                         present = True
                         continue
                     if task_path in target_paths:
@@ -268,7 +413,7 @@ class DownloaderProbe:
                         if file_queries > 32 or not task_hash:
                             return False, True if present else None
                         base = _path(_get(row, "save_path") or _get(row, "download_dir") or _get(row, "downloadDir"))
-                        files = service.instance.get_files(tid=task_hash)
+                        files = self._inventory(service.instance, "files", task_hash)
                         if (base is None or not isinstance(files, Sequence) or isinstance(files, (str, bytes))
                                 or not files or len(files) > 10000):
                             complete = False
@@ -288,23 +433,25 @@ class DownloaderProbe:
         except Exception:
             return False, None
 
-    def plan_purge(self, download_hash, source_path, size):
+    def plan_purge(self, download_hash, source_path, size, *, downloader=None):
         """Enumerate all summaries and exact files of every potentially shared task."""
         try:
             source = _path(source_path)
-            if source is None or not _torrent_hash(download_hash) or type(size) is not int or size <= 0:
+            if source is None or not _torrent_hash(download_hash) or (size is not None and (type(size) is not int or size <= 0)):
                 return PurgePlan(reason="invalid_source_identity")
             configs = self.helper.get_configs(include_disabled=True)
             if not isinstance(configs, dict) or not configs or len(configs) > self.max_services:
                 return PurgePlan()
             tasks, total, file_count, file_queries = [], 0, 0, 0
             for service_name, config in configs.items():
+                if self.stop_requested():
+                    return PurgePlan(reason="cleanup_cancelled")
                 service = self.helper.get_service(name=service_name)
                 if (_get(config, "enabled") is not True or service is None
                         or _get(service, "type") not in ("qbittorrent", "transmission")
                         or _get(service, "instance") is None):
                     return PurgePlan()
-                rows, error = service.instance.get_torrents(ids=None, status=None, tags=None)
+                rows, error = self._inventory(service.instance, "tasks")
                 if error is not False or not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
                     return PurgePlan()
                 total += len(rows)
@@ -312,6 +459,8 @@ class DownloaderProbe:
                     return PurgePlan(reason="task_inventory_limit")
                 seen = set()
                 for row in rows:
+                    if self.stop_requested():
+                        return PurgePlan(reason="cleanup_cancelled")
                     task_hash = _get(row, "hash") or _get(row, "hash_string") or _get(row, "hashString")
                     base = _path(_get(row, "save_path") or _get(row, "download_dir") or _get(row, "downloadDir"))
                     if not _torrent_hash(task_hash) or base is None or task_hash.lower() in seen:
@@ -327,13 +476,13 @@ class DownloaderProbe:
                     content = _path(content)
                     if content is None or not _within(content, base):
                         return PurgePlan(reason="task_path_ambiguous")
-                    same_hash = task_hash.lower() == download_hash.lower()
+                    same_hash = task_hash.lower() == download_hash.lower() and (downloader is None or service_name == downloader)
                     if not same_hash and not (_within(source, content) or _within(content, source)):
                         continue  # The native content summary proves no overlap.
                     file_queries += 1
                     if file_queries > 32:
                         return PurgePlan(reason="file_query_limit")
-                    files = service.instance.get_files(tid=task_hash)
+                    files = self._inventory(service.instance, "files", task_hash)
                     if not isinstance(files, Sequence) or isinstance(files, (str, bytes)) or not files:
                         return PurgePlan(reason="file_inventory_incomplete")
                     file_count += len(files)
@@ -354,37 +503,46 @@ class DownloaderProbe:
                     if not same_hash and source in paths:
                         return PurgePlan(reason="source_shared_by_task")
                     if same_hash:
+                        lifecycle_reason = _task_lifecycle(_get(service, "type"), row)
+                        if lifecycle_reason:
+                            return PurgePlan(reason=lifecycle_reason)
                         if len(files) != 1 or matched is None:
                             return PurgePlan(reason="torrent_not_exclusive_single_file")
                         length = _get(matched, "size", _get(matched, "length"))
                         completed, progress = _get(matched, "completed"), _get(matched, "progress")
-                        file_complete = (type(completed) is int and completed == size
+                        file_complete = (type(completed) is int and completed == length
                                          or type(progress) in (int, float) and progress == 1)
-                        if type(length) is not int or length != size or not file_complete:
+                        if type(length) is not int or length <= 0 or (size is not None and length != size) or not file_complete:
                             return PurgePlan(reason="torrent_file_incomplete")
-                        tasks.append(PurgeTask(service_name, task_hash.lower(), str(source), size))
+                        tasks.append(PurgeTask(service_name, task_hash.lower(), str(source), length))
             return PurgePlan(True, tuple(sorted(tasks, key=lambda task: (task.service, task.download_hash))), "")
         except Exception:
             return PurgePlan()
 
-    def remove_exclusive_tasks(self, download_hash, source_path, size, expected):
+    def remove_exclusive_tasks(self, download_hash, source_path, size, expected, *, downloader=None):
         """Remove only freshly revalidated tasks; success requires disappearance."""
+        self.last_removed = ()
         if not isinstance(expected, PurgePlan) or not expected.complete:
             return False
         remaining = expected.tasks
         try:
             for task in expected.tasks:
-                fresh = self.plan_purge(download_hash, source_path, size)
+                if self.stop_requested():
+                    return False
+                fresh = self.plan_purge(download_hash, source_path, size, downloader=downloader)
                 if not fresh.complete or fresh.tasks != remaining:
                     return False
                 service = self.helper.get_service(name=task.service)
                 if service is None or service.instance.delete_torrents(delete_file=False, ids=[task.download_hash]) is not True:
                     return False
                 remaining = tuple(item for item in remaining if item != task)
-                after = self.plan_purge(download_hash, source_path, size)
+                after = self.plan_purge(download_hash, source_path, size, downloader=downloader)
                 if not after.complete or after.tasks != remaining:
                     return False
-            final = self.plan_purge(download_hash, source_path, size)
+                self.last_removed += (task,)
+                if self._batch_cache is not None:
+                    self._batch_cache.clear()
+            final = self.plan_purge(download_hash, source_path, size, downloader=downloader)
             return final.complete and not final.tasks
         except Exception:
             return False
@@ -551,6 +709,14 @@ def _record(candidate):
     )
 
 
+def _file_record(candidate):
+    fingerprint = hashlib.sha256((str(candidate.download_hash) + "\0" + str(candidate.source_path)).encode()).hexdigest()
+    return CleanupRecord(key="download_file_only:" + str(candidate.file_id) + ":" + fingerprint,
+        revision=candidate.revision, record_id=candidate.file_id, source_path=candidate.source_path,
+        destination_paths=(), media_source="", media_id="", media_type="", storage=candidate.storage,
+        kind="download_file_only", download_hash=candidate.download_hash, downloader=candidate.downloader)
+
+
 def _merge_presence(values):
     if Presence.PRESENT in values:
         return Presence.PRESENT
@@ -560,6 +726,74 @@ def _merge_presence(values):
 class MoviePilotCleanupAdapter:
     def __init__(self, gateway, paths, downloaders, media):
         self.gateway, self.paths, self.downloaders, self.media = gateway, paths, downloaders, media
+
+    def reconcile_batch(self, state, *, persist, now=None, dry_run=True, options=None, stop_requested=None):
+        from .reconcile import reconcile_batch
+        return reconcile_batch(self, state, persist=persist, now=now, dry_run=dry_run,
+                               options=options, stop_requested=stop_requested)
+
+    def list_file_only_candidates(self, *, cursor=0, limit=100):
+        if type(cursor) is not int or cursor < 0 or type(limit) is not int or not 1 <= limit <= 100:
+            return CandidatePage(reason="invalid_cursor_or_limit")
+        try:
+            rows = self.gateway.list_file_only_candidates(after_id=cursor, limit=limit)
+            if not isinstance(rows, (list, tuple)) or len(rows) > limit:
+                raise ValueError("candidate_page_unbounded")
+            records, previous = [], cursor
+            for candidate in rows:
+                if type(candidate.file_id) is not int or candidate.file_id <= previous:
+                    raise ValueError("candidate_page_unordered")
+                previous = candidate.file_id
+                records.append(_file_record(candidate))
+            return CandidatePage(tuple(records), previous if len(rows) == limit else 0, True)
+        except Exception:
+            return CandidatePage(cursor=cursor, reason="candidate_read_failed")
+
+    def observe_file_only(self, record, *, fresh=False):
+        if record.kind != "download_file_only":
+            return CleanupEvidence(record_present=None)
+        try:
+            current = self.gateway.get_file_only_candidate(record.record_id)
+            if current is None:
+                return CleanupEvidence(record_present=False)
+            if _file_record(current) != record:
+                return CleanupEvidence(revision=current.revision, identity_verified=False)
+            source = self.paths.check(record.source_path)
+            evidence = CleanupEvidence(source=source.presence, storage_ready=source.ready,
+                revision=current.revision, record_present=True,
+                identity_verified=_get(current, "identity_verified") is True and not _get(current, "review_reason"))
+            if source.presence is not Presence.MISSING or not source.ready:
+                return evidence
+            protection = self.gateway.get_file_only_protection(current)
+            activity = getattr(self.downloaders, "check_activity", None)
+            if activity:
+                complete, present = activity(current.download_hash, (record.source_path,), current.downloader, cached=not fresh)
+            else:
+                check = self.downloaders.check if fresh else getattr(self.downloaders, "check_cached", self.downloaders.check)
+                complete, present = check(current.download_hash, (record.source_path,))
+            return replace(evidence, downloaders_complete=complete is True,
+                           downloader_task_present=present, transfer_task_active=_get(protection, "transfer_task_active"),
+                           blocking_reason=getattr(self.downloaders, "activity_reason", "") if present else "")
+        except Exception:
+            return CleanupEvidence(record_present=None)
+
+    def mutate_file_only(self, record, evidence, options):
+        fresh = self.observe_file_only(record, fresh=True)
+        decision = file_only_decision(record, fresh)
+        if decision:
+            return MutationResult("already_clean" if decision[0] == "already_clean" else "needs_review", decision[1])
+        # Inventory calls can be slow; absence must still be true at commit.
+        path = self.paths.check(record.source_path)
+        if not path.ready or path.presence is not Presence.MISSING:
+            return MutationResult("needs_review", "source_reappeared")
+        try:
+            current = self.gateway.get_file_only_candidate(record.record_id)
+            if current is None or _file_record(current) != record:
+                return MutationResult("needs_review", "record_changed")
+            result = self.gateway.apply_file_only(current, fresh)
+            return result if isinstance(result, MutationResult) else MutationResult("needs_review", "host_retained_record")
+        except Exception:
+            return MutationResult("needs_review", "host_cleanup_failed")
 
     def list_candidates(self, *, cursor=0, limit=100):
         if type(cursor) is not int or cursor < 0 or type(limit) is not int or not 1 <= limit <= 100:
@@ -747,6 +981,7 @@ class MoviePilotCleanupAdapter:
     def mutate(self, record, evidence, options):
         # The engine enforces the persistent stability period. Recheck all live
         # evidence here too; never forward the engine's old observation as proof.
+        options = replace(options, allow_subscription_retry=False)
         current, fresh, other_paths = self._observe(record)
         safe = (
             current is not None and fresh.revision == record.revision and fresh.record_present is True
@@ -810,6 +1045,50 @@ class MoviePilotGateway:
     def get_cleanup_candidate(self, file_id):
         return self.module.get_cleanup_candidate(file_id)
 
+    def list_file_only_candidates(self, **kwargs):
+        from .host_db import list_file_only_candidates
+        return list_file_only_candidates(**kwargs)
+
+    def get_file_only_candidate(self, file_id):
+        from .host_db import get_file_only_candidate
+        return get_file_only_candidate(file_id)
+
+    def get_file_only_protection(self, candidate):
+        from .host_db import get_file_only_protection
+        return get_file_only_protection(candidate)
+
+    def apply_file_only(self, candidate, evidence):
+        from .host_db import apply_file_only
+        return apply_file_only(candidate, evidence)
+
+    def prepare_receipt(self, file_id):
+        from .host_db import prepare_receipt
+        return prepare_receipt(file_id)
+
+    def receipt_view(self, receipt):
+        from .host_db import receipt_view
+        return receipt_view(receipt)
+
+    def apply_receipt(self, receipt, proof):
+        from .host_db import apply_receipt
+        return apply_receipt(receipt, proof)
+
+    def source_ownership(self, receipt, source):
+        from .host_db import source_ownership
+        return source_ownership(receipt, source)
+
+    def apply_transfer_scope(self, receipt, source, proof):
+        from .host_db import apply_transfer_scope
+        return apply_transfer_scope(receipt, source, proof)
+
+    def list_orphan_receipts(self, **kwargs):
+        from .host_db import list_orphan_receipts
+        return list_orphan_receipts(**kwargs)
+
+    def propose_receipt_refresh(self, receipt):
+        from .host_db import propose_receipt_refresh
+        return propose_receipt_refresh(receipt)
+
     def get_cleanup_protection(self, candidate, **kwargs):
         return self.module.get_cleanup_protection(candidate, **kwargs)
 
@@ -871,7 +1150,6 @@ def configured_local_roots(helper):
 def build_host_adapter(roots=()):
     from app.application.directory import DirectoryHelper
     from app.application.downloader import DownloaderHelper
-    from app.application.mediaserver import MediaServerHelper
     try:
         configured = configured_local_roots(DirectoryHelper())
         all_roots = tuple(dict.fromkeys(configured + tuple(roots)))
@@ -882,5 +1160,5 @@ def build_host_adapter(roots=()):
         paths = LocalPathProbe(())
     return MoviePilotCleanupAdapter(
         MoviePilotGateway(), paths,
-        DownloaderProbe(DownloaderHelper()), EmbyExactProbe(MediaServerHelper()),
+        DownloaderProbe(DownloaderHelper()), None,
     )

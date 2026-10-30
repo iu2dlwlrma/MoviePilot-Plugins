@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from copy import deepcopy
 from collections.abc import Callable
 from pathlib import PurePosixPath
 from typing import TypeVar
 
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, exists, or_, select, update
 from sqlalchemy.orm import Session
 
 from .host_cleanup import (
@@ -19,7 +20,9 @@ from .host_cleanup import (
     CleanupResult,
     proof_allows_cleanup,
     proof_allows_destination_repair,
+    FileOnlyCandidate,
 )
+from .record_cleanup import MutationResult
 from app.db.models.downloadhistory import DownloadFiles, DownloadHistory
 from app.db.models.subscribe import Subscribe
 from app.db.models.transferhistory import TransferHistory
@@ -92,20 +95,29 @@ def _candidate(session: Session, file_id: int) -> CleanupCandidate | None:
     download_hash = file.download_hash or ""
     histories = list(session.execute(
         select(DownloadHistory)
-        .where(DownloadHistory.download_hash == download_hash)
+        .where(DownloadHistory.download_hash == download_hash, DownloadHistory.downloader == file.downloader)
         .order_by(DownloadHistory.id.desc())
-        .limit(2)
+        .limit(20001)
     ).scalars()) if download_hash else []
-    history = histories[0] if len(histories) == 1 else None
+    equivalent = len(histories) <= 20000 and len({_parent_identity(_snapshot(row, HISTORY_FIELDS)) for row in histories}) <= 1
+    history = histories[0] if histories and equivalent else None
     transfers = list(session.execute(
         select(TransferHistory)
-        .where(TransferHistory.src == source)
+        .where(TransferHistory.src == source, TransferHistory.download_hash == download_hash,
+               or_(TransferHistory.downloader == file.downloader, TransferHistory.downloader.is_(None)))
         .order_by(TransferHistory.id.desc())
         .limit(2)
     ).scalars()) if source else []
     transfer = transfers[0] if len(transfers) == 1 else None
     season = _single_number(history.seasons, "S") if history else None
     episode = _single_number(history.episodes, "E") if history else None
+    if history and history.type == "电视剧" and (season is None or episode is None):
+        matches = list(re.finditer(r"(?:^|[^a-z0-9])S(\d{1,3})E(\d{1,4})(?![0-9e~\-])", PurePosixPath(source).name, re.IGNORECASE))
+        if len(matches) == 1:
+            proposed_season, proposed_episode = map(int, matches[0].groups())
+            if (_range_contains(history.seasons, "S", proposed_season) is True
+                    and _range_contains(history.episodes, "E", proposed_episode) is True):
+                season, episode = proposed_season, proposed_episode
     media_source = history.media_source if history else None
     media_id = history.media_id if history else None
     media_type = history.type if history else None
@@ -124,7 +136,7 @@ def _candidate(session: Session, file_id: int) -> CleanupCandidate | None:
     reason = None
     if not source.startswith("/") or ".." in source.split("/"):
         reason = "unsafe_source_path"
-    elif not download_hash or len(histories) != 1:
+    elif not download_hash or not history:
         reason = "ambiguous_download_history"
     elif not media_source or not media_id or media_type not in ("电视剧", "电影"):
         reason = "ambiguous_media_episode"
@@ -188,6 +200,7 @@ def _candidate(session: Session, file_id: int) -> CleanupCandidate | None:
          subscribe.best_version, subscribe.episode_priority, subscribe.start_episode,
          subscribe.total_episode, subscribe.activity_key) if subscribe else None,
         (len(histories), len(transfers), len(subscribers), reason),
+        [_snapshot(row, HISTORY_FIELDS) for row in histories],
     )
     return CleanupCandidate(
         file_id=file.id,
@@ -209,6 +222,7 @@ def _candidate(session: Session, file_id: int) -> CleanupCandidate | None:
         identity_verified=identity_verified,
         revision=revision,
         review_reason=reason,
+        history_ids=tuple(row.id for row in histories),
     )
 
 
@@ -542,6 +556,7 @@ def _apply(
     resolved_lack_episode: int | None,
 ) -> CleanupResult:
     """在同一 Session 中重读、复核证据并暂存所有精确 CAS。"""
+    allow_subscription_retry = False
     _begin_serialized_write(session)
     _lock_related_rows(session, candidate, subscription=allow_subscription_retry)
     current = _candidate(session, candidate.file_id)
@@ -875,3 +890,425 @@ class SqlAlchemyCleanupService:
     ) -> CleanupResult:
         """只修正精确的旧整理回执，不触碰下载与订阅事实。"""
         return repair_missing_destination(candidate, proof, session_factory=self._session_factory)
+
+
+# Narrow reconciliation ports. These do not import Subscribe or any media-server
+# capability. Their transaction owns exact IDs, never a fuzzy media/title match.
+GROUP_LIMIT = 20000
+FILE_FIELDS = ("id", "downloader", "download_hash", "fullpath", "savepath", "filepath", "torrentname", "state")
+HISTORY_FIELDS = ("id", "downloader", "download_hash", "path", "type", "media_source", "media_id", "seasons", "episodes")
+TRANSFER_FIELDS = ("id", "downloader", "download_hash", "src", "src_storage", "dest", "dest_storage", "mode", "status",
+                   "type", "media_source", "media_id", "seasons", "episodes", "src_fileitem", "dest_fileitem", "files",
+                   "transfer_task_id", "transfer_settlement_revision")
+
+
+def _snapshot(row, fields):
+    return {field: getattr(row, field, None) for field in fields}
+
+
+def _safe_path(path):
+    return (isinstance(path, str) and path.startswith("/") and path != "/" and not path.endswith("/")
+            and not path.startswith("//") and str(PurePosixPath(path)) == path
+            and "\x00" not in path and not any(part in (".", "..") for part in path.split("/")))
+
+
+def _file_candidate(session, file_id):
+    row = session.get(DownloadFiles, file_id)
+    if row is None or row.state != 1:
+        return None
+    valid = _safe_path(row.fullpath) and bool(row.download_hash) and bool(row.downloader)
+    return FileOnlyCandidate(row.id, row.fullpath or "", row.download_hash or "", row.downloader,
+        _revision(_snapshot(row, FILE_FIELDS)), identity_verified=valid,
+        review_reason="" if valid else "invalid_file_identity")
+
+
+def get_file_only_candidate(file_id, *, session_factory=None):
+    return _read(lambda session: _file_candidate(session, file_id), session_factory)
+
+
+def list_file_only_candidates(after_id=0, limit=100, *, session_factory=None):
+    if type(after_id) is not int or after_id < 0 or type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("invalid_cursor_or_limit")
+    def operation(session):
+        ids = session.execute(select(DownloadFiles.id).where(DownloadFiles.id > after_id,
+            DownloadFiles.state == 1).order_by(DownloadFiles.id).limit(limit)).scalars()
+        return [candidate for file_id in ids if (candidate := _file_candidate(session, file_id)) is not None]
+    return _read(operation, session_factory)
+
+
+def _pending_paths(session, paths):
+    for text in paths:
+        if not _safe_path(text):
+            return True
+        source = PurePosixPath(text)
+        ancestors = tuple(str(path) for path in (source, *source.parents))
+        escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        if session.execute(select(TransferPending.id).where(TransferPending.storage == "local", or_(
+            TransferPending.src_path.in_(ancestors), TransferPending.src_path.like(escaped + "/%", escape="\\"),
+        )).limit(1)).scalar_one_or_none() is not None:
+            return True
+    return False
+
+
+def get_file_only_protection(candidate, *, session_factory=None):
+    def operation(session):
+        current = _file_candidate(session, candidate.file_id)
+        active = None if current != candidate else _pending_paths(session, (candidate.source_path,))
+        return CleanupProtection((), False, active)
+    return _read(operation, session_factory)
+
+
+def _narrow_write(operation, session_factory):
+    try:
+        if session_factory is None:
+            return run_sync_transaction(operation)
+        with session_factory() as session:
+            try:
+                result = operation(session)
+                session.commit()
+                return result
+            except Exception:
+                session.rollback()
+                raise
+    except CleanupConflict:
+        return MutationResult("needs_review", "database_changed")
+
+
+def apply_file_only(candidate, proof, *, session_factory=None):
+    def operation(session):
+        _begin_serialized_write(session)
+        session.execute(select(DownloadFiles.id).where(DownloadFiles.id == candidate.file_id).with_for_update()).scalar_one_or_none()
+        current = _file_candidate(session, candidate.file_id)
+        if current is None:
+            return MutationResult("already_clean", "record_absent")
+        if current != candidate or not current.identity_verified:
+            return MutationResult("needs_review", "record_changed")
+        if not (getattr(proof, "source", None) == "missing" and proof.storage_ready is True
+                and proof.identity_verified is True and proof.record_present is True
+                and proof.revision == current.revision and proof.downloaders_complete is True
+                and proof.downloader_task_present is False and proof.transfer_task_active is False
+                and not _pending_paths(session, (current.source_path,))):
+            return MutationResult("needs_review", "file_evidence_incomplete")
+        result = session.execute(delete(DownloadFiles).where(DownloadFiles.id == current.file_id,
+            DownloadFiles.downloader == current.downloader, DownloadFiles.download_hash == current.download_hash,
+            DownloadFiles.fullpath == current.source_path, DownloadFiles.state == 1).execution_options(synchronize_session=False))
+        if result.rowcount != 1:
+            raise CleanupConflict("file_changed")
+        return MutationResult("applied", "file_record_removed", {"download_files": 1})
+    return _narrow_write(operation, session_factory)
+
+
+def _bounded_rows(session, model, fields, *conditions):
+    rows = list(session.execute(select(model).where(*conditions).order_by(model.id).limit(GROUP_LIMIT + 1)).scalars())
+    if len(rows) > GROUP_LIMIT:
+        raise ValueError("group_inventory_limit")
+    return [_snapshot(row, fields) for row in rows]
+
+
+def _canonical_provider(value):
+    return {"themoviedb": "tmdb", "thetvdb": "tvdb"}.get(value, value)
+
+
+def _parent_identity(row):
+    def ranges(text, prefix):
+        if not text:
+            return ()
+        intervals = []
+        for item in re.split(r"\s*[,;|]\s*", text.strip()):
+            match = re.fullmatch(rf"{prefix}0*(\d+)(?:\s*[-~]\s*{prefix}?0*(\d+))?", item, re.IGNORECASE)
+            if not match:
+                return ("unknown", text.strip().upper())
+            start, end = int(match[1]), int(match[2] or match[1])
+            if end < start:
+                return ("unknown", text.strip().upper())
+            intervals.append((start, end))
+        merged = []
+        for start, end in sorted(intervals):
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return tuple(merged)
+    return (row["path"], row["type"], _canonical_provider(row["media_source"]), row["media_id"],
+            ranges(row["seasons"], "S"), ranges(row["episodes"], "E"))
+
+
+def _belongs(path, root):
+    if not _safe_path(path) or not _safe_path(root):
+        return False
+    source, parent = PurePosixPath(path), PurePosixPath(root)
+    return source == parent or parent in source.parents
+
+
+def _group_inventory(session, downloader, download_hash, sources=(), roots=()):
+    files = _bounded_rows(session, DownloadFiles, FILE_FIELDS,
+        DownloadFiles.downloader == downloader, DownloadFiles.download_hash == download_hash)
+    histories = _bounded_rows(session, DownloadHistory, HISTORY_FIELDS,
+        DownloadHistory.downloader == downloader, DownloadHistory.download_hash == download_hash)
+    roots = tuple(row["path"] for row in histories) + tuple(roots)
+    sources = set(sources) | {row["fullpath"] for row in files}
+    transfers = _bounded_rows(session, TransferHistory, TRANSFER_FIELDS,
+        TransferHistory.download_hash == download_hash,
+        or_(TransferHistory.downloader == downloader, TransferHistory.downloader.is_(None)))
+    transfers = [row for row in transfers if row["downloader"] == downloader or row["src"] in sources or
+                 row["downloader"] is None and _resolve_transfer_owner(session, row) == downloader
+                 and any(_belongs(row["src"], root) for root in roots)]
+    return files, histories, transfers
+
+
+def _mapping_safe(row, histories):
+    if not (_safe_path(row["src"]) and _safe_path(row["dest"]) and row["src"] != row["dest"]
+            and row["src_storage"] == "local" and row["dest_storage"] == "local" and row["status"] is True
+            and not row["transfer_task_id"] and row["transfer_settlement_revision"] is None
+            and _embedded_path_matches(row["src_fileitem"], row["src"])
+            and _embedded_path_matches(row["dest_fileitem"], row["dest"])
+            and _single_transfer_file_matches(row["files"], row["src"])):
+        return False
+    if histories:
+        parent = histories[0]
+        if (row["type"], _canonical_provider(row["media_source"]), row["media_id"]) != (
+                parent["type"], _canonical_provider(parent["media_source"]), parent["media_id"]):
+            return False
+        if row["type"] == "电视剧":
+            season, episode = _single_number(row["seasons"], "S"), _single_number(row["episodes"], "E")
+            return (season is not None and episode is not None
+                    and _range_contains(parent["seasons"], "S", season) is True
+                    and _range_contains(parent["episodes"], "E", episode) is True)
+    return True
+
+
+def _resolve_transfer_owner(session, transfer):
+    parents = _bounded_rows(session, DownloadHistory, HISTORY_FIELDS, DownloadHistory.download_hash == transfer["download_hash"])
+    owners = {row["downloader"] for row in parents if row["downloader"] and _belongs(transfer["src"], row["path"])
+              and _mapping_safe(transfer, [row])}
+    if len(owners) != 1:
+        return None
+    owner = next(iter(owners))
+    foreign = session.execute(select(DownloadFiles.id).where(DownloadFiles.download_hash == transfer["download_hash"],
+        DownloadFiles.fullpath == transfer["src"], or_(DownloadFiles.downloader != owner, DownloadFiles.downloader.is_(None)))
+        .limit(1)).scalar_one_or_none()
+    return owner if foreign is None else None
+
+
+def prepare_receipt(file_id, *, session_factory=None):
+    def operation(session):
+        candidate = _file_candidate(session, file_id)
+        if candidate is None or not candidate.identity_verified:
+            raise ValueError("invalid_file_identity")
+        files, histories, transfers = _group_inventory(session, candidate.downloader, candidate.download_hash)
+        equivalent = len({_parent_identity(row) for row in histories}) <= 1
+        complete = all(_safe_path(row["fullpath"]) for row in files)
+        key = _revision(candidate.downloader, candidate.download_hash)
+        return dict(version=1, key=key, revision=_revision(files, histories, transfers), complete=complete,
+            equivalent_parents=equivalent, downloader=candidate.downloader, download_hash=candidate.download_hash,
+            files=files, histories=histories, transfers=transfers)
+    return _read(operation, session_factory)
+
+
+def _receipt_view(session, receipt):
+    if (not isinstance(receipt, dict) or receipt.get("version") != 1 or receipt.get("complete") is not True
+            or not receipt.get("downloader") or not receipt.get("download_hash")
+            or any(not isinstance(receipt.get(kind), list) or len(receipt[kind]) > GROUP_LIMIT for kind in ("files", "histories", "transfers"))):
+        return dict(valid=False, reason="invalid_receipt")
+    if (receipt.get("key") != _revision(receipt["downloader"], receipt["download_hash"])
+            or receipt.get("revision") != _revision(receipt["files"], receipt["histories"], receipt["transfers"])):
+        return dict(valid=False, reason="receipt_signature_mismatch")
+    sources = tuple(row["fullpath"] for row in receipt["files"]) + tuple(row["src"] for row in receipt["transfers"])
+    roots = tuple(row["path"] for row in receipt["histories"])
+    current = _group_inventory(session, receipt["downloader"], receipt["download_hash"], sources, roots)
+    for name, rows, model, fields in zip(("files", "histories", "transfers"), current,
+        (DownloadFiles, DownloadHistory, TransferHistory), (FILE_FIELDS, HISTORY_FIELDS, TRANSFER_FIELDS)):
+        original = {row["id"]: row for row in receipt[name]}
+        if len(original) != len(receipt[name]) or any(original.get(row["id"]) != row for row in rows):
+            return dict(valid=False, reason="new_or_changed_reference")
+        included_ids = {row["id"] for row in rows}
+        for row_id, snapshot in original.items():
+            row = session.get(model, row_id)
+            if row is not None and _snapshot(row, fields) != snapshot:
+                return dict(valid=False, reason="new_or_changed_reference")
+            if row is not None and row_id not in included_ids:
+                return dict(valid=False, reason="association_owner_changed")
+    files, histories, transfers = current
+    paths = sources + tuple(row["dest"] for row in receipt["transfers"])
+    return dict(valid=True, reason="", files=files, histories=histories, transfers=transfers,
+        pending=_pending_paths(session, paths), revision=_revision(*current),
+        mappings_safe=all(_mapping_safe(row, receipt["histories"]) for row in receipt["transfers"]),
+        done=not any(current))
+
+
+def receipt_view(receipt, *, session_factory=None):
+    return _read(lambda session: _receipt_view(session, receipt), session_factory)
+
+
+def propose_receipt_refresh(receipt, *, session_factory=None):
+    """Accept only exact state=0 -> 1 completion deltas; retain every old path,
+    deleted row snapshot and recovery intention for the new observation epoch."""
+    def operation(session):
+        candidate = deepcopy(receipt)
+        changed = False
+        for snapshot in candidate.get("files", ()):
+            row = session.get(DownloadFiles, snapshot["id"])
+            if row is None:
+                continue
+            actual = _snapshot(row, FILE_FIELDS)
+            if actual == snapshot:
+                continue
+            if (snapshot.get("state") != 0 or actual.get("state") != 1
+                    or any(actual[field] != snapshot.get(field) for field in FILE_FIELDS if field != "state")):
+                return None
+            snapshot["state"] = 1
+            changed = True
+        if not changed:
+            return None
+        candidate["revision"] = _revision(candidate["files"], candidate["histories"], candidate["transfers"])
+        view = _receipt_view(session, candidate)
+        if not view.get("valid") or view["pending"] or candidate.get("equivalent_parents") is not True:
+            return None
+        candidate["generation"] = candidate.get("generation", 0) + 1
+        candidate.pop("source_cycle_id", None)
+        candidate["source_cursor"] = 0
+        return candidate
+    return _read(operation, session_factory)
+
+
+def _source_ownership(session, receipt, source, *, physical=True):
+    view = _receipt_view(session, receipt)
+    if not view.get("valid") or view["pending"]:
+        return False
+    if any(row["fullpath"] == source and row["state"] != 1 for row in view["files"]):
+        return False
+    if physical and session.execute(select(TransferHistory.id).where(TransferHistory.dest == source).limit(1)).scalar_one_or_none() is not None:
+        return False
+    allowed_files = {row["id"] for row in receipt["files"]}
+    allowed_transfers = {row["id"] for row in receipt["transfers"]}
+    allowed_histories = {row["id"] for row in receipt["histories"]}
+    references = (
+        (DownloadFiles, DownloadFiles.fullpath == source, allowed_files),
+        (TransferHistory, or_(TransferHistory.src == source, TransferHistory.dest == source), allowed_transfers),
+        (DownloadHistory, DownloadHistory.path == source, allowed_histories),
+    )
+    for model, condition, allowed in references:
+        query = select(model.id).where(condition)
+        if allowed:
+            query = query.where(model.id.notin_(allowed))
+        if session.execute(query.limit(1)).scalar_one_or_none() is not None:
+            return False
+    return True
+
+
+def source_ownership(receipt, source, *, session_factory=None):
+    return _read(lambda session: _source_ownership(session, receipt, source), session_factory)
+
+
+def apply_receipt(receipt, proof, *, session_factory=None):
+    def operation(session):
+        _begin_serialized_write(session)
+        for model, kind in ((DownloadHistory, "histories"), (TransferHistory, "transfers"), (DownloadFiles, "files")):
+            ids = [row["id"] for row in receipt[kind]]
+            if ids:
+                list(session.execute(select(model.id).where(model.id.in_(ids)).with_for_update()).scalars())
+        view = _receipt_view(session, receipt)
+        if not view.get("valid"):
+            return MutationResult("needs_review", view.get("reason", "invalid_receipt"))
+        if view["done"]:
+            return MutationResult("already_clean", "related_records_absent")
+        if (view["files"] or view["pending"] or receipt.get("equivalent_parents") is not True
+                or not view["mappings_safe"] or proof.get("revision") != view["revision"]
+                or any(proof.get(field) is not True for field in ("sources_missing", "destinations_missing", "storage_ready", "tasks_absent"))):
+            return MutationResult("needs_review", "related_evidence_incomplete")
+        sources = {row["fullpath"] for row in receipt["files"]} | {row["src"] for row in receipt["transfers"]}
+        if any(not _source_ownership(session, receipt, source, physical=False) for source in sources):
+            return MutationResult("needs_review", "source_shared_reference")
+        counts = {}
+        for model, name, count_name, fields in ((TransferHistory, "transfers", "transfer_history", TRANSFER_FIELDS),
+                (DownloadHistory, "histories", "download_history", HISTORY_FIELDS)):
+            for row in view[name]:
+                conditions = [getattr(model, field) == row[field] for field in fields
+                              if field not in ("src_fileitem", "dest_fileitem", "files")]
+                deleted = session.execute(delete(model).where(*conditions).execution_options(synchronize_session=False))
+                if deleted.rowcount != 1:
+                    raise CleanupConflict("related_record_changed")
+                counts[count_name] = counts.get(count_name, 0) + 1
+        return MutationResult("applied", "related_history_removed", counts)
+    return _narrow_write(operation, session_factory)
+
+
+def apply_transfer_scope(receipt, source, proof, *, session_factory=None):
+    """Remove only stale successful mappings for one source; retain its source,
+    siblings, parent group, tasks and subscriptions."""
+    def operation(session):
+        _begin_serialized_write(session)
+        ids = [row["id"] for row in receipt["transfers"] if row["src"] == source]
+        if ids:
+            list(session.execute(select(TransferHistory.id).where(TransferHistory.id.in_(ids)).with_for_update()).scalars())
+        view = _receipt_view(session, receipt)
+        if not view.get("valid"):
+            return MutationResult("needs_review", view.get("reason", "invalid_receipt"))
+        rows = [row for row in view["transfers"] if row["src"] == source]
+        if not rows:
+            return MutationResult("already_clean", "transfer_records_absent")
+        targets = tuple(sorted({row["dest"] for row in rows}))
+        if (view["pending"] or receipt.get("equivalent_parents") is not True
+                or any(not _mapping_safe(row, receipt["histories"]) for row in rows)
+                or proof.get("revision") != view["revision"] or proof.get("destination_paths") != targets
+                or proof.get("source") not in ("present", "missing")
+                or any(proof.get(name) is not True for name in ("destinations_missing", "storage_ready", "tasks_inactive"))):
+            return MutationResult("needs_review", "transfer_evidence_incomplete")
+        for row in rows:
+            fields = [field for field in TRANSFER_FIELDS if field not in ("src_fileitem", "dest_fileitem", "files")]
+            deleted = session.execute(delete(TransferHistory).where(*[getattr(TransferHistory, field) == row[field] for field in fields])
+                .execution_options(synchronize_session=False))
+            if deleted.rowcount != 1:
+                raise CleanupConflict("transfer_changed")
+        return MutationResult("applied", "stale_transfer_removed", {"transfer_history": len(rows)})
+    return _narrow_write(operation, session_factory)
+
+
+def list_orphan_receipts(after_id=0, limit=100, *, kind="history", session_factory=None):
+    """Bounded seeds for old orphan groups. A directory alone proves nothing."""
+    if type(after_id) is not int or after_id < 0 or type(limit) is not int or not 1 <= limit <= 100 or kind not in ("history", "transfer"):
+        raise ValueError("invalid_orphan_cursor")
+    def operation(session):
+        model = DownloadHistory if kind == "history" else TransferHistory
+        file_conditions = [DownloadFiles.download_hash == model.download_hash, DownloadFiles.downloader == model.downloader]
+        if kind == "transfer":
+            file_conditions.append(DownloadFiles.fullpath == TransferHistory.src)
+        has_files = exists(select(DownloadFiles.id).where(*file_conditions))
+        query = select(model).where(model.id > after_id, ~has_files).order_by(model.id).limit(limit)
+        seeds = list(session.execute(query).scalars())
+        entries, prepared = [], {}
+        for seed in seeds:
+            downloader, download_hash = seed.downloader, seed.download_hash
+            if not downloader and download_hash:
+                downloader = _resolve_transfer_owner(session, _snapshot(seed, TRANSFER_FIELDS)) if kind == "transfer" else None
+            if not downloader or not download_hash:
+                entries.append(dict(record_id=seed.id, receipt=None, reason="orphan_downloader_unverified"))
+                continue
+            group_key = _revision(downloader, download_hash)
+            if group_key not in prepared:
+                files, histories, transfers = _group_inventory(session, downloader, download_hash)
+                # Include every explicit same-owner mapping, not only a guessed
+                # directory prefix; nullable legacy rows need the unique parent.
+                all_transfers = _bounded_rows(session, TransferHistory, TRANSFER_FIELDS,
+                    TransferHistory.download_hash == download_hash,
+                    or_(TransferHistory.downloader == downloader, TransferHistory.downloader.is_(None)))
+                transfers = [row for row in all_transfers if row["downloader"] == downloader or
+                             row["downloader"] is None and _resolve_transfer_owner(session, row) == downloader]
+                equivalent = len({_parent_identity(row) for row in histories}) <= 1
+                reason = ("related_files_still_registered" if files and (kind == "history" or any(row["fullpath"] == getattr(seed, "src", None) for row in files)) else
+                    "conflicting_parent_histories" if not equivalent else
+                    "orphan_mapping_incomplete" if not transfers or any(not _mapping_safe(row, histories) for row in transfers) else "")
+                if not reason and histories and any(not any(_belongs(row["src"], history["path"]) for history in histories) for row in transfers):
+                    reason = "orphan_mapping_incomplete"
+                if not reason and any(row["downloader"] is None and _resolve_transfer_owner(session, row) is None
+                                      and any(_belongs(row["src"], history["path"]) for history in histories) for row in all_transfers):
+                    reason = "orphan_downloader_unverified"
+                receipt = (None if reason else dict(version=1, key=group_key, revision=_revision(files, histories, transfers),
+                    complete=True, equivalent_parents=equivalent, downloader=downloader, download_hash=download_hash,
+                    files=files, histories=histories, transfers=transfers))
+                prepared[group_key] = (receipt, reason)
+            receipt, reason = prepared[group_key]
+            entries.append(dict(record_id=seed.id, receipt=receipt, reason=reason,
+                                source_path=getattr(seed, "src", None) or getattr(seed, "path", "")))
+        return dict(entries=entries, cursor=seeds[-1].id if len(seeds) == limit else 0, complete=True)
+    return _read(operation, session_factory)

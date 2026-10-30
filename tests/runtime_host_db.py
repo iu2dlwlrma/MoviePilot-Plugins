@@ -580,7 +580,7 @@ def test_cleanup_marks_only_target_and_keeps_subscription_when_retry_disabled():
 
 
 def test_subscription_retry_needs_resolved_progress_before_any_write():
-    """无法可靠重算缺集数时，重开订阅请求必须整笔保留。"""
+    """历史开关为真也不再请求补下载或重写订阅。"""
     from cleanup_plugin.host_db import apply_cleanup_candidate, get_cleanup_candidate
 
     engine = make_database()
@@ -588,10 +588,10 @@ def test_subscription_retry_needs_resolved_progress_before_any_write():
         candidate = get_cleanup_candidate(1, session_factory=lambda: Session(engine))
         assert candidate is not None
         result = apply_cleanup_candidate(candidate, missing_proof(candidate), allow_subscription_retry=True, session_factory=lambda: Session(engine))
-        assert result.status == "needs_review"
+        assert result.status == "cleaned" and result.note_updated is False
         with Session(engine) as session:
-            assert session.get(DownloadFiles, 1).state == 1
-            assert session.get(DownloadHistory, 10) is not None
+            assert session.get(DownloadFiles, 1) is None
+            assert session.get(DownloadHistory, 10) is None
             assert session.get(Subscribe, 30).note == [4, 5, 13]
     finally:
         engine.dispose()
@@ -646,7 +646,7 @@ def test_malformed_subscription_note_is_never_silently_classified_as_no_retry():
 
 
 def test_subscription_retry_removes_only_confirmed_episode_and_updates_progress():
-    """完整证据下仅移除 E04，缺集数与 note 在同一事务变更。"""
+    """即使旧调用传入完整缺集数，也保留原订阅 note 和缺集数。"""
     from cleanup_plugin.host_db import apply_cleanup_candidate, get_cleanup_candidate
 
     engine = make_database()
@@ -655,10 +655,10 @@ def test_subscription_retry_removes_only_confirmed_episode_and_updates_progress(
         assert candidate is not None
         result = apply_cleanup_candidate(candidate, missing_proof(candidate), allow_subscription_retry=True, resolved_lack_episode=11, session_factory=lambda: Session(engine))
         assert result.status == "cleaned"
-        assert result.note_updated is True
+        assert result.note_updated is False
         with Session(engine) as session:
-            assert session.get(Subscribe, 30).note == [5, 13]
-            assert session.get(Subscribe, 30).lack_episode == 11
+            assert session.get(Subscribe, 30).note == [4, 5, 13]
+            assert session.get(Subscribe, 30).lack_episode == 10
     finally:
         engine.dispose()
 
@@ -681,9 +681,9 @@ def test_same_hash_active_sibling_prevents_note_retry_and_rolls_back_file_state(
             candidate, missing_proof(candidate), allow_subscription_retry=True,
             resolved_lack_episode=11, session_factory=lambda: Session(engine),
         )
-        assert result.status == "needs_review"
+        assert result.status == "cleaned" and result.note_updated is False
         with Session(engine) as session:
-            assert session.get(DownloadFiles, 1).state == 1
+            assert session.get(DownloadFiles, 1) is None
             assert session.get(DownloadFiles, 2).state == 1
             assert session.get(DownloadHistory, 10) is not None
             assert session.get(Subscribe, 30).note == [4, 5, 13]
@@ -770,11 +770,11 @@ def test_two_missing_versions_clean_separately_then_reopen_note_once():
             second, missing_proof(second), allow_subscription_retry=True,
             resolved_lack_episode=11, session_factory=lambda: Session(engine),
         )
-        assert result.status == "cleaned" and result.note_updated is True
+        assert result.status == "cleaned" and result.note_updated is False
         with Session(engine) as session:
             assert session.get(DownloadFiles, 2) is None
-            assert session.get(Subscribe, 30).note == [5, 13]
-            assert session.get(Subscribe, 30).lack_episode == 11
+            assert session.get(Subscribe, 30).note == [4, 5, 13]
+            assert session.get(Subscribe, 30).lack_episode == 10
     finally:
         engine.dispose()
 
@@ -1181,7 +1181,502 @@ def test_empty_destinations_need_complete_lookup():
     assert proof_allows_cleanup(replace(proof, destination_lookup_complete=False), revision="revision-2") is False
 
 
+def test_file_only_pack_duplicates_and_receipt_survive_deleted_children():
+    from types import SimpleNamespace
+    from cleanup_plugin.host_db import (get_cleanup_candidate, get_file_only_candidate, apply_file_only,
+                                       prepare_receipt, receipt_view, apply_receipt)
+    engine = make_database()
+    factory = lambda: Session(engine)
+    try:
+        with Session(engine) as session:
+            history = session.get(DownloadHistory, 10)
+            history.episodes = "E01-E26"
+            session.add(DownloadHistory(id=11, title="等价父历史", path=history.path, type=history.type,
+                media_source=history.media_source, media_id=history.media_id, seasons=history.seasons,
+                episodes=history.episodes, downloader="qb", download_hash=history.download_hash))
+            session.get(TransferHistory, 20).downloader = "qb"
+            session.commit()
+        receipt = prepare_receipt(1, session_factory=factory)
+        assert receipt["complete"] and receipt["equivalent_parents"]
+        assert len(receipt["histories"]) == 2
+        identified = get_cleanup_candidate(1, session_factory=factory)
+        assert identified.identity_verified and identified.episodes == (4,)
+        assert identified.history_ids == (11, 10)
+        current = get_file_only_candidate(1, session_factory=factory)
+        evidence = SimpleNamespace(source="missing", storage_ready=True, identity_verified=True,
+            record_present=True, revision=current.revision, downloaders_complete=True,
+            downloader_task_present=False, transfer_task_active=False)
+        result = apply_file_only(current, evidence, session_factory=factory)
+        assert result.status == "applied"
+        view = receipt_view(receipt, session_factory=factory)
+        assert view["valid"] and view["files"] == []
+        assert len(view["histories"]) == 2 and len(view["transfers"]) == 1
+        proof = dict(sources_missing=True, destinations_missing=True, storage_ready=True,
+            tasks_absent=True, revision=view["revision"])
+        result = apply_receipt(receipt, proof, session_factory=factory)
+        assert result.status == "applied"
+        assert result.counts == {"download_history": 2, "transfer_history": 1}
+        with Session(engine) as session:
+            assert session.get(Subscribe, 30).note == [4, 5, 13]
+    finally:
+        engine.dispose()
+
+
+def test_receipt_rejects_new_or_changed_reference_and_other_downloader_is_not_deleted():
+    from types import SimpleNamespace
+    from cleanup_plugin.host_db import prepare_receipt, receipt_view, get_file_only_candidate, apply_file_only
+    engine = make_database()
+    factory = lambda: Session(engine)
+    try:
+        receipt = prepare_receipt(1, session_factory=factory)
+        with Session(engine) as session:
+            session.add(DownloadFiles(id=2, downloader="other", download_hash="hash-04",
+                fullpath="/other/S04E04.mkv", state=1))
+            session.add(DownloadHistory(id=12, title="另一下载器", downloader="other", download_hash="hash-04", path="/other",
+                type="电视剧", media_source="tmdb", media_id="123", seasons="S04", episodes="E04"))
+            session.commit()
+        assert receipt_view(receipt, session_factory=factory)["valid"]
+        current = get_file_only_candidate(1, session_factory=factory)
+        proof = SimpleNamespace(source="missing", storage_ready=True, identity_verified=True,
+            record_present=True, revision=current.revision, downloaders_complete=True,
+            downloader_task_present=False, transfer_task_active=False)
+        assert apply_file_only(current, proof, session_factory=factory).status == "applied"
+        with Session(engine) as session:
+            assert session.get(DownloadFiles, 2) is not None and session.get(DownloadHistory, 12) is not None
+            session.add(DownloadFiles(id=3, downloader="qb", download_hash="hash-04",
+                fullpath="/downloads/new.mkv", state=1))
+            session.commit()
+        assert receipt_view(receipt, session_factory=factory)["valid"] is False
+    finally:
+        engine.dispose()
+
+
+def test_receipt_physical_ownership_protects_inactive_same_source_without_downloader_task():
+    from cleanup_plugin.host_db import prepare_receipt, source_ownership
+    engine = make_database()
+    factory = lambda: Session(engine)
+    try:
+        with Session(engine) as session:
+            session.add(DownloadFiles(id=2, downloader="qb", download_hash="hash-04",
+                fullpath="/downloads/S04E04.mkv", state=0))
+            session.commit()
+        receipt = prepare_receipt(1, session_factory=factory)
+        assert source_ownership(receipt, "/downloads/S04E04.mkv", session_factory=factory) is False
+    finally:
+        engine.dispose()
+
+
+def test_receipt_excludes_legacy_transfer_of_other_downloader_and_rejects_signature_changes():
+    from cleanup_plugin.host_db import prepare_receipt, receipt_view
+    engine = make_database()
+    factory = lambda: Session(engine)
+    try:
+        with Session(engine) as session:
+            session.add(DownloadFiles(id=2, downloader="other", download_hash="hash-04",
+                fullpath="/downloads/other.mkv", state=1))
+            session.add(TransferHistory(id=21, src="/downloads/other.mkv", src_storage="local",
+                dest="/library/other.mkv", dest_storage="local", type="电视剧",
+                media_source="tmdb", media_id="123", seasons="S04", episodes="E04",
+                download_hash="hash-04", status=True))
+            session.commit()
+        receipt = prepare_receipt(1, session_factory=factory)
+        assert [row["id"] for row in receipt["transfers"]] == [20]
+        assert receipt_view(receipt, session_factory=factory)["valid"] is True
+        receipt["files"][0]["fullpath"] = "/downloads/forged.mkv"
+        assert receipt_view(receipt, session_factory=factory)["valid"] is False
+    finally:
+        engine.dispose()
+
+
+def test_file_only_rechecks_every_file_field_and_does_not_touch_parent_or_subscription():
+    from types import SimpleNamespace
+    from cleanup_plugin.host_db import get_file_only_candidate, apply_file_only
+    engine = make_database()
+    factory = lambda: Session(engine)
+    try:
+        current = get_file_only_candidate(1, session_factory=factory)
+        proof = SimpleNamespace(source="missing", storage_ready=True, identity_verified=True,
+            record_present=True, revision=current.revision, downloaders_complete=True,
+            downloader_task_present=False, transfer_task_active=False)
+        with Session(engine) as session:
+            session.get(DownloadFiles, 1).savepath = "/changed"
+            session.commit()
+        assert apply_file_only(current, proof, session_factory=factory).status == "needs_review"
+        with Session(engine) as session:
+            assert session.get(DownloadFiles, 1) is not None
+            assert session.get(DownloadHistory, 10) is not None and session.get(TransferHistory, 20) is not None
+            assert session.get(Subscribe, 30).note == [4, 5, 13]
+    finally:
+        engine.dispose()
+
+
+def test_receipt_transaction_rolls_back_transfer_delete_when_parent_delete_fails():
+    from sqlalchemy import event
+    from cleanup_plugin.host_db import prepare_receipt, receipt_view, apply_receipt
+    engine = make_database()
+    factory = lambda: Session(engine)
+    try:
+        receipt = prepare_receipt(1, session_factory=factory)
+        with Session(engine) as session:
+            session.delete(session.get(DownloadFiles, 1))
+            session.commit()
+        view = receipt_view(receipt, session_factory=factory)
+        def fail_parent(connection, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith("DELETE FROM DOWNLOADHISTORY"):
+                raise OperationalError(statement, parameters, RuntimeError("isolated injected failure"))
+        event.listen(engine, "before_cursor_execute", fail_parent)
+        try:
+            try:
+                apply_receipt(receipt, dict(sources_missing=True, destinations_missing=True,
+                    storage_ready=True, tasks_absent=True, revision=view["revision"]), session_factory=factory)
+                raise AssertionError("injected transaction failure was not exercised")
+            except OperationalError:
+                pass
+        finally:
+            event.remove(engine, "before_cursor_execute", fail_parent)
+        with Session(engine) as session:
+            assert session.get(TransferHistory, 20) is not None
+            assert session.get(DownloadHistory, 10) is not None
+            assert session.get(Subscribe, 30).note == [4, 5, 13]
+    finally:
+        engine.dispose()
+
+
+def test_high_level_reconciliation_uses_real_database_cas_paths_and_durable_recovery():
+    from copy import deepcopy
+    from functools import partial
+    from types import SimpleNamespace
+    from cleanup_plugin import host_db
+    from cleanup_plugin.host_adapter import MoviePilotCleanupAdapter, DownloaderProbe, LocalPathProbe, TrustedRoot
+    from cleanup_plugin.record_cleanup import CleanupOptions
+    for source_present in (False, True):
+        engine = make_database()
+        factory = lambda: Session(engine)
+        try:
+            with TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source, destination = root / "source/a.mkv", root / "library/a.mkv"
+                source.parent.mkdir()
+                destination.parent.mkdir()
+                if source_present:
+                    source.write_bytes(b"media")
+                else:
+                    destination.write_bytes(b"library")
+                keep = root / "another-version.mkv"
+                keep.write_bytes(b"preserved")
+                with Session(engine) as session:
+                    file = session.get(DownloadFiles, 1)
+                    file.fullpath, file.savepath, file.filepath = str(source), str(root), "source/a.mkv"
+                    file.download_hash = "a" * 40
+                    history = session.get(DownloadHistory, 10)
+                    history.path, history.download_hash = str(source.parent), "a" * 40
+                    transfer = session.get(TransferHistory, 20)
+                    transfer.src, transfer.dest = str(source), str(destination)
+                    transfer.downloader, transfer.download_hash = "qb", "a" * 40
+                    session.commit()
+                gateway = SimpleNamespace(**{name: partial(getattr(host_db, name), session_factory=factory) for name in (
+                    "list_file_only_candidates", "get_file_only_candidate", "get_file_only_protection", "apply_file_only",
+                    "prepare_receipt", "receipt_view", "apply_receipt", "source_ownership", "list_orphan_receipts", "apply_transfer_scope", "propose_receipt_refresh")})
+                class Client:
+                    def __init__(self):
+                        self.tasks = ([dict(hash="a" * 40, content_path=str(source), save_path=str(root), state="uploading")]
+                                      if source_present else [])
+                        self.deleted = []
+                    def get_torrents(self, **kwargs):
+                        return self.tasks, False
+                    def get_files(self, tid):
+                        return [dict(name="source/a.mkv", size=5, progress=1.0)]
+                    def delete_torrents(self, *, delete_file, ids):
+                        assert delete_file is False
+                        self.deleted.extend(ids)
+                        self.tasks = []
+                        return True
+                client = Client()
+                service = SimpleNamespace(type="qbittorrent", instance=client)
+                helper = SimpleNamespace(get_configs=lambda **_: {"qb": SimpleNamespace(enabled=True)},
+                                         get_service=lambda **_: service)
+                probe = LocalPathProbe([TrustedRoot(str(root), root.stat().st_dev, str(root), "test")], mount_check=lambda _: True)
+                adapter = MoviePilotCleanupAdapter(gateway, probe, DownloaderProbe(helper), object())
+                stored = []
+                def persist(snapshot):
+                    stored.append(deepcopy(snapshot))
+                state = {}
+                for now in (100, 101):
+                    result = adapter.reconcile_batch(state, persist=persist, now=now, dry_run=False,
+                        options=CleanupOptions(stability_seconds=0, allow_subscription_retry=True))
+                    assert result.report["status"] in ("completed", "review"), result.report
+                    state = result.state
+                with Session(engine) as session:
+                    assert session.get(DownloadFiles, 1) is None
+                    assert session.get(DownloadHistory, 10) is not None
+                    assert session.get(TransferHistory, 20) is not None
+                    assert session.get(Subscribe, 30).note == [4, 5, 13]
+                assert state["cleanup_v2"]["receipts"] and stored
+                if source_present:
+                    assert source.exists() is False and client.deleted == ["a" * 40]
+                else:
+                    assert destination.exists() and client.deleted == []
+                    destination.unlink()
+                for now in (102, 103):
+                    result = adapter.reconcile_batch(state, persist=persist, now=now, dry_run=False,
+                        options=CleanupOptions(stability_seconds=0))
+                    assert result.report["status"] in ("completed", "review"), result.report
+                    state = result.state
+                with Session(engine) as session:
+                    assert session.get(DownloadHistory, 10) is None
+                    assert session.get(TransferHistory, 20) is None
+                    assert session.get(Subscribe, 30).note == [4, 5, 13]
+                assert not state["cleanup_v2"]["receipts"]
+                assert keep.read_bytes() == b"preserved"
+        finally:
+            engine.dispose()
+
+
+def _real_reconcile_fixture(engine, root, *, source_present=False, shared=False):
+    from functools import partial
+    from types import SimpleNamespace
+    from cleanup_plugin import host_db
+    from cleanup_plugin.host_adapter import MoviePilotCleanupAdapter, LocalPathProbe, TrustedRoot, DownloaderProbe
+    source, destination = root / "source/a.mkv", root / "library/a.mkv"
+    source.parent.mkdir()
+    destination.parent.mkdir()
+    if source_present:
+        source.write_bytes(b"media")
+    with Session(engine) as session:
+        file = session.get(DownloadFiles, 1)
+        file.fullpath, file.savepath, file.filepath, file.download_hash = str(source), str(root), "source/a.mkv", "a" * 40
+        history = session.get(DownloadHistory, 10)
+        history.path, history.download_hash, history.episodes = str(source.parent), "a" * 40, "E04-E05"
+        transfer = session.get(TransferHistory, 20)
+        transfer.src, transfer.dest, transfer.downloader, transfer.download_hash = str(source), str(destination), "qb", "a" * 40
+        if shared:
+            second, second_dest = root / "source/b.mkv", root / "library/b.mkv"
+            second.write_bytes(b"other")
+            second_dest.write_bytes(b"other")
+            session.add(DownloadFiles(id=2, downloader="qb", download_hash="a" * 40,
+                fullpath=str(second), savepath=str(root), filepath="source/b.mkv", state=1))
+            session.add(TransferHistory(id=21, downloader="qb", download_hash="a" * 40, src=str(second),
+                src_storage="local", dest=str(second_dest), dest_storage="local", type="电视剧", media_source="tmdb",
+                media_id="123", seasons="S04", episodes="E05", status=True))
+        session.commit()
+    factory = lambda: Session(engine)
+    gateway = SimpleNamespace(**{name: partial(getattr(host_db, name), session_factory=factory) for name in (
+        "list_file_only_candidates", "get_file_only_candidate", "get_file_only_protection", "apply_file_only",
+        "prepare_receipt", "receipt_view", "apply_receipt", "source_ownership", "list_orphan_receipts", "apply_transfer_scope", "propose_receipt_refresh")})
+    class Client:
+        def __init__(self):
+            self.tasks = ([dict(hash="a" * 40, content_path=str(source.parent), save_path=str(root), state="uploading")] if shared else [])
+            self.deleted = []
+        def get_torrents(self, **kwargs):
+            return self.tasks, False
+        def get_files(self, tid):
+            return [dict(name="source/a.mkv", size=5, progress=1), dict(name="source/b.mkv", size=5, progress=1)]
+        def delete_torrents(self, *, delete_file, ids):
+            assert delete_file is False
+            self.deleted.extend(ids)
+            self.tasks = []
+            return True
+    client = Client()
+    helper = SimpleNamespace(get_configs=lambda **_: {"qb": SimpleNamespace(enabled=True)},
+        get_service=lambda **_: SimpleNamespace(type="qbittorrent", instance=client))
+    probe = LocalPathProbe([TrustedRoot(str(root), root.stat().st_dev, str(root), "test")], mount_check=lambda _: True)
+    adapter = MoviePilotCleanupAdapter(gateway, probe, DownloaderProbe(helper), object())
+    return adapter, source, destination, client
+
+
+def test_source_scoped_stale_transfer_cleanup_preserves_shared_completed_task_and_valid_episode():
+    from cleanup_plugin.record_cleanup import CleanupOptions
+    for source_present in (False, True):
+        engine = make_database()
+        try:
+            with TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                adapter, source, destination, client = _real_reconcile_fixture(engine, root, source_present=source_present, shared=True)
+                if source_present:
+                    os.link(source, root / "valid-hardlink.mkv")
+                state = {}
+                for now in (100, 101, 102):
+                    result = adapter.reconcile_batch(state, persist=lambda _: None, now=now, dry_run=False,
+                        options=CleanupOptions(stability_seconds=0))
+                    assert result.report["status"] in ("completed", "review"), result.report
+                    state = result.state
+                with Session(engine) as session:
+                    assert (session.get(DownloadFiles, 1) is not None) is source_present
+                    assert session.get(TransferHistory, 20) is None
+                    assert session.get(DownloadFiles, 2) is not None and session.get(TransferHistory, 21) is not None
+                    assert session.get(DownloadHistory, 10) is not None
+                    assert session.get(Subscribe, 30).note == [4, 5, 13]
+                assert source.exists() is source_present
+                assert (root / "source/b.mkv").read_bytes() == b"other"
+                assert (root / "library/b.mkv").read_bytes() == b"other"
+                assert client.tasks and client.deleted == []
+        finally:
+            engine.dispose()
+
+
+def test_old_orphan_seeds_use_complete_mappings_and_keep_directory_only_or_conflicting_records():
+    from cleanup_plugin.record_cleanup import CleanupOptions
+    for variant in ("complete", "nullable_owner", "transfer_only", "directory_only", "conflict"):
+        engine = make_database()
+        try:
+            with TemporaryDirectory() as temporary:
+                adapter, source, destination, client = _real_reconcile_fixture(engine, Path(temporary))
+                with Session(engine) as session:
+                    session.delete(session.get(DownloadFiles, 1))
+                    if variant == "nullable_owner":
+                        session.get(TransferHistory, 20).downloader = None
+                    if variant == "transfer_only":
+                        session.delete(session.get(DownloadHistory, 10))
+                    if variant == "directory_only":
+                        session.delete(session.get(TransferHistory, 20))
+                    if variant == "conflict":
+                        session.add(DownloadHistory(id=11, title="真实冲突", downloader="qb", download_hash="a" * 40,
+                            path=str(source.parent), type="电视剧", media_source="tmdb", media_id="999", seasons="S04", episodes="E04"))
+                    session.commit()
+                state = {}
+                for now in (100, 101, 102):
+                    result = adapter.reconcile_batch(state, persist=lambda _: None, now=now, dry_run=False,
+                        options=CleanupOptions(stability_seconds=0))
+                    assert result.report["status"] in ("completed", "review"), result.report
+                    state = result.state
+                with Session(engine) as session:
+                    if variant in ("complete", "nullable_owner", "transfer_only"):
+                        assert session.get(TransferHistory, 20) is None, (variant, result.report)
+                        assert session.get(DownloadHistory, 10) is None, (variant, result.report)
+                    else:
+                        assert session.get(DownloadHistory, 10) is not None
+                        assert any(item["reason"] in ("orphan_mapping_incomplete", "conflicting_parent_histories") for item in result.report["items"])
+                    assert session.get(Subscribe, 30).note == [4, 5, 13]
+        finally:
+            engine.dispose()
+
+
+def test_new_same_owner_transfer_outside_old_root_invalidates_receipt():
+    from cleanup_plugin.host_db import prepare_receipt, receipt_view, apply_receipt
+    engine = make_database()
+    factory = lambda: Session(engine)
+    try:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            adapter, source, destination, _ = _real_reconcile_fixture(engine, root)
+            receipt = prepare_receipt(1, session_factory=factory)
+            moved = root / "moved/a.mkv"
+            moved.parent.mkdir()
+            moved.write_bytes(b"valid moved source")
+            valid_destination = root / "new-library/a.mkv"
+            valid_destination.parent.mkdir()
+            valid_destination.write_bytes(b"valid library")
+            with Session(engine) as session:
+                session.delete(session.get(DownloadFiles, 1))
+                session.add(TransferHistory(id=21, downloader="qb", download_hash="a" * 40, src=str(moved), src_storage="local",
+                    dest=str(valid_destination), dest_storage="local", type="电视剧", media_source="tmdb", media_id="123",
+                    seasons="S04", episodes="E04", status=True))
+                session.commit()
+            view = receipt_view(receipt, session_factory=factory)
+            assert view["valid"] is False and view["reason"] == "new_or_changed_reference"
+            result = apply_receipt(receipt, dict(sources_missing=True, destinations_missing=True,
+                storage_ready=True, tasks_absent=True, revision="obsolete"), session_factory=factory)
+            assert result.status == "needs_review"
+            with Session(engine) as session:
+                assert session.get(DownloadHistory, 10) is not None
+                assert session.get(TransferHistory, 20) is not None and session.get(TransferHistory, 21) is not None
+            assert moved.exists() and valid_destination.exists()
+    finally:
+        engine.dispose()
+
+
+def test_transfer_commit_then_state_store_failure_recovers_exact_delta_and_original_source_signature():
+    from copy import deepcopy
+    from cleanup_plugin.record_cleanup import CleanupOptions
+    engine = make_database()
+    try:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            adapter, source, _, client = _real_reconcile_fixture(engine, root, source_present=True)
+            allow = [False]
+            original_owner = adapter.gateway.source_ownership
+            adapter.gateway.source_ownership = lambda *args: allow[0] and original_owner(*args)
+            saved = [None]
+            fail = [False]
+            def persist(snapshot):
+                if fail[0] and any(receipt.get("removed_transfer_ids") for receipt in snapshot.get("cleanup_v2", {}).get("receipts", {}).values()):
+                    raise OSError("isolated state write failure after committed transfer CAS")
+                saved[0] = deepcopy(snapshot)
+            first = adapter.reconcile_batch({}, persist=persist, now=100, dry_run=False, options=CleanupOptions(stability_seconds=0))
+            fail[0] = True
+            second = adapter.reconcile_batch(first.state, persist=persist, now=101, dry_run=False, options=CleanupOptions(stability_seconds=0))
+            assert second.report["status"] == "failed"
+            with Session(engine) as session:
+                assert session.get(TransferHistory, 20) is None
+                assert session.get(DownloadFiles, 1) is not None
+            assert source.exists()
+            persisted = deepcopy(saved[0])
+            assert all(not receipt.get("removed_transfer_ids") for receipt in persisted["cleanup_v2"]["receipts"].values())
+            fail[0], allow[0] = False, True
+            state = persisted
+            for now in (102, 103, 104, 105):
+                result = adapter.reconcile_batch(state, persist=persist, now=now, dry_run=False, options=CleanupOptions(stability_seconds=0))
+                state = result.state
+            assert not source.exists(), result.report
+            with Session(engine) as session:
+                assert session.get(DownloadFiles, 1) is None
+                assert session.get(DownloadHistory, 10) is None
+                assert session.get(Subscribe, 30).note == [4, 5, 13]
+    finally:
+        engine.dispose()
+
+
+def test_only_completed_state_transition_refreshes_observation_generation_and_preserves_shared_valid_data():
+    from cleanup_plugin.record_cleanup import CleanupOptions
+    engine = make_database()
+    try:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            adapter, source, _, client = _real_reconcile_fixture(engine, root, shared=True)
+            with Session(engine) as session:
+                session.get(DownloadFiles, 2).state = 0
+                session.commit()
+            client.tasks[0]["state"] = "downloading"
+            state = {}
+            for now in (100, 101):
+                result = adapter.reconcile_batch(state, persist=lambda _: None, now=now, dry_run=False, options=CleanupOptions(stability_seconds=0))
+                state = result.state
+            with Session(engine) as session:
+                assert session.get(DownloadFiles, 1) is not None and session.get(TransferHistory, 20) is not None
+                session.get(DownloadFiles, 2).state = 1
+                session.commit()
+            client.tasks[0]["state"] = "uploading"
+            resumed = adapter.reconcile_batch(state, persist=lambda _: None, now=102, dry_run=False, options=CleanupOptions(stability_seconds=0))
+            state = resumed.state
+            assert next(iter(state["cleanup_v2"]["receipts"].values())).get("generation", 0) >= 1
+            with Session(engine) as session:
+                assert session.get(DownloadFiles, 1) is not None and session.get(TransferHistory, 20) is not None
+            for now in (103, 104, 105):
+                result = adapter.reconcile_batch(state, persist=lambda _: None, now=now, dry_run=False, options=CleanupOptions(stability_seconds=0))
+                state = result.state
+            with Session(engine) as session:
+                assert session.get(DownloadFiles, 1) is None and session.get(TransferHistory, 20) is None
+                assert session.get(DownloadFiles, 2).state == 1 and session.get(TransferHistory, 21) is not None
+                assert session.get(DownloadHistory, 10) is not None and session.get(Subscribe, 30).note == [4, 5, 13]
+            assert client.tasks and not client.deleted
+            assert (root / "source/b.mkv").exists() and (root / "library/b.mkv").exists()
+    finally:
+        engine.dispose()
+
+
 if __name__ == "__main__":
+    test_new_same_owner_transfer_outside_old_root_invalidates_receipt()
+    test_transfer_commit_then_state_store_failure_recovers_exact_delta_and_original_source_signature()
+    test_only_completed_state_transition_refreshes_observation_generation_and_preserves_shared_valid_data()
+    test_source_scoped_stale_transfer_cleanup_preserves_shared_completed_task_and_valid_episode()
+    test_old_orphan_seeds_use_complete_mappings_and_keep_directory_only_or_conflicting_records()
+    test_high_level_reconciliation_uses_real_database_cas_paths_and_durable_recovery()
+    test_receipt_transaction_rolls_back_transfer_delete_when_parent_delete_fails()
+    test_receipt_physical_ownership_protects_inactive_same_source_without_downloader_task()
+    test_receipt_excludes_legacy_transfer_of_other_downloader_and_rejects_signature_changes()
+    test_file_only_rechecks_every_file_field_and_does_not_touch_parent_or_subscription()
+    test_file_only_pack_duplicates_and_receipt_survive_deleted_children()
+    test_receipt_rejects_new_or_changed_reference_and_other_downloader_is_not_deleted()
     test_movie_candidate_and_protection_use_exact_media_identity()
     test_movie_full_missing_and_transfer_only_paths_are_separate()
     test_missing_destination_repair_preserves_download_and_subscription()

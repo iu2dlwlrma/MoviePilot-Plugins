@@ -1,533 +1,421 @@
-"""Exercise plugin orchestration with the actual records-only policy engine."""
+"""Exercise plugin API/orchestration without accessing MoviePilot or business data."""
 import ast
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
-import importlib.util
-from pathlib import Path
-from threading import Event, Lock
-from types import ModuleType, SimpleNamespace
-import sys
-import unittest
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+import errno
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import tempfile
+import sys
+from threading import Event, Lock, Thread
+import time
+from types import SimpleNamespace, ModuleType
+import unittest
 from unittest.mock import patch
+import uuid
 
-
-ROOT = Path(__file__).resolve().parents[1] / "plugins.v2/emptyfoldercleaner"
-PACKAGE = "cleanup_plugin_tests"
-package = ModuleType(PACKAGE)
-package.__path__ = [str(ROOT)]
-sys.modules[PACKAGE] = package
-
-
-def load(name):
-    spec = importlib.util.spec_from_file_location(PACKAGE + "." + name, ROOT / (name + ".py"))
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-kernel = load("record_cleanup")
-host = load("host_adapter")
-SOURCE = ROOT / "__init__.py"
+SOURCE = Path(__file__).resolve().parents[1] / "plugins.v2/emptyfoldercleaner/__init__.py"
+package = ModuleType("cleanup_plugin_tests")
+package.__path__ = [str(SOURCE.parent)]
+sys.modules[package.__name__] = package
 TREE = ast.parse(SOURCE.read_text())
 CLASS = next(node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name == "EmptyFolderCleaner")
-
 
 class Base:
     def __init__(self):
         self.data, self.saved_config, self.messages = {}, None, []
-
-    def get_data(self, key):
-        return self.data.get(key)
-
-    def save_data(self, key, value):
-        self.data[key] = value
-
+        self.stored_config = None
+        self.directory = tempfile.TemporaryDirectory()
+    def get_data_path(self): return Path(self.directory.name)
+    def get_data(self, key): return deepcopy(self.data.get(key))
+    def save_data(self, key, value): self.data[key] = deepcopy(value)
+    def get_config(self): return deepcopy(self.stored_config if self.stored_config is not None else self._loaded_config)
     def update_config(self, value):
-        self.saved_config = value
-
-    def post_message(self, **value):
-        self.messages.append(value)
-
+        self.saved_config = deepcopy(value)
+        self.stored_config = deepcopy(value)
+        return True
+    def post_message(self, **value): self.messages.append(value)
 
 class Log:
     level = 20
-    def __getattr__(self, _name):
-        return lambda *_args, **_kwargs: None
-
+    def __getattr__(self, _): return lambda *args, **kwargs: None
 
 class Scheduler:
     running = False
-    def __init__(self, **_):
-        self.jobs = []
-    def add_job(self, function, *_args, **_kwargs):
-        self.jobs.append(function)
-    def get_jobs(self):
-        return self.jobs
-    def print_jobs(self):
-        pass
-    def start(self):
-        self.running = True
-    def remove_all_jobs(self):
-        self.jobs.clear()
-    def shutdown(self, **_):
-        self.running = False
+    def __init__(self, **_): self.jobs = []
+    def add_job(self, function, *_args, **_kwargs): self.jobs.append(function)
+    def get_jobs(self): return self.jobs
+    def print_jobs(self): pass
+    def start(self): self.running = True
+    def remove_all_jobs(self): self.jobs.clear()
+    def shutdown(self, **_): self.running = False
 
+class Response:
+    def __init__(self, success, data=None, message=None):
+        self.success, self.data, self.message = success, data, message
 
 NAMESPACE = dict(
-    __name__=PACKAGE + ".plugin", __package__=PACKAGE, _PluginBase=Base,
-    Any=object, List=list, Dict=dict, Tuple=tuple, Optional=__import__("typing").Optional,
-    Event=Event, Lock=Lock, Path=Path, datetime=datetime, timedelta=timedelta,
-    os=__import__("os"), errno=__import__("errno"), time=__import__("time"),
-    logger=Log(), settings=SimpleNamespace(TZ="UTC"),
+    __name__="cleanup_plugin_tests.plugin", __package__="cleanup_plugin_tests",
+    _PluginBase=Base, Any=object, List=list, Dict=dict, Tuple=tuple,
+    Optional=__import__("typing").Optional, Event=Event, Lock=Lock, Thread=Thread,
+    Path=Path, datetime=datetime, timedelta=timedelta, os=os, errno=errno,
+    time=time, fcntl=fcntl, hashlib=hashlib, json=json, uuid=uuid, deepcopy=deepcopy,
+    logger=Log(), settings=SimpleNamespace(TZ="UTC"), Response=Response,
     pytz=SimpleNamespace(timezone=lambda _: timezone.utc), BackgroundScheduler=Scheduler,
-    CronTrigger=SimpleNamespace(from_crontab=lambda value: value),
+    CronTrigger=SimpleNamespace(from_crontab=lambda value: value if len(value.split()) == 5 else (_ for _ in ()).throw(ValueError())),
     NotificationType=SimpleNamespace(SiteMessage="site"),
 )
 exec(compile(ast.fix_missing_locations(ast.Module(body=[CLASS], type_ignores=[])), str(SOURCE), "exec"), NAMESPACE)
 Plugin = NAMESPACE["EmptyFolderCleaner"]
 
-START = 1_000_000.0
-DAY = 86400.0
-
-
-def record(number=7, *, destination=True):
-    return kernel.CleanupRecord(
-        key=f"file:{number}", revision=f"rev:{number}", record_id=number,
-        source_path=f"/downloads/show/S01E{number:02}.mkv",
-        destination_paths=(f"/library/show/S01E{number:02}.mkv",) if destination else (),
-        media_source="themoviedb", media_id="123", media_type="电视剧", season=1,
-        episodes=(number,),
-    )
-
-
 class Adapter:
-    def __init__(self, records=(), cursor=0, *, source=kernel.Presence.MISSING):
-        self.page = host.CandidatePage(tuple(records), cursor, True)
-        self.calls, self.applied, self.purged = [], [], []
-        self.source = source
-        self.observe_error = False
-        self.mutation_failure = False
+    def __init__(self, *, hold=False):
+        self.entered, self.release = Event(), Event()
+        self.hold, self.options = hold, None
+    def reconcile_batch(self, state, *, persist, now=None, dry_run=True, options=None, stop_requested=None):
+        self.options = options
+        self.entered.set()
+        if self.hold: self.release.wait(2)
+        snapshot = {**state, "cleanup_v2": {"cursor": 9}}
+        persist(snapshot)
+        return SimpleNamespace(state=snapshot, report={
+            "status": "cancelled" if stop_requested() else "completed", "dry_run": dry_run,
+            "processed": 1, "items": [{"key": "file:7", "file": "PRIVATE_MEDIA.mkv", "branch": "file_only", "status": "applied", "reason": "missing_file_row_removed"}],
+            "summary": {"applied": 1}, "counts": {"download_files": 1, "source_files": 0, "tasks": 0, "download_history": 0, "transfer_history": 0},
+            "observed_pending": 0, "cursor_before": 0, "cursor_after": 9, "cycle_complete": False,
+            "scan": {"cycle_id": "cycle", "checked": 1, "complete": False, "total": None},
+        })
 
-    def list_candidates(self, **kwargs):
-        self.calls.append(kwargs)
-        return self.page
+class PluginTests(unittest.TestCase):
+    def test_every_registered_api_preserves_the_host_superuser_boundary(self):
+        fastapi = ModuleType("fastapi")
+        auth = ModuleType("app.api.dependencies.auth")
+        def superuser_guard(): pass
+        fastapi.Depends = lambda dependency: SimpleNamespace(dependency=dependency)
+        auth.get_current_active_superuser = superuser_guard
+        plugin = self.instance()
+        with patch.dict(sys.modules, {"fastapi": fastapi, "app.api.dependencies.auth": auth}):
+            apis = plugin.get_api()
+        self.assertEqual(len(apis), 7)
+        for api in apis:
+            self.assertEqual(api["auth"], "bear")
+            self.assertTrue(api.get("dependencies"), api["path"])
+            self.assertIs(api["dependencies"][0].dependency, superuser_guard)
 
-    def observe(self, item):
-        if self.observe_error:
-            raise OSError("private server URL must not appear")
-        return kernel.CleanupEvidence(
-            source=self.source, destinations=tuple(kernel.Presence.MISSING for _ in item.destination_paths),
-            other_versions=kernel.Presence.MISSING, media_library=kernel.Presence.MISSING,
-            destination_lookup_complete=True, media_lookup_complete=True,
-            downloaders_complete=True, downloader_task_present=self.source is kernel.Presence.PRESENT,
-            transfer_task_active=False, storage_ready=True, identity_verified=True, revision=item.revision,
-            source_signature=(1, 100, 33188, 1024, 900, 900, 1) if self.source is kernel.Presence.PRESENT else (),
-        )
+    def instance(self, config=None, adapter=None):
+        obj = Plugin()
+        def cleanup():
+            obj.stop_service()
+            if adapter is not None:
+                adapter.release.set()
+            if obj._run_thread and obj._run_thread.is_alive():
+                obj._run_thread.join(3)
+            obj.directory.cleanup()
+        self.addCleanup(cleanup)
+        obj.init_plugin(config or {"enabled": False, "records_enabled": True})
+        obj._build_record_adapter = lambda: adapter or Adapter()
+        obj._refresh_services = lambda: None
+        return obj
 
-    observe_destination = observe
+    def test_settings_patch_preserves_unknowns_and_does_not_consume_onlyonce(self):
+        obj = self.instance({"enabled": False, "cron": "0 0 * * 1", "target_dirs": "/old", "onlyonce": False, "future": {"secret": "keep"}, "records_reopen_subscription": True})
+        obj._loaded_config["onlyonce"] = True
+        obj._onlyonce = True
+        before = obj.get_settings().data
+        result = obj.update_settings({"revision": before["revision"], "changes": {"notify": True}})
+        self.assertTrue(result.success)
+        self.assertEqual(obj.saved_config, {"enabled": False, "cron": "0 0 * * 1", "target_dirs": "/old", "onlyonce": True, "future": {"secret": "keep"}, "records_reopen_subscription": True, "notify": True})
+        self.assertIsNone(obj._scheduler)
 
-    def mutate(self, item, _evidence, options):
-        if self.mutation_failure:
-            return kernel.MutationResult("needs_review", "host_cleanup_failed")
-        self.applied.append((item.record_id, options.allow_subscription_retry))
-        return kernel.MutationResult("applied", "records_updated")
+    def test_stale_revision_and_unknown_patch_never_replace_configuration(self):
+        obj = self.instance()
+        self.assertFalse(obj.update_settings({"revision": "stale", "changes": {"notify": True}}).success)
+        self.assertIsNone(obj.saved_config)
+        revision = obj.get_settings().data["revision"]
+        self.assertFalse(obj.update_settings({"revision": revision, "changes": {"future": "overwrite"}}).success)
+        self.assertIsNone(obj.saved_config)
 
-    def repair_destination(self, *_):
-        raise AssertionError("obsolete transfer-only cleanup must never execute")
+    def test_settings_merge_reads_actual_storage_and_confirms_the_write(self):
+        obj = self.instance({"notify": False, "future": "old"})
+        obj.stored_config = {"notify": False, "future": "external"}
+        revision = obj.get_settings().data["revision"]
+        self.assertTrue(obj.update_settings({"revision": revision, "changes": {"notify": True}}).success)
+        self.assertEqual(obj.saved_config, {"notify": True, "future": "external"})
+        revision = obj.get_settings().data["revision"]
+        obj.update_config = lambda value: None
+        result = obj.update_settings({"revision": revision, "changes": {"notify": False}})
+        self.assertFalse(result.success)
+        self.assertTrue(obj._notify)
 
-    def purge_source(self, item, _evidence, options):
-        self.purged.append((item.record_id, options.preserve_source_tasks, options.allow_subscription_retry))
-        return kernel.MutationResult("applied", "source_purged")
+    def test_invalid_config_rejects_the_whole_patch(self):
+        obj = self.instance()
+        revision = obj.get_settings().data["revision"]
+        for changes in ({"notify": "false"}, {"records_batch_size": 101}, {"cron": "broken"}, {"onlyonce": True}):
+            self.assertFalse(obj.update_settings({"revision": revision, "changes": changes}).success)
+        self.assertIsNone(obj.saved_config)
 
+    def test_reconcile_persists_with_readback_and_forbids_subscription_mutations(self):
+        adapter = Adapter()
+        obj = self.instance({"records_enabled": True, "records_dry_run": False, "records_reopen_subscription": True}, adapter)
+        result = obj.clean_records()
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(adapter.options.allow_subscription_retry)
+        self.assertEqual(obj.data["records_state"]["cleanup_v2"]["cursor"], 9)
+        self.assertEqual(obj.data["records_report"]["counts"]["download_files"], 1)
 
-def plugin(adapter, data=None, **config):
-    instance = Plugin()
-    instance.data = data if data is not None else {}
-    instance.init_plugin({"enabled": False, "records_enabled": True, **config})
-    instance._build_record_adapter = lambda: adapter
-    return instance
+    def test_persist_readback_failure_is_failed_not_completed(self):
+        obj = self.instance()
+        real_save = obj.save_data
+        obj.save_data = lambda key, value: None if key == "records_state" else real_save(key, value)
+        self.assertEqual(obj.clean_records()["status"], "failed")
 
+    def test_home_and_status_have_only_statistics_not_media_items(self):
+        obj = self.instance()
+        obj.clean_records()
+        self.assertNotIn("PRIVATE_MEDIA", repr(obj.get_status().data))
+        self.assertNotIn("PRIVATE_MEDIA", repr(obj.get_page()))
+        self.assertEqual(obj.get_status().data["records"]["processed"], 1)
+        self.assertFalse(obj.get_status().data["records"]["scan"]["complete"])
 
-def all_text(value):
-    if isinstance(value, dict):
-        return " ".join(str(v) if k in ("text", "title") else all_text(v) for k, v in value.items())
-    if isinstance(value, (list, tuple)):
-        return " ".join(all_text(item) for item in value)
-    return ""
+    def test_details_are_paginated_from_an_immutable_snapshot(self):
+        obj = self.instance()
+        obj.clean_records()
+        first = obj.get_details(kind="records", page=1, page_size=1).data
+        obj.data["records_report"]["items"] = [{"file": "new.mkv"}]
+        same = obj.get_details(kind="records", page=1, page_size=1, snapshot_id=first["snapshot_id"]).data
+        self.assertEqual(same["items"][0]["file"], "PRIVATE_MEDIA.mkv")
+        self.assertEqual(same["scope"], "latest_batch")
 
+    def test_legacy_folder_history_is_preserved_and_paginated(self):
+        obj = self.instance()
+        obj.data["history"] = [{"clean_time": str(i), "removed_count": i} for i in range(50)]
+        result = obj.get_history(kind="folders", page=2, page_size=20).data
+        self.assertEqual(result["total"], 50)
+        self.assertEqual(len(result["items"]), 20)
+        self.assertEqual(len(obj.data["history"]), 50)
 
-class CleanupPluginIntegrationTests(unittest.TestCase):
-    def run_at(self, instance, now):
-        with patch.object(NAMESPACE["time"], "time", return_value=now):
-            return instance.clean_records()
+    def test_explicit_empty_record_cron_never_registers_default_schedule(self):
+        obj = self.instance({"enabled": True, "records_enabled": True, "records_cron": ""})
+        self.assertEqual(obj.get_service(), [])
+        self.assertEqual(obj.get_settings().data["config"]["records_cron"], "")
 
-    def test_new_default_is_bounded_five_minute_but_existing_config_and_folder_history_survive(self):
-        old_history = [{"clean_time": "2026-10-01", "removed_count": 2, "target_dirs": 1}]
-        instance = plugin(Adapter(), {"history": old_history}, cron="0 0 * * 1",
-                          target_dirs="/Data/Downloads", exclude_dirs="keep", custom_future={"v": 7})
-        config = instance._config_payload()
-        self.assertEqual(config["cron"], "0 0 * * 1")
-        self.assertEqual(config["target_dirs"], "/Data/Downloads")
-        self.assertEqual(config["custom_future"], {"v": 7})
-        self.assertEqual(config["records_cron"], "*/5 * * * *")
-        self.assertEqual(config["records_batch_size"], 100)
-        self.assertFalse(config["records_reopen_subscription"])
-        self.assertIs(instance.data["history"], old_history)
-        custom = plugin(Adapter(), records_cron="15 4 * * *")
-        self.assertEqual(custom._records_cron, "15 4 * * *")
+    def test_home_selects_latest_folder_history_and_omits_non_statistical_fields(self):
+        obj = self.instance()
+        obj.data["history"] = [{"clean_time": "2026-10-29", "removed_count": 8, "private_file": "SECRET.mkv"},
+                               {"clean_time": "2026-10-01", "removed_count": 1}]
+        result = obj.get_status().data
+        self.assertEqual(result["folders"]["removed_count"], 8)
+        self.assertNotIn("SECRET.mkv", repr(result))
 
-    def test_run_once_runs_both_features_and_folder_error_does_not_hide_records(self):
-        instance = plugin(Adapter(), target_dirs="/downloads")
-        calls = []
-        def folder():
-            calls.append("folder")
-            raise OSError("folder inaccessible")
-        instance.clean_empty_folders = folder
-        instance.clean_records = lambda: calls.append("records") or {"status": "completed"}
-        result = instance.run_once()
-        self.assertEqual(calls, ["folder", "records"])
-        self.assertEqual(result["folders"], "failed")
-        self.assertEqual(result["records"]["status"], "completed")
+    def test_snapshot_keeps_all_bounded_results_instead_of_silently_truncating(self):
+        obj = self.instance()
+        obj._save_record_report({"status": "completed", "items": [{"file": str(i), "branch": "file_only"} for i in range(250)]})
+        result = obj.get_details(page=13, page_size=20).data
+        self.assertEqual(result["total"], 250)
+        self.assertEqual(result["items"][-1]["file"], "249")
 
-    def test_folder_validation_failure_is_reported_without_disabling_records(self):
-        instance = plugin(Adapter(), target_dirs="/definitely-not-an-existing-cleanup-root")
-        result = instance.run_once()
-        self.assertEqual(result["folders"], "failed")
-        self.assertEqual(result["records"]["status"], "completed")
+    def test_duplicate_manual_runs_share_one_job_and_cancel_reports_real_outcome(self):
+        adapter = Adapter(hold=True)
+        obj = self.instance(adapter=adapter)
+        first = obj.start_run({"scope": "records", "request_id": "click1"})
+        self.assertTrue(adapter.entered.wait(1))
+        second = obj.start_run({"scope": "records", "request_id": "click2"})
+        self.assertEqual(first.data["run_id"], second.data["run_id"])
+        self.assertTrue(obj.cancel_run({"run_id": first.data["run_id"]}).success)
+        adapter.release.set()
+        obj._run_thread.join(2)
+        self.assertEqual(obj.get_status().data["run"]["status"], "cancelled")
 
-    def test_reload_stops_old_event_and_keeps_a_new_run_available(self):
-        instance = plugin(Adapter())
-        previous = instance._event
-        instance.init_plugin({"enabled": False, "records_enabled": True})
-        self.assertTrue(previous.is_set())
-        self.assertFalse(instance._event.is_set())
-        instance.stop_service()
-        self.assertTrue(instance._event.is_set())
-        self.assertEqual(self.run_at(instance, START)["status"], "cancelled")
+    def test_file_lock_prevents_a_different_instance_starting_another_job(self):
+        adapter = Adapter(hold=True)
+        obj = self.instance(adapter=adapter)
+        obj.start_run({"scope": "records", "request_id": "first"})
+        self.assertTrue(adapter.entered.wait(1))
+        other = self.instance()
+        other.directory.cleanup()
+        other.get_data_path = obj.get_data_path
+        self.assertFalse(other.start_run({"scope": "records", "request_id": "other"}).success)
+        adapter.release.set()
+        obj._run_thread.join(2)
 
-    def test_restart_keeps_cursor_and_observation_then_wraps_after_last_page(self):
-        adapter = Adapter([record(7, destination=False)], cursor=7)
-        instance = plugin(adapter)
-        first = self.run_at(instance, START)
-        self.assertEqual(first["status"], "completed")
-        self.assertEqual(instance.data["records_state"]["cursor"], 7)
-        saved = instance.data["records_state"]["full_missing"]
-        self.assertEqual(saved["candidates"]["file:7"]["first_seen"], START)
-        adapter.page = host.CandidatePage((record(8, destination=False),), 0, True)
-        reopened = plugin(adapter, instance.data)
-        self.run_at(reopened, START + 3600)
-        self.assertEqual(adapter.calls[-1]["cursor"], 7)
-        self.assertEqual(reopened.data["records_state"]["cursor"], 0)
-        self.assertEqual(set(reopened.data["records_state"]["full_missing"]["candidates"]), {"file:7", "file:8"})
+    def test_restarted_unlocked_job_is_interrupted_without_losing_history(self):
+        obj = self.instance()
+        obj.data["cleanup_run"] = {"run_id": "old", "status": "running", "scope": "records"}
+        self.assertEqual(obj.get_status().data["run"]["status"], "interrupted")
+        self.assertEqual(obj.data["cleanup_run"]["run_id"], "old")
 
-    def test_default_preview_never_mutates_even_after_stability(self):
-        adapter = Adapter([record(destination=False)])
-        instance = plugin(adapter)
-        self.run_at(instance, START)
-        report = self.run_at(instance, START + DAY)
-        self.assertEqual(report["summary"]["eligible"], 1)
-        self.assertEqual(adapter.applied, [])
-        self.assertTrue(report["dry_run"])
+    def test_old_cancel_cannot_stop_or_overwrite_a_replacement_job(self):
+        obj = self.instance()
+        obj.data["cleanup_run"] = {"run_id": "old", "status": "running", "scope": "records"}
+        obj._run_event = Event()
+        obj._run_event_id = "new"
+        new_event = obj._run_event
+        original_get = obj.get_data
+        reads = 0
+        def interleaved(key):
+            nonlocal reads
+            result = original_get(key)
+            if key == "cleanup_run":
+                reads += 1
+                if reads == 1:
+                    obj.data["cleanup_run"] = {"run_id": "new", "status": "running", "scope": "records"}
+            return result
+        obj.get_data = interleaved
+        obj.cancel_run({"run_id": "old"})
+        self.assertFalse(new_event.is_set())
+        self.assertEqual(obj.data["cleanup_run"]["run_id"], "new")
 
-    def test_actual_record_write_waits_a_day_and_does_not_claim_file_deletion(self):
-        adapter = Adapter([record(destination=False)])
-        instance = plugin(adapter, records_dry_run=False, records_reopen_subscription=False)
-        self.run_at(instance, START)
-        self.assertEqual(adapter.applied, [])
-        report = self.run_at(instance, START + DAY)
-        self.assertEqual(adapter.applied, [(7, False)])
-        self.assertEqual(report["summary"]["applied"], 1)
-        self.assertNotIn("deleted_files", report)
+    def test_cancel_does_not_revive_a_completed_receipt(self):
+        obj = self.instance()
+        obj.data["cleanup_run"] = {"run_id": "old", "status": "running", "scope": "records"}
+        original_get = obj.get_data
+        reads = 0
+        def interleaved(key):
+            nonlocal reads
+            result = original_get(key)
+            if key == "cleanup_run":
+                reads += 1
+                if reads == 1: obj.data["cleanup_run"]["status"] = "completed"
+            return result
+        obj.get_data = interleaved
+        obj.cancel_run({"run_id": "old"})
+        self.assertEqual(obj.data["cleanup_run"]["status"], "completed")
 
-    def test_source_purge_has_independent_day_and_never_reopens_subscription(self):
-        adapter = Adapter([record()], source=kernel.Presence.PRESENT)
-        instance = plugin(adapter, records_dry_run=False, records_reopen_subscription=True)
-        self.run_at(instance, START)
-        state = instance.data["records_state"]
-        self.assertEqual(state["full_missing"]["candidates"], {})
-        self.assertIn("file:7", state["source_purge"]["candidates"])
-        self.run_at(instance, START + DAY)
-        self.assertEqual(adapter.applied, [])
-        self.assertEqual(adapter.purged, [(7, False, False)])
-
-    def test_old_transfer_only_state_cannot_authorize_source_deletion(self):
-        adapter = Adapter([record()], source=kernel.Presence.PRESENT)
-        previous = kernel.RecordCleanupEngine(adapter.observe_destination, decision=kernel.destination_decision).run(
-            [record()], {}, now=START)
-        data = {"records_state": {"version": 1, "cursor": 0, "destination_only": previous.state}}
-        instance = plugin(adapter, data, records_dry_run=False)
-        report = self.run_at(instance, START + DAY)
-        self.assertEqual(adapter.purged, [])
-        self.assertNotIn("destination_only", instance.data["records_state"])
-        self.assertEqual(report["summary"]["waiting"], 1)
-        self.assertEqual(instance.data["records_state"]["source_purge"]["candidates"]["file:7"]["first_seen"], START + DAY)
-
-    def test_source_purge_preview_never_calls_mutation_and_existing_subscription_option_is_preserved(self):
-        adapter = Adapter([record()], source=kernel.Presence.PRESENT)
-        instance = plugin(adapter, records_reopen_subscription=True)
-        self.run_at(instance, START)
-        report = self.run_at(instance, START + DAY)
-        self.assertEqual(report["summary"]["eligible"], 1)
-        self.assertEqual(adapter.purged, [])
-        self.assertTrue(instance._config_payload()["records_reopen_subscription"])
-        missing_adapter = Adapter([record(destination=False)])
-        enabled = plugin(missing_adapter, records_dry_run=False, records_reopen_subscription=True)
-        self.run_at(enabled, START)
-        self.run_at(enabled, START + DAY)
-        self.assertEqual(missing_adapter.applied, [(7, True)])
-
-    def test_partial_source_delete_survives_restart_and_never_reopens_subscription(self):
-        adapter = Adapter([record()], source=kernel.Presence.PRESENT)
-        instance = plugin(adapter, records_dry_run=False, records_reopen_subscription=True)
-        observed_intents = []
-        def partial(item, _evidence, options):
-            # The durable intent must precede even the first physical action.
-            observed_intents.append(deepcopy(instance.data["records_state"]["purged_source"][item.key]))
-            adapter.source = kernel.Presence.MISSING
-            return kernel.MutationResult("needs_review", "source_purged_history_pending")
-        adapter.purge_source = partial
-        self.run_at(instance, START)
-        self.run_at(instance, START + DAY)
-        self.assertEqual(observed_intents[0]["revision"], record().revision)
-        self.assertIn(record().key, instance.data["records_state"]["purged_source"])
-        restarted = plugin(adapter, deepcopy(instance.data), records_dry_run=False, records_reopen_subscription=True)
-        self.run_at(restarted, START + DAY + 1)
-        self.run_at(restarted, START + 2 * DAY + 1)
-        self.assertEqual(adapter.applied, [(7, False)])
-        self.assertNotIn(record().key, restarted.data["records_state"]["purged_source"])
-
-    def test_exception_after_source_delete_keeps_durable_intent(self):
-        adapter = Adapter([record()], source=kernel.Presence.PRESENT)
-        instance = plugin(adapter, records_dry_run=False, records_reopen_subscription=True)
-        def interrupted(*_):
-            adapter.source = kernel.Presence.MISSING
-            raise OSError("process interrupted after unlink")
-        adapter.purge_source = interrupted
-        self.run_at(instance, START)
-        self.run_at(instance, START + DAY)
-        self.assertIn(record().key, instance.data["records_state"]["purged_source"])
-        restarted = plugin(adapter, deepcopy(instance.data), records_dry_run=False, records_reopen_subscription=True)
-        self.run_at(restarted, START + DAY + 1)
-        self.run_at(restarted, START + 2 * DAY + 1)
-        self.assertEqual(adapter.applied, [(7, False)])
-
-    def test_source_intent_write_or_readback_failure_prevents_any_physical_purge(self):
-        for failure in ("raise", "silent", "readback"):
-            with self.subTest(failure=failure):
-                adapter = Adapter([record()], source=kernel.Presence.PRESENT)
-                instance = plugin(adapter, records_dry_run=False)
-                self.run_at(instance, START)
-                save, get = instance.save_data, instance.get_data
-                armed = []
-                def save_fault(key, value):
-                    if key == "records_state" and value.get("purged_source"):
-                        armed.append(True)
-                        if failure == "raise":
-                            raise OSError("intent store unavailable")
-                        if failure == "silent":
-                            return
-                    save(key, value)
-                def get_fault(key):
-                    if key == "records_state" and armed and failure == "readback":
-                        raise OSError("intent readback unavailable")
-                    return get(key)
-                instance.save_data, instance.get_data = save_fault, get_fault
-                result = self.run_at(instance, START + DAY)
-                self.assertEqual(adapter.purged, [])
-                self.assertEqual(result["status"], "failed")
-
-    def test_invalid_intent_state_cannot_fall_back_to_retry_enabled(self):
-        for value in ("broken", {"version": 1, "purged_source": []},
-                      {"version": 1, "purged_source": {"file:7": {"revision": ""}}}):
-            with self.subTest(value=value):
-                adapter = Adapter([record(destination=False)])
-                instance = plugin(adapter, {"records_state": value}, records_dry_run=False,
-                                  records_reopen_subscription=True)
-                result = self.run_at(instance, START)
-                self.assertEqual(result["status"], "failed")
-                self.assertEqual(adapter.applied, [])
-                self.assertEqual(adapter.calls, [])
-
-    def test_intent_read_failure_prevents_all_mutations(self):
-        adapter = Adapter([record(destination=False)])
-        instance = plugin(adapter, records_dry_run=False, records_reopen_subscription=True)
-        get = instance.get_data
-        def unavailable(key):
-            if key == "records_state":
-                raise OSError("state cannot be read")
-            return get(key)
-        instance.get_data = unavailable
-        report = self.run_at(instance, START)
-        self.assertEqual(report["status"], "failed")
-        self.assertEqual(adapter.calls, [])
-        self.assertEqual(adapter.applied, [])
-
-    def test_changed_record_revision_keeps_intent_and_never_falls_back_to_retry_true(self):
-        adapter = Adapter([record(destination=False)])
-        data = {"records_state": {"version": 1, "purged_source": {record().key: {
-            "revision": "earlier-revision", "source_signature": [1, 100, 33188, 1024, 900, 900, 1],
-        }}}}
-        instance = plugin(adapter, data, records_dry_run=False, records_reopen_subscription=True)
-        self.run_at(instance, START)
-        report = self.run_at(instance, START + DAY)
-        self.assertEqual(adapter.applied, [])
-        self.assertEqual(report["items"][0]["reason"], "source_intent_revision_changed")
-        self.assertIn(record().key, instance.data["records_state"]["purged_source"])
-
-    def test_committed_cleanup_removes_intent_only_after_confirmed_state_write(self):
-        adapter = Adapter([record(destination=False)])
-        data = {"records_state": {"version": 1, "purged_source": {record().key: {
-            "revision": record().revision, "source_signature": [1, 100, 33188, 1024, 900, 900, 1],
-        }}}}
-        instance = plugin(adapter, data, records_dry_run=False, records_reopen_subscription=True)
-        self.run_at(instance, START)
-        save = instance.save_data
-        def fail_clear(key, value):
-            if key == "records_state" and not value.get("purged_source"):
-                raise OSError("clear intent failed")
-            save(key, value)
-        instance.save_data = fail_clear
-        report = self.run_at(instance, START + DAY)
-        self.assertEqual(adapter.applied, [(7, False)])
-        self.assertEqual(report["status"], "failed")
-        self.assertIn(record().key, instance.data["records_state"]["purged_source"])
-
-    def test_page_read_failure_reports_failure_and_does_not_move_cursor_or_state(self):
-        adapter = Adapter([record(destination=False)], cursor=7)
-        instance = plugin(adapter)
-        self.run_at(instance, START)
-        prior_state = instance.data["records_state"]
-        adapter.page = host.CandidatePage(cursor=7, reason="candidate_read_failed")
-        report = self.run_at(instance, START + DAY)
-        self.assertEqual(report["status"], "failed")
-        self.assertEqual(report["error"], "candidate_read_failed")
-        self.assertIs(instance.data["records_state"], prior_state)
-        self.assertEqual(instance.data["records_state"]["cursor"], 7)
-
-    def test_state_write_failure_is_visible_and_never_publishes_advanced_cursor(self):
-        instance = plugin(Adapter([record(destination=False)], cursor=7))
-        save = instance.save_data
-        failed = []
-        def interrupted_save(key, value):
-            if key == "records_state" and not failed:
-                failed.append(True)
-                raise OSError("storage failure")
-            save(key, value)
-        instance.save_data = interrupted_save
-        report = self.run_at(instance, START)
-        self.assertEqual(report["status"], "failed")
-        self.assertEqual(report["cursor_after"], 0)
-        self.assertEqual(instance.data["records_state"]["cursor"], 0)
-
-    def test_individual_observer_failure_is_visible_but_does_not_starve_later_pages(self):
-        adapter = Adapter([record(destination=False)], cursor=7)
-        adapter.observe_error = True
-        instance = plugin(adapter)
-        report = self.run_at(instance, START)
-        self.assertEqual(report["status"], "review")
-        self.assertEqual(report["summary"]["needs_review"], 1)
-        self.assertEqual(report["items"][0]["reason"], "observation_failed")
-        self.assertNotIn("private server", repr(report))
-        self.assertEqual(instance.data["records_state"]["cursor"], 7)
-
-    def test_individual_mutation_failure_keeps_record_uncompleted_and_reports_reason(self):
-        adapter = Adapter([record(destination=False)], cursor=7)
-        instance = plugin(adapter, records_dry_run=False)
-        self.run_at(instance, START)
-        adapter.mutation_failure = True
-        adapter.page = host.CandidatePage((record(destination=False),), 0, True)
-        report = self.run_at(instance, START + DAY)
-        self.assertEqual(report["status"], "review")
-        self.assertEqual(instance.data["records_state"]["full_missing"]["completed"], {})
-        self.assertEqual(instance.data["records_state"]["cursor"], 0)
-        self.assertEqual(report["items"][0]["reason"], "host_cleanup_failed")
-
-    def test_repeated_click_while_busy_does_not_replace_report_or_state(self):
-        adapter = Adapter([record(destination=False)])
-        instance = plugin(adapter)
-        instance.data["records_report"] = {"status": "running", "run_id": "first"}
-        instance._records_lock.acquire()
+    def test_cross_instance_cancel_and_replacement_use_the_same_file_transaction(self):
+        first = self.instance()
+        first.data["cleanup_run"] = {"run_id": "old", "status": "running", "scope": "records"}
+        first._run_event, first._run_event_id = Event(), "old"
+        adapter = Adapter(hold=True)
+        second = self.instance(adapter=adapter)
+        second.get_data_path = first.get_data_path
+        second.data = first.data
+        at_write, release, replacing, replaced = Event(), Event(), Event(), Event()
+        original = first._persist_checked
+        def paused_write(key, value):
+            if key == "cleanup_cancel":
+                at_write.set()
+                release.wait(1)
+            return original(key, value)
+        first._persist_checked = paused_write
+        cancel = Thread(target=lambda: first.cancel_run({"run_id": "old"}))
+        def replace():
+            replacing.set()
+            second._state_transaction(lambda: second._write_run_if_current(
+                {"run_id": "old", "status": "completed", "scope": "records"}))
+            second.start_run({"scope": "records", "request_id": "replacement"})
+            replaced.set()
+        replacement = Thread(target=replace)
+        def join_test_threads():
+            release.set()
+            if cancel.ident: cancel.join(1)
+            if replacement.ident: replacement.join(1)
+        self.addCleanup(join_test_threads)
+        cancel.start()
+        self.assertTrue(at_write.wait(1))
+        replacement.start()
+        self.assertTrue(replacing.wait(1))
         try:
-            result = self.run_at(instance, START)
+            self.assertFalse(replaced.wait(.05), "replacement must wait for the cancellation transaction")
         finally:
-            instance._records_lock.release()
-        self.assertEqual(result["status"], "busy")
-        self.assertEqual(instance.data["records_report"], {"status": "running", "run_id": "first"})
-        self.assertEqual(adapter.calls, [])
+            release.set()
+        cancel.join(1); replacement.join(1)
+        self.assertTrue(adapter.entered.wait(1))
+        self.assertNotEqual(second.data["cleanup_run"]["run_id"], "old")
+        self.assertFalse(second._run_event.is_set())
+        adapter.release.set()
+        second._run_thread.join(1)
 
-    def test_cancelled_batch_never_advances_cursor(self):
-        adapter = Adapter([record(destination=False)], cursor=7)
-        instance = plugin(adapter)
-        original = adapter.observe
-        def stop(item):
-            instance._event.set()
-            return original(item)
-        adapter.observe = stop
-        result = self.run_at(instance, START)
-        self.assertEqual(result["status"], "cancelled")
-        self.assertEqual(instance.data.get("records_state", {}).get("cursor", 0), 0)
-        self.assertEqual(adapter.applied, [])
+    def test_hot_reload_cannot_turn_an_old_folder_preview_into_deletion(self):
+        obj = self.instance({"target_dirs": "", "dry_run": True, "notify": False})
+        root = Path(obj.directory.name) / "scan"
+        (root / "empty").mkdir(parents=True)
+        obj._load_config({"target_dirs": str(root), "dry_run": True, "notify": False})
+        original_excluded = obj._EmptyFolderCleaner__is_excluded
+        calls = 0
+        def reload_after_stop_check(path, *args):
+            nonlocal calls
+            if path.name == "empty":
+                calls += 1
+                if calls == 2:
+                    obj.init_plugin({"target_dirs": str(root), "dry_run": False, "notify": True})
+            return original_excluded(path, *args)
+        obj._EmptyFolderCleaner__is_excluded = reload_after_stop_check
+        obj.clean_empty_folders()
+        self.assertTrue((root / "empty").is_dir())
+        self.assertTrue(obj.data["history"][-1]["dry_run"])
+        self.assertEqual(obj.messages, [])
 
-    def test_page_renders_record_outcomes_and_existing_folder_history_together(self):
-        adapter = Adapter([record(destination=False)])
-        instance = plugin(adapter, {"history": [dict(clean_time="2026-10-01", removed_count=2, target_dirs=1)]})
-        self.run_at(instance, START)
-        text = all_text(instance.get_page())
-        self.assertIn("观察", text)
-        self.assertIn("S01E07.mkv", text)
-        self.assertIn("2026-10-01", text)
-        self.assertIn("记录", text)
-        self.assertIn("空文件夹", text)
+    def test_record_run_keeps_its_original_preview_mode_during_reload(self):
+        adapter = Adapter()
+        obj = self.instance({"records_enabled": True, "records_dry_run": True}, adapter)
+        def reload():
+            obj._load_config({"records_enabled": True, "records_dry_run": False})
+            return adapter
+        obj._build_record_adapter = reload
+        result = obj.clean_records()
+        self.assertTrue(result["dry_run"])
 
-    def test_report_history_is_bounded_and_retains_no_full_duplicate_item_lists(self):
-        instance = plugin(Adapter())
-        for i in range(25):
-            self.run_at(instance, START + i)
-        self.assertEqual(len(instance.data["records_history"]), 20)
-        self.assertTrue(all("items" not in item for item in instance.data["records_history"]))
+    def test_failed_batch_exposes_a_safe_recovery_reason_in_details(self):
+        obj = self.instance()
+        def fail(): raise OSError("PRIVATE_AUTH_VALUE")
+        obj._build_record_adapter = fail
+        self.assertEqual(obj.clean_records()["status"], "failed")
+        details = obj.get_details().data
+        self.assertEqual(details["run_error"], "record_run_failed")
+        self.assertNotIn("PRIVATE_AUTH_VALUE", repr(details))
 
-    def test_source_cleanup_report_explains_protection_and_partial_outcomes(self):
-        instance = plugin(Adapter())
-        expected = {
-            "source_signature_unverified": "文件身份或独占硬链接状态",
-            "source_purge_evidence_changed": "源文件、媒体身份或归属证据已变化",
-            "source_shared_by_task": "其他种子任务共用",
-            "torrent_not_exclusive_single_file": "独占单文件种子",
-            "torrent_file_incomplete": "尚未完整下载",
-            "task_inventory_incomplete": "种子任务清单不完整",
-            "file_inventory_incomplete": "种子文件清单不完整",
-            "task_inventory_limit": "种子任务数超出",
-            "file_inventory_limit": "种子文件数超出",
-            "file_path_ambiguous": "文件路径无法精确对应",
-            "invalid_source_identity": "源文件身份或大小无法确认",
-            "source_purge_not_authorized": "本次运行不允许",
-            "media_lookup_incomplete": "媒体库范围",
-            "downloader_remove_unconfirmed": "任务移除未全部确认",
-            "source_unlink_unconfirmed": "源文件删除结果未确认",
-            "source_purged_history_pending": "源文件已删除",
-            "source_purge_failed": "可能部分完成",
-        }
-        for reason, text in expected.items():
-            with self.subTest(reason=reason):
-                report = {"status": "review", "dry_run": False, "items": [{
-                    "file_id": 7, "file": "S01E07.mkv", "branch": "source_purge",
-                    "status": "needs_review", "reason": reason,
-                }]}
-                rendered = all_text(instance._record_report_page(report))
-                self.assertIn(text, rendered)
-                self.assertNotIn(f"（{reason}）", rendered)
-                if reason in ("source_purged_history_pending", "source_unlink_unconfirmed",
-                              "downloader_remove_unconfirmed", "source_purge_failed",
-                              "source_purge_evidence_changed"):
-                    self.assertNotIn("未修改", rendered)
-        pending = instance._record_report_page({"status": "review", "dry_run": False, "items": [{
-            "branch": "source_purge", "status": "needs_review", "reason": "source_purged_history_pending",
-        }]})
-        self.assertIn("下轮缺源核对", all_text(pending))
-        self.assertIn("不更新订阅进度", all_text(pending))
+    def test_budget_yield_is_continuable_instead_of_claiming_completion(self):
+        obj = self.instance()
+        obj._run_records_batch = lambda stop, config: {"status": "yielded", "error": "batch_host_budget"}
+        obj.clean_records()
+        self.assertEqual(obj.get_status().data["run"]["status"], "yielded")
+        obj._save_record_report({"status": "yielded", "error": "batch_host_budget", "items": []})
+        self.assertEqual(obj.get_details().data["run_error"], "batch_host_budget")
 
+    def test_request_retry_after_another_completed_run_reuses_its_original_job(self):
+        obj = self.instance()
+        first = obj.start_run({"scope": "records", "request_id": "first"})
+        obj._run_thread.join(1)
+        second = obj.start_run({"scope": "records", "request_id": "second"})
+        obj._run_thread.join(1)
+        retried = obj.start_run({"scope": "records", "request_id": "first"})
+        self.assertEqual(retried.data["run_id"], first.data["run_id"])
+        self.assertTrue(retried.data["reused"])
+        self.assertEqual(obj.data["cleanup_run"]["run_id"], second.data["run_id"])
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_reusing_a_request_id_for_a_different_scope_is_rejected(self):
+        obj = self.instance()
+        obj.start_run({"scope": "records", "request_id": "stable"})
+        obj._run_thread.join(1)
+        self.assertFalse(obj.start_run({"scope": "folders", "request_id": "stable"}).success)
+
+    def test_failed_thread_creation_has_a_failed_receipt_and_never_claims_started(self):
+        class BrokenThread:
+            def __init__(self, *args, **kwargs): pass
+            def start(self): raise RuntimeError("no capacity")
+            def is_alive(self): return False
+        obj = self.instance()
+        with patch.dict(NAMESPACE, {"Thread": BrokenThread}):
+            result = obj.start_run({"scope": "records", "request_id": "failed"})
+        self.assertFalse(result.success)
+        self.assertEqual(result.data["status"], "failed")
+        self.assertTrue(result.data["not_started"])
+        self.assertEqual(obj.data["cleanup_run"]["status"], "failed")
+        again = obj.start_run({"scope": "records", "request_id": "failed"})
+        self.assertFalse(again.success)
+        self.assertTrue(again.data["reused"])
+
+    def test_recent_request_receipts_are_bounded_while_aliases_reuse_one_worker(self):
+        adapter = Adapter(hold=True)
+        obj = self.instance(adapter=adapter)
+        original = obj.start_run({"scope": "records", "request_id": "original"})
+        self.assertTrue(adapter.entered.wait(1))
+        for index in range(60):
+            result = obj.start_run({"scope": "records", "request_id": str(index)})
+            self.assertEqual(result.data["run_id"], original.data["run_id"])
+        self.assertEqual(len(obj.data["cleanup_requests"]), 50)
+
+if __name__ == "__main__": unittest.main()

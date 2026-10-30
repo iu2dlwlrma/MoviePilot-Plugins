@@ -1,0 +1,9 @@
+{
+  "name": "moviepilot-emptyfoldercleaner-ui",
+  "private": true,
+  "version": "2.1.0",
+  "type": "module",
+  "scripts": { "build": "vite build", "test": "node ../../tests/test_cleanup_master_frontend.mjs" },
+  "dependencies": { "vue": "3.5.13", "vuetify": "3.7.3" },
+  "devDependencies": { "@originjs/vite-plugin-federation": "1.4.1", "@vitejs/plugin-vue": "5.2.1", "vite": "5.4.11" }
+}

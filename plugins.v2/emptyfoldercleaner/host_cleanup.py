@@ -10,6 +10,18 @@ Presence = Literal["present", "missing", "unknown"]
 
 
 @dataclass(frozen=True, slots=True)
+class FileOnlyCandidate:
+    file_id: int
+    source_path: str
+    download_hash: str
+    downloader: str | None
+    revision: str
+    storage: str = "local"
+    identity_verified: bool = True
+    review_reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class CleanupCandidate:
     """下载文件及其精确关联的只读清理候选。
 
@@ -53,6 +65,7 @@ class CleanupCandidate:
     identity_verified: bool
     revision: str
     review_reason: str | None = None
+    history_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

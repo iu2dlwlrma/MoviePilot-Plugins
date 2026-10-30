@@ -52,7 +52,7 @@ def absent(**changes):
 class RecordCleanupTests(unittest.TestCase):
     def test_options_cannot_disable_stability_or_remove_resource_bounds(self):
         for changes in (
-            {"stability_seconds": 0}, {"stability_seconds": DAY - 1},
+            {"stability_seconds": -1},
             {"stability_seconds": float("nan")}, {"batch_size": 0},
             {"batch_size": 101}, {"pending_limit": 2001},
             {"preserve_source_tasks": "false"},
@@ -480,6 +480,81 @@ class ObservationExpiryTests(unittest.TestCase):
         self.assertEqual(later.results[0].status, "waiting")
         self.assertNotIn(record().key, later.state["candidates"])
         self.assertEqual(later.state["candidates"][another.key]["first_seen"], START + MODULE.MAX_STALE_SECONDS + 1)
+
+
+class FileOnlyCleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue(callable(getattr(MODULE, "file_only_decision", None)))
+        self.item = record(kind="download_file_only", key="download_file_only:17:path-fingerprint",
+                           destination_paths=(), media_source="", media_id="", media_type="",
+                           season=None, episodes=())
+        self.evidence = CleanupEvidence(source=Presence.MISSING, storage_ready=True,
+                                       identity_verified=True, revision=self.item.revision,
+                                       downloaders_complete=True, downloader_task_present=False,
+                                       transfer_task_active=False)
+
+    def engine(self, observer=None, mutation=None):
+        return RecordCleanupEngine(observer or (lambda _: self.evidence), mutation,
+                                   decision=MODULE.file_only_decision)
+
+    def test_missing_source_record_can_expire_without_media_identity_or_library_absence(self):
+        for media in (Presence.PRESENT, Presence.UNKNOWN):
+            evidence = replace(self.evidence, media_library=media, other_versions=media)
+            engine = self.engine(lambda _: evidence)
+            first = engine.run([self.item], {}, now=START)
+            self.assertEqual(first.results[0].status, "waiting")
+            mature = engine.run([self.item], first.state, now=START + DAY)
+            self.assertEqual(mature.results[0].status, "eligible")
+
+    def test_missing_source_record_keeps_health_tasks_and_exact_identity_gates(self):
+        for changes, status in (
+            ({"source": Presence.PRESENT}, "skipped"),
+            ({"source": Presence.UNKNOWN}, "needs_review"),
+            ({"storage_ready": False}, "needs_review"),
+            ({"identity_verified": False}, "needs_review"),
+            ({"downloaders_complete": False}, "needs_review"),
+            ({"downloader_task_present": None}, "needs_review"),
+            ({"downloader_task_present": True}, "skipped"),
+            ({"transfer_task_active": None}, "needs_review"),
+            ({"transfer_task_active": True}, "skipped"),
+            ({"revision": "new"}, "needs_review"),
+        ):
+            with self.subTest(changes=changes):
+                result = self.engine(lambda _: replace(self.evidence, **changes)).run([self.item], {}, now=START)
+                self.assertEqual(result.results[0].status, status)
+                self.assertEqual(result.state["candidates"], {})
+
+    def test_file_only_record_never_enters_broad_cleanup_or_source_purge_decision(self):
+        for decision in (MODULE._decision, MODULE.destination_decision):
+            engine = RecordCleanupEngine(lambda _: absent(destinations=()), decision=decision)
+            result = engine.run([self.item], {}, now=START)
+            self.assertEqual(result.results[0].status, "needs_review")
+        result = self.engine().run([record()], {}, now=START)
+        self.assertEqual(result.results[0].status, "needs_review")
+
+    def test_source_reappearing_during_commit_recheck_preserves_record(self):
+        observations = iter((self.evidence, self.evidence, replace(self.evidence, source=Presence.PRESENT)))
+        calls = []
+        engine = self.engine(lambda _: next(observations), lambda *args: calls.append(args))
+        first = engine.run([self.item], {}, now=START)
+        result = engine.run([self.item], first.state, now=START + DAY, dry_run=False)
+        self.assertEqual(result.results[0].status, "skipped")
+        self.assertEqual(calls, [])
+
+    def test_exact_file_revision_change_restarts_twenty_four_hour_observation(self):
+        engine = self.engine(lambda item: replace(self.evidence, revision=item.revision))
+        first = engine.run([self.item], {}, now=START)
+        changed = engine.run([replace(self.item, revision="new")], first.state, now=START + DAY)
+        self.assertEqual(changed.results[0].status, "waiting")
+
+    def test_zero_grace_still_requires_two_distinct_observation_times(self):
+        engine = self.engine()
+        options = CleanupOptions(stability_seconds=0)
+        first = engine.run([self.item], {}, now=START, options=options)
+        same_time = engine.run([self.item], first.state, now=START, options=options)
+        self.assertEqual(same_time.results[0].status, "waiting")
+        later = engine.run([self.item], same_time.state, now=START + 1, options=options)
+        self.assertEqual(later.results[0].status, "eligible")
 
 
 if __name__ == "__main__":

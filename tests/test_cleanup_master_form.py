@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "plugins.v2/emptyfoldercleaner/__init__.py"
 ORIGINAL = next(node for node in ast.parse(SOURCE.read_text(encoding="utf-8")).body
                 if isinstance(node, ast.ClassDef) and node.name == "EmptyFolderCleaner")
-METHODS = {"init_plugin", "get_form", "get_state", "get_service", "_config_payload", "_bounded_int"}
+METHODS = {"init_plugin", "get_form", "get_state", "get_service", "_bounded_int", "_load_config"}
 CLASS = ast.ClassDef(
     name="EmptyFolderCleaner", bases=[ast.Name(id="_PluginBase", ctx=ast.Load())],
     keywords=[], decorator_list=[],
@@ -18,6 +18,7 @@ CLASS = ast.ClassDef(
 )
 NAMESPACE = {
     "_PluginBase": object,
+    "deepcopy": __import__("copy").deepcopy,
     "Event": __import__("threading").Event,
     "Lock": __import__("threading").Lock,
     "Any": object,
@@ -37,19 +38,17 @@ class CleanupMasterFormTests(unittest.TestCase):
         self.assertEqual(Plugin.__name__, "EmptyFolderCleaner")
         self.assertEqual(plugin.plugin_config_prefix, "emptyfoldercleaner_")
         self.assertEqual(plugin.plugin_name, "清理大师")
-        plugin._enabled = True
-        plugin._cron = "0 0 * * 1"
-        plugin._target_dirs = "/Data/Downloads"
-        plugin._exclude_dirs = "keep"
-        plugin._recursive = True
-        plugin._dry_run = False
-        plugin._records_enabled = True
-        plugin._records_cron = "0 3 * * *"
-        config = plugin._config_payload()
-        self.assertEqual(config["cron"], "0 0 * * 1")
-        self.assertEqual(config["target_dirs"], "/Data/Downloads")
-        self.assertEqual(config["exclude_dirs"], "keep")
-        self.assertTrue(config["records_enabled"])
+        original = {"enabled": True, "cron": "0 0 * * 1", "target_dirs": "/Data/Downloads",
+                    "exclude_dirs": "keep", "recursive": True, "dry_run": False,
+                    "records_enabled": True, "records_cron": "0 3 * * *", "future": {"v": 7}}
+        plugin._load_config(original)
+        self.assertEqual(plugin._cron, "0 0 * * 1")
+        self.assertEqual(plugin._target_dirs, "/Data/Downloads")
+        self.assertEqual(plugin._exclude_dirs, "keep")
+        self.assertTrue(plugin._records_enabled)
+        self.assertEqual(plugin._loaded_config, original)
+        plugin._loaded_config["future"]["v"] = 8
+        self.assertEqual(original["future"]["v"], 7)
 
     def test_form_defaults_preview_new_record_cleanup(self):
         _, defaults = Plugin().get_form()
@@ -59,13 +58,12 @@ class CleanupMasterFormTests(unittest.TestCase):
         self.assertEqual(defaults["records_grace_hours"], 24)
         self.assertEqual(defaults["target_dirs"], "")
 
-    def test_form_explains_source_and_exclusive_task_deletion_without_automatic_redownload(self):
+    def test_normal_form_cannot_trigger_one_shot_or_grant_subscription_mutation(self):
         form, _ = Plugin().get_form()
-        text = repr(form)
-        self.assertIn("删除源文件", text)
-        self.assertIn("独占单文件种子任务", text)
-        self.assertIn("手动开启", text)
-        self.assertNotIn("不删除下载文件", text)
+        models = {item["props"]["model"] for item in form[0]["content"]}
+        self.assertNotIn("onlyonce", models)
+        self.assertNotIn("records_reopen_subscription", models)
+        self.assertTrue({"target_dirs", "exclude_dirs", "recursive", "notify", "dry_run", "cron"} <= models)
 
     def test_folder_and_record_jobs_are_independent(self):
         plugin = Plugin()
