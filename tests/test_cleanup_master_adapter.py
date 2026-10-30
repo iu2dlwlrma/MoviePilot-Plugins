@@ -92,6 +92,41 @@ class PathProbeTests(unittest.TestCase):
         helper = SimpleNamespace(get_dirs=lambda: rows)
         self.assertEqual(adapter.configured_local_roots(helper), ("/downloads", "/library"))
 
+    def test_real_builder_covers_historical_paths_on_verified_storage_mount(self):
+        storage = self.root / "mounted-storage"
+        download, library = storage / "downloads/current", storage / "library/current"
+        download.mkdir(parents=True)
+        library.mkdir(parents=True)
+        rows = [SimpleNamespace(storage="local", download_path=str(download),
+                                library_storage="local", library_path=str(library)),
+                SimpleNamespace(storage="local", download_path=str(download),
+                                library_storage=None, library_path=None)]
+        modules = {name: ModuleType(name) for name in ("app", "app.application", "app.application.directory", "app.application.downloader")}
+        modules["app.application.directory"].DirectoryHelper = lambda: SimpleNamespace(get_dirs=lambda: rows)
+        modules["app.application.downloader"].DownloaderHelper = lambda: SimpleNamespace()
+        with patch.dict(sys.modules, modules), patch.object(adapter, "_mounts", return_value=[("verified", str(storage))]):
+            subject = adapter.build_host_adapter()
+            historical = subject.paths.check(str(storage / "downloads/old/a.mkv"))
+            self.assertEqual(historical.presence, P.MISSING)
+            self.assertTrue(historical.ready)
+            self.assertEqual(subject.paths.check(str(self.root / "outside/a.mkv")).presence, P.UNKNOWN)
+            (storage / "shortcut").symlink_to(self.root / "outside", target_is_directory=True)
+            self.assertEqual(subject.paths.check(str(storage / "shortcut/a.mkv")).presence, P.UNKNOWN)
+            with patch.object(adapter, "_mounts", return_value=[]):
+                self.assertEqual(subject.paths.check(str(storage / "downloads/old/a.mkv")).presence, P.UNKNOWN)
+
+    def test_real_builder_never_trusts_container_root_or_missing_configuration_anchor(self):
+        configured = self.root / "missing-configured-directory"
+        rows = [SimpleNamespace(storage="local", download_path=str(configured), library_storage=None, library_path=None)]
+        modules = {name: ModuleType(name) for name in ("app", "app.application", "app.application.directory", "app.application.downloader")}
+        modules["app.application.directory"].DirectoryHelper = lambda: SimpleNamespace(get_dirs=lambda: rows)
+        modules["app.application.downloader"].DownloaderHelper = lambda: SimpleNamespace()
+        with patch.dict(sys.modules, modules), patch.object(adapter, "_mounts", return_value=[("verified", str(self.root))]):
+            self.assertEqual(adapter.build_host_adapter().paths.check(str(self.root / "old/a.mkv")).presence, P.UNKNOWN)
+        configured.mkdir()
+        with patch.dict(sys.modules, modules), patch.object(adapter, "_mounts", return_value=[("container", "/")]):
+            self.assertEqual(adapter.build_host_adapter().paths.check(str(self.root / "old/a.mkv")).presence, P.UNKNOWN)
+
     def test_two_distinct_trusted_roots_can_both_prove_missing(self):
         source, library = self.root / "source", self.root / "library"
         source.mkdir()

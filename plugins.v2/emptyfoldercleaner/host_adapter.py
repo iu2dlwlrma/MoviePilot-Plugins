@@ -153,6 +153,28 @@ class LocalPathProbe:
                 continue
         return cls(roots)
 
+    @classmethod
+    def from_storage_paths(cls, paths):
+        """Current configured folders anchor their mounted storage, including
+        exact historical paths that predate today's folder configuration."""
+        configured = cls.from_paths(paths)
+        roots, seen = [], set()
+        for anchor in configured.roots:
+            if anchor.mountpoint in seen:
+                continue
+            mount = Path(anchor.mountpoint)
+            try:
+                info = os.lstat(mount)
+                if (str(mount) == "/" or mount.resolve(strict=True) != mount
+                        or not stat.S_ISDIR(info.st_mode) or info.st_dev != anchor.device
+                        or not _mounted(anchor)):
+                    continue
+                roots.append(TrustedRoot(str(mount), anchor.device, anchor.mountpoint, anchor.mount_id))
+                seen.add(anchor.mountpoint)
+            except (OSError, ValueError):
+                continue
+        return cls(roots)
+
     def check(self, text):
         path = _path(text)
         if path is None:
@@ -1155,7 +1177,7 @@ def build_host_adapter(roots=()):
         all_roots = tuple(dict.fromkeys(configured + tuple(roots)))
         if not configured or len(all_roots) > 32:
             raise ValueError("trusted_roots_incomplete")
-        paths = LocalPathProbe.from_paths(all_roots)
+        paths = LocalPathProbe.from_storage_paths(all_roots)
     except Exception:
         paths = LocalPathProbe(())
     return MoviePilotCleanupAdapter(
