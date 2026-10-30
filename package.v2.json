@@ -1,0 +1,12 @@
+{
+  "EmptyFolderCleaner": {
+    "name": "清理大师",
+    "description": "安全清理空文件夹，并核对失效的下载与入库记录。",
+    "labels": "文件整理",
+    "version": "2.0.0",
+    "icon": "clean.png",
+    "author": "oriecho",
+    "level": 2,
+    "history": {}
+  }
+}

@@ -1,0 +1,116 @@
+name: Site Statistic Plugin Release
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tests -p 'test_site_statistic*.py' -v
+      - name: Validate plugin identity and release inputs
+        run: |
+          python3 - <<'PY'
+          import ast
+          import json
+          from pathlib import Path
+
+          plugin_id = "OriechoSiteStatistic"
+          root = Path("plugins.v3/sitestatistic")
+          manifest = json.loads(Path("package.v3.json").read_text(encoding="utf-8"))
+          entry = manifest[plugin_id]
+          tree = ast.parse((root / "__init__.py").read_text(encoding="utf-8"))
+          cls = next(node for node in tree.body
+                     if isinstance(node, ast.ClassDef) and node.name == plugin_id)
+          metadata = {}
+          for node in cls.body:
+              if isinstance(node, ast.Assign):
+                  for target in node.targets:
+                      if isinstance(target, ast.Name) and target.id in {
+                          "plugin_version", "plugin_name", "plugin_author", "author_url",
+                          "plugin_config_prefix"
+                      }:
+                          metadata[target.id] = ast.literal_eval(node.value)
+          assert entry["version"] == metadata["plugin_version"], "Version mismatch"
+          assert entry["name"] == metadata["plugin_name"] == "站点数据统计", "Name mismatch"
+          assert entry["author"] == metadata["plugin_author"] == "oriecho", "Author mismatch"
+          assert entry["author_url"] == metadata["author_url"] == "https://github.com/iu2dlwlrma", "Author URL mismatch"
+          assert entry["release"] is True and entry["level"] == 2, "Invalid release metadata"
+          assert metadata["plugin_config_prefix"] == "oriechositestatistic_", "Config prefix mismatch"
+          assert entry["system_version"] == ">=3.0.0", "Unsupported host version"
+          for relative in ("README.md", "LICENSE", "monthly.py"):
+              assert (root / relative).is_file(), f"Missing release input: {relative}"
+          assert (root / "LICENSE").read_bytes() == Path("LICENSE").read_bytes(), "License mismatch"
+          for relative in ("__init__.py", "monthly.py"):
+              compile((root / relative).read_text(encoding="utf-8"), str(root / relative), "exec")
+          print(f"{plugin_id} {entry['version']}: release inputs verified")
+          PY
+
+  release:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq zip
+
+      - name: Build and release plugin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          plugin_id="OriechoSiteStatistic"
+          plugin_id_lc="oriechositestatistic"
+          plugin_dir="plugins.v3/sitestatistic"
+          plugin_version="$(jq -er --arg id "$plugin_id" '.[$id] | select(.release == true) | .version' package.v3.json)"
+          if [[ ! "$plugin_version" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "::error::Invalid plugin version"
+            exit 1
+          fi
+          tag="${plugin_id}_v${plugin_version}"
+          asset="${plugin_id_lc}_v${plugin_version}.zip"
+
+          # Published versions are immutable; use a new version for changed code.
+          if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            python3 - "$tag" "$plugin_id" "$plugin_dir" <<'PY'
+          import json
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          tag, plugin_id, plugin_dir = sys.argv[1:]
+          published_manifest = json.loads(subprocess.check_output(
+              ["git", "show", f"{tag}:package.v3.json"], text=True))
+          current_manifest = json.loads(Path("package.v3.json").read_text(encoding="utf-8"))
+          source_changed = subprocess.run(
+              ["git", "diff", "--quiet", tag, "HEAD", "--", plugin_dir]).returncode != 0
+          if source_changed or published_manifest.get(plugin_id) != current_manifest.get(plugin_id):
+              print(f"::error::Tag {tag} already exists with different plugin content; increase the version.")
+              sys.exit(1)
+          PY
+            if gh release view "$tag" --json assets --jq '.assets[].name' | grep -Fxq "$asset"; then
+              echo "Version $tag is already published; keeping the existing release."
+              exit 0
+            fi
+            echo "::error::Tag $tag exists without the expected release asset; inspect the interrupted release before retrying."
+            exit 1
+          fi
+
+          (cd "$(dirname "$plugin_dir")" && zip -r "$GITHUB_WORKSPACE/$asset" "$(basename "$plugin_dir")" \
+            -x "*/__pycache__/*" -x "*.pyc" -x "*/node_modules/*" -x "*/.git/*") >/dev/null
+          gh release create "$tag" "$asset" \
+            --title "$tag" \
+            --notes "站点数据统计 · oriecho $plugin_version；详见仓库 README 与插件说明。" \
+            --target "$GITHUB_SHA"

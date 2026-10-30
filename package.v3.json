@@ -1,0 +1,35 @@
+{
+  "OriechoBrushFlow": {
+    "name": "站点刷流",
+    "description": "所有站点共用刷流规则，统一选择站点，保留分页续扫与请求预算。",
+    "labels": [
+      "刷流",
+      "仪表板"
+    ],
+    "version": "7.3.2",
+    "icon": "brush.jpg",
+    "author": "oriecho",
+    "level": 2,
+    "release": true,
+    "system_version": ">=3.0.0",
+    "author_url": "https://github.com/iu2dlwlrma",
+    "history": {}
+  },
+  "OriechoSiteStatistic": {
+    "name": "站点数据统计",
+    "description": "顶部同时展示累计、本月、今日汇总，单一站点列表包含日月上传下载明细。",
+    "labels": [
+      "站点",
+      "统计",
+      "仪表板"
+    ],
+    "version": "1.1.0",
+    "icon": "statistic.png",
+    "author": "oriecho",
+    "level": 2,
+    "release": true,
+    "system_version": ">=3.0.0",
+    "author_url": "https://github.com/iu2dlwlrma",
+    "history": {}
+  }
+}
