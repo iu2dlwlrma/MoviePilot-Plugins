@@ -164,6 +164,3 @@ cython_debug/
 !plugins.v3/brushflow/dist/
 plugins.v3/brushflow/node_modules/
 node_modules/
-
-!plugins.v2/emptyfoldercleaner/dist/
-plugins.v2/emptyfoldercleaner/node_modules/
